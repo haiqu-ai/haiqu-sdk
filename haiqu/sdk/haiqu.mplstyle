@@ -1,0 +1,100 @@
+# Haiqu brand matplotlib style
+# Derived from the Haiqu Brand Guidelines
+# Aesthetic: minimal, high-contrast, clean technical with selective vibrancy
+#
+# Palette (cold → warm → neutral, matching brand usage priority):
+#   Morpho Blue  #093188  — primary series
+#   Light Blue   #C4D5FF  — second series / confidence fills
+#   Orange       #FEA450  — third series
+#   Red          #8D2816  — fourth series
+#   Black        #000000  — text, spines
+#   Neutral Grey #CCCCCC  — grid, secondary elements
+#
+# Custom colormaps (haiqu_blue, haiqu_diverging) are registered at import time
+# in __init__.py and cannot be declared here.
+
+# --- Color cycle (cold first, per brand usage on data viz pages) ---
+axes.prop_cycle : cycler('color', ['093188', 'C4D5FF', 'FEA450', '8D2816', '000000', 'CCCCCC'])
+
+# --- Patches (histogram bars, filled areas) ---
+patch.facecolor      : 093188
+patch.edgecolor      : white
+patch.linewidth      : 0.8
+patch.antialiased    : True
+
+# --- Figure ---
+figure.facecolor     : white
+figure.edgecolor     : white
+figure.dpi           : 150
+figure.figsize       : 7, 4.5
+figure.autolayout    : True
+
+# --- Axes ---
+axes.facecolor       : white
+axes.edgecolor       : 000000
+axes.linewidth       : 0.8
+axes.spines.top      : False
+axes.spines.right    : False
+axes.labelcolor      : 000000
+axes.labelsize       : 10
+axes.titlesize       : 11
+axes.titleweight     : normal
+axes.titlelocation   : left
+axes.titlepad        : 10
+axes.axisbelow       : True
+
+# --- Grid ---
+axes.grid            : True
+grid.color           : CCCCCC
+grid.linewidth       : 0.5
+grid.linestyle       : --
+grid.alpha           : 0.7
+
+# --- Ticks ---
+xtick.color          : 000000
+ytick.color          : 000000
+xtick.labelsize      : 9
+ytick.labelsize      : 9
+xtick.direction      : out
+ytick.direction      : out
+xtick.major.size     : 3.5
+ytick.major.size     : 3.5
+xtick.minor.visible  : False
+ytick.minor.visible  : False
+xtick.major.width    : 0.8
+ytick.major.width    : 0.8
+
+# --- Lines ---
+lines.linewidth       : 1.8
+lines.markersize      : 6
+lines.markeredgewidth : 0.8
+lines.markeredgecolor : auto
+lines.dashed_pattern  : 2.0, 2.0   # short dashes (brand-aligned, not default 6/6)
+
+# --- Scatter (default point is square, matching brand data viz style) ---
+scatter.marker       : s
+scatter.edgecolors   : face
+
+# --- Histogram ---
+hist.bins            : auto
+
+# --- Legend ---
+legend.frameon       : False
+legend.fontsize      : 9
+legend.labelcolor    : 000000
+legend.handlelength  : 1.5
+legend.borderaxespad : 0.5
+
+# --- Font ---
+# Suisse Int'l Mono — brand monospace typeface (labels, tick marks, captions)
+# Registered at import time from the bundled fonts/ directory.
+font.family          : monospace
+font.monospace       : Suisse Int'l Mono, DejaVu Sans Mono, Courier New, monospace
+font.size            : 10
+text.color           : 000000
+
+# --- Saving ---
+savefig.dpi          : 300
+savefig.facecolor    : white
+savefig.edgecolor    : white
+savefig.bbox         : tight

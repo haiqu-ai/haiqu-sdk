@@ -1,0 +1,127 @@
+[build-system]
+requires = ["setuptools>=68.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "haiqu-sdk"
+version = "1.0.5"
+description = "Python SDK for Haiqu quantum cloud — circuit analytics, error mitigation, and hybrid quantum application execution"
+authors = [{name = "Haiqu, Inc.", email = "info@haiqu.ai"}]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = [
+    "quantum computing",
+    "error mitigation",
+    "zero-noise extrapolation",
+    "hybrid quantum-classical",
+    "quantum applications",
+    "quantum machine learning",
+    "QML",
+    "data loading",
+    "qiskit",
+    "circuit analytics",
+    "quantum cloud",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.6.0,<3.0",
+    "requests>=2.33.0,<3",
+
+    "qiskit==2.2.*",
+    "qiskit_ibm_runtime==0.45.*",
+    "qiskit-aer==0.17.*",
+    "qiskit_algorithms==0.4.0",
+    "qiskit-addon-obp==0.3.0",
+    "qiskit-addon-utils==0.3.0",
+    "qiskit-qasm3-import==0.6.0",
+    "qiskit-optimization[cplex]==0.7.0",
+
+    "cplex",  # qiskit-optimization==0.7.0 ignores [cplex] for python>=3.13
+    "hashable-list==0.2.*",  # Required by docplex==2.32.257 (via qiskit-optimization)
+    "ordered-set==4.1.*",  # Required by docplex==2.32.257 (via qiskit-optimization)
+
+    "tabulate==0.9.0",
+    "plotly==6.0.0",
+    "kaleido==0.2.1",
+    "pandas==2.3.1",
+    "ipywidgets==8.1.8",
+]
+
+[project.readme]
+file = "README.md"
+content-type = "text/markdown; charset=UTF-8"
+
+[project.urls]
+Homepage = "https://haiqu.ai"
+Documentation = "https://docs.haiqu.ai"
+Source = "https://github.com/haiqu-ai/haiqu-sdk"
+"Bug Tracker" = "https://github.com/haiqu-ai/haiqu-sdk/-/issues"
+
+[project.optional-dependencies]
+visualization = [
+    "matplotlib==3.9.0",
+    "pylatexenc==2.10",
+]
+skqd = [
+    "ffsim",
+]
+dev = [
+    "black==23.7.0",
+    "isort",
+    "flake8==6.0.0",
+]
+build = [
+    
+]
+
+[tool.setuptools.packages.find]
+include = ["haiqu*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.*"]
+
+[tool.black]
+line-length = 130
+
+[tool.isort]
+line_length = 130
+profile = "black"
+multi_line_output = 3
+
+[tool.mypy]
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = "."
+
+ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ['haiqu']
+omit = ["*/__init__.py"]
+
+[tool.coverage.report]
+fail_under = 100
+skip_covered = true
+show_missing = true
+exclude_lines = [
+  "pragma: no cover",
+  "def __repr__",
+  "def __str__",
+  "raise AssertionError",
+  "raise NotImplementedError",
+  "if __name__ == .__main__.:",
+]
