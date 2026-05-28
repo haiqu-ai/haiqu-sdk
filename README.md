@@ -18,6 +18,9 @@ For example, using Haiqu SDK for a utility-scale Floquet dynamics simulation of 
 
 ![Kicked Ising Pareto Plot](https://raw.githubusercontent.com/haiqu-ai/haiqu-sdk/main/images/pareto.png)
 
+See the [`kicked_ising.ipynb`](https://github.com/haiqu-ai/sdk-examples/blob/main/applications/kicked_ising/kicked_ising.ipynb) notebook for the full experiment, as well as other SDK Application notebooks in the [sdk-examples](https://github.com/haiqu-ai/sdk-examples/tree/main/applications) repository for more cases of practical advantage.
+
+
 Want to see this in action? **[Book a demo](https://haiqu.ai/demoform)** to get access to this example and more.
 
 ### Research results
@@ -109,9 +112,13 @@ You're all set. Refer to the [Getting Started](#getting-started) section to lear
 
 ## Getting Started
 
-SDK example notebooks are coming soon — we will be releasing the **[sdk-examples](https://github.com/haiqu-ai/sdk-examples) repository** shortly. It will act as a tutorial for basic Haiqu SDK features with ready-to-run notebooks.
+The fastest way to get started is through the SDK tutorial notebooks in the **[sdk-examples](https://github.com/haiqu-ai/sdk-examples) repository**. They act as a tutorial for basic Haiqu SDK feature with ready-to-run notebooks. Clone it and open the notebooks in your environment to get started:
+```bash
+git clone https://github.com/haiqu-ai/sdk-examples.git
+cd sdk-examples
+```
 
-In the meantime, see the [Core Features](https://docs.haiqu.ai/core_features/exp_tracking) section of the Haiqu SDK docs for guides, as well as the full [Haiqu SDK Reference](https://docs.haiqu.ai/reference/core/login).
+Also see the [Core Features](https://docs.haiqu.ai/core_features/exp_tracking) section of the Haiqu SDK docs for guides, as well as the full [Haiqu SDK Reference](https://docs.haiqu.ai/reference/core/login).
 
 ## AI-Assisted Development (MCP)
 
