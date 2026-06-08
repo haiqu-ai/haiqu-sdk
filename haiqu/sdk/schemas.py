@@ -11,7 +11,7 @@ from typing import Any, Iterable, Optional, Union, List, Tuple, cast
 import json
 import numpy as np
 
-from pydantic import BaseModel, TypeAdapter, Field
+from pydantic import BaseModel, ConfigDict, TypeAdapter, Field
 from qiskit import QuantumCircuit
 
 # from qiskit.transpiler import Target
@@ -21,7 +21,7 @@ from . import errors
 from . import exceptions
 from .errors import JUPYTER_LAB  # TODO: find better place for this constant
 from .utils import from_qpy, setup_logger
-from .qml.optimizer import NFTOptimizerOptions
+from .qml.optimizer import NFTOptimizerOptions, OptimizerOptionsUnion
 
 JOB_POLL_DELAY = 5
 JOB_POLL_MAX_TIMES = 60
@@ -1016,6 +1016,8 @@ class BaseJobModel(ClientMixin, ParseIterableMixin, BaseModel):
     logged local jobs, etc.
     """
 
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     name: Optional[str] = None
     description: Optional[str] = None
@@ -1032,9 +1034,6 @@ class BaseJobModel(ClientMixin, ParseIterableMixin, BaseModel):
     info: Optional[dict] = None
     time: Optional[float] = None
     parameters: Optional[dict | list] = None
-
-    class Config:
-        from_attributes = True
 
     def __repr__(self):
         if errors.JUPYTER_LAB:
@@ -1210,6 +1209,7 @@ class DataLoadingJobModel(BaseJobModel):
                          desired ideal state
             * num_blocks - equal to the number of blocks in the `block_vector_loading`
             * num_qubits_per_block - number of qubits each encoding block takes in the `block_vector_loading`
+            * block_norms - norms of the encoded blocks in the `block_vector_loading`
             * fidelity_per_block - quantum state fidelity of the each block's data loading in the `block_vector_loading`
             * mean_fidelity - average quantum state fidelity over all block's data loading in the `block_vector_loading`
             * global_fidelity - global quantum state fidelity of the `block_vector_loading`
@@ -1388,7 +1388,7 @@ class RunJobModel(BaseJobModel):
         Render the execution flow graph for this run job.
 
         Shows the processing pipeline from input to the target device,
-        including packing, mitigation, and observable stages where applicable.
+        including packing, mitigation, transpilation, and observable stages where applicable.
 
         Args:
             help (bool): If ``True``, add a legend explaining each stage. Defaults to ``False``.
@@ -1398,15 +1398,36 @@ class RunJobModel(BaseJobModel):
         """
         from haiqu.sdk.wiz.jupyter import draw_run_job
 
+        options = self.options or {}
+
+        skip_transpilation = options.get("skip_transpilation", False)
+        if skip_transpilation:
+            uses_transpilation = False
+        else:
+            circuit_models = [self._client.get_circuit(circuit_id=cid) for cid in self.circuit_ids]
+            all_pre_transpiled = bool(circuit_models) and all(cm.transpilation_target is not None for cm in circuit_models)
+            uses_transpilation = not all_pre_transpiled
+
         uses_observables = bool(self.observables)
         uses_mitigation = bool(self.use_mitigation)
-        uses_packing = bool((self.options or {}).get("use_packing", False))
+        uses_packing = bool(options.get("use_packing", False))
+        emo = options.get("error_mitigation_options") or {}
+
+        try:
+            device_label = self._client.get_device(self.device_id).name
+        except Exception:
+            device_label = self.device_id
 
         return draw_run_job(
-            device_id=self.device_id,
+            device_id=device_label,
             uses_observables=uses_observables,
             uses_mitigation=uses_mitigation,
             uses_packing=uses_packing,
+            uses_transpilation=uses_transpilation,
+            use_advanced=emo.get("advanced_mitigation", True),
+            use_noise_tailoring=emo.get("noise_tailoring", False),
+            use_dd=emo.get("dynamical_decoupling", True),
+            use_readout=emo.get("readout_mitigation", True),
             help=help,
         )
 
@@ -1909,10 +1930,37 @@ class VariationalProblemSubmitModel(BaseModel):
     device_id: str
     options: Optional[dict] = None
     initial_parameters: Optional[List[float]] = None
-    optimizer_options: NFTOptimizerOptions = NFTOptimizerOptions()
+    optimizer_options: OptimizerOptionsUnion = Field(default_factory=NFTOptimizerOptions)
     use_mitigation: bool = False
+    use_compression: bool = False
+    compression_options: Optional[dict] = None
     name: Optional[str] = ""
     description: Optional[str] = ""
+
+
+class VariationalCompressionStats:
+    """Per-step compression statistics from a variational optimization run."""
+
+    def __init__(
+        self,
+        per_step_quality: List[float],
+        per_step_percent: Optional[List[float]] = None,
+        **_ignored,
+    ):
+        self.per_step_quality = per_step_quality
+        self.per_step_percent = per_step_percent or []
+        self.mean_quality = float(sum(per_step_quality) / len(per_step_quality)) if per_step_quality else 0.0
+        self.mean_compression_percent = (
+            float(sum(self.per_step_percent) / len(self.per_step_percent)) if self.per_step_percent else 0.0
+        )
+
+    def __repr__(self):
+        return (
+            f"VariationalCompressionStats("
+            f"mean_quality={self.mean_quality:.4f}, "
+            f"mean_compression_percent={self.mean_compression_percent:.1f}%, "
+            f"steps={len(self.per_step_quality)})"
+        )
 
 
 class VariationalResult:
@@ -1929,10 +1977,12 @@ class VariationalResult:
         optimal_parameters: List[float],
         min_loss: float,
         loss_history: List[float],
+        compression_stats: Optional[VariationalCompressionStats] = None,
     ):
         self.optimal_parameters = optimal_parameters
         self.min_loss = min_loss
         self.loss_history = loss_history
+        self.compression_stats = compression_stats
 
     def __repr__(self):
         # Show first 5 values of loss_history, with ... if more
@@ -1967,6 +2017,7 @@ class VariationalJobModel(BaseJobModel):
     optimal_parameters: Optional[List[float]] = None
     min_loss: Optional[float] = None
     loss_history: Optional[List[float]] = None
+    compression_stats: Optional[dict] = None
 
     def retrieve_status(self) -> JobStatus:
         """Query backend for the job status."""
@@ -1974,6 +2025,7 @@ class VariationalJobModel(BaseJobModel):
         self.optimal_parameters = response.optimal_parameters
         self.min_loss = response.min_loss
         self.loss_history = response.loss_history
+        self.compression_stats = response.compression_stats
         return self.status
 
     def result(self) -> Union[VariationalResult, None]:
@@ -1982,20 +2034,30 @@ class VariationalJobModel(BaseJobModel):
         Blocks until the job completes.
 
         Returns:
-            VariationalResult: Object containing optimal_parameters, min_loss, and loss_history.
+            VariationalResult | None: Object containing optimal_parameters, min_loss, and loss_history, or ``None`` if not
+            available (e.g. from a dry run job).
 
         Raises:
             Exception: If the job failed or was cancelled.
 
-        Job's `info` field contains additional information (not every field may be present):
+        Job's ``info`` field contains additional information (not every field may be present):
+
             * loss_history - history of losses during the optimization
         """
         super().result()
+
+        if self.optimal_parameters is None or self.min_loss is None or self.loss_history is None:
+            return None
+
+        comp_stats = None
+        if self.compression_stats:
+            comp_stats = VariationalCompressionStats(**self.compression_stats)
 
         return VariationalResult(
             optimal_parameters=self.optimal_parameters,
             min_loss=self.min_loss,
             loss_history=self.loss_history,
+            compression_stats=comp_stats,
         )
 
     @property
@@ -2042,6 +2104,33 @@ class VariationalJobModel(BaseJobModel):
         if self.info is None:
             return None
         return self.info.get("session_cost")
+
+    @property
+    def estimated_qpu_cost(self) -> Optional[dict]:
+        """
+        Estimated QPU cost for the variational optimization, computed from the
+        ansatz circuit, shots, optimizer's maximum iteration count, and the device
+        cost model. Populated when the job was submitted with ``dry_run=True``;
+        otherwise ``None``.
+
+        Returns:
+            dict or None: ``{"native": {"amount": <seconds|shots>, "unit": "<vendor_unit>"},
+            "converted": {"amount": <dollars>, "unit": "USD"},
+            "warning": <str | None>}``. When the job was submitted with
+            ``use_session=True``, ``warning`` is populated with the string
+            ``"Session mode also bills classical optimization and parameter-update
+            time, not included here."``
+
+        Warning:
+            This property blocks the current CPU thread until the job reaches a
+            terminal state (Done/Error), similarly to ``result()``. Use ``retrieve_status()``
+            to first check the state of the job to omit the prolonged thread blockade.
+        """
+        self.result()
+
+        if self.info is None:
+            return None
+        return self.info.get("estimated_qpu_cost")
 
     def progress(self):
         """Display the progress widget, stream logs from the job."""

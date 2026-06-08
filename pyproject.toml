@@ -4,7 +4,6 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "haiqu-sdk"
-version = "1.0.5"
 description = "Python SDK for Haiqu quantum cloud — circuit analytics, error mitigation, and hybrid quantum application execution"
 authors = [{name = "Haiqu, Inc.", email = "info@haiqu.ai"}]
 license = "Apache-2.0"
@@ -39,6 +38,7 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.6.0,<3.0",
+    "beartype==0.22.9",
     "requests>=2.33.0,<3",
 
     "qiskit==2.2.*",
@@ -61,6 +61,8 @@ dependencies = [
     "ipywidgets==8.1.8",
 ]
 
+dynamic = ["version"]
+
 [project.readme]
 file = "README.md"
 content-type = "text/markdown; charset=UTF-8"
@@ -73,7 +75,7 @@ Source = "https://github.com/haiqu-ai/haiqu-sdk"
 
 [project.optional-dependencies]
 visualization = [
-    "matplotlib==3.9.0",
+    "matplotlib==3.9.2",
     "pylatexenc==2.10",
 ]
 skqd = [
@@ -90,6 +92,9 @@ build = [
 
 [tool.setuptools.packages.find]
 include = ["haiqu*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "haiqu.sdk.version.__version__"}
 
 [tool.setuptools.package-data]
 "*" = ["*.*"]

@@ -9,13 +9,14 @@ from datetime import datetime
 import io
 import json
 import logging
-from typing import Any, Union
 import os
+from typing import Any
 
 import openqasm3.parser
 import numpy as np
 import pandas as pd
 import qiskit.qasm2
+from ._typecheck import typecheck
 from qiskit import QuantumCircuit, qpy
 from qiskit.circuit import ParameterExpression
 from qiskit.primitives import BasePrimitiveJob, EstimatorResult, SamplerResult
@@ -118,50 +119,83 @@ HAIQU_OPERATIONS = ["HaiquCircuit", "HaiquCircuitdg"]
 class HaiquJSONEncoder(json.JSONEncoder):
     """JSON encoder for API client. Handles NumPy arrays."""
 
-    def default(self, obj):
+    def default(self, obj: Any) -> Any:
+        """Serialize supported NumPy values into JSON-compatible payloads.
+
+        This encoder serializes ``np.ndarray`` instances and ``np.complex128``
+        scalars as base64-encoded NPY strings so they can be embedded safely in
+        JSON request bodies.
+
+        Args:
+            obj (Any): Object that the JSON encoder is attempting to serialize.
+
+        Returns:
+            Any: Base64-encoded NPY string for supported NumPy values, or the
+            result of ``json.JSONEncoder.default`` for other objects.
+
+        Raises:
+            TypeError: If ``obj`` is not handled by this method and the parent
+            JSON encoder cannot serialize it.
+        """
         if isinstance(obj, np.ndarray):
             return to_npy(obj)
-        elif isinstance(obj, np.complex128):
-            return to_npy(obj)
+        if isinstance(obj, np.complex128):  # JSON serialization can surface NumPy complex scalars element-wise.
+            return to_npy(np.asarray(obj))
         return super().default(obj)
 
 
-def ensure_qc(circuit) -> QuantumCircuit:
-    """Make sure circuit is Qiskit QuantumCircuit. Convert if needed."""
-    if isinstance(circuit, QuantumCircuit):
-        return circuit
-    elif isinstance(circuit, str):
-        try:
-            # Method from_qasm_str uses legacy instructions
-            return QuantumCircuit.from_qasm_str(circuit)
-            # return qiskit.qasm2.loads(circuit)
-        except qiskit.qasm2.exceptions.QASM2ParseError:
-            return qasm3_parse(circuit)
-    raise TypeError("Circuit must be QASM string or Qiskit QuantumCircuit.")
+@typecheck
+def ensure_qc(circuit: QuantumCircuit | str) -> QuantumCircuit:
+    """Return a Qiskit circuit from a circuit object or QASM source.
 
-
-def from_qpy(encoded: str):
-    """Load circuit from base64-encoded qiskit.QPY binary format.
+    String inputs are parsed as QASM 2 first and then retried as QASM 3 if the
+    QASM 2 parser rejects them.
 
     Args:
-        encoded (str): Base64-encoded binary data.
+        circuit (QuantumCircuit | str): Existing ``QuantumCircuit`` instance or
+            a QASM 2/QASM 3 string.
 
     Returns:
-        QuantumCircuit: The decoded circuit.
+        QuantumCircuit: The original circuit or a parsed ``QuantumCircuit`` instance.
+
+    Raises:
+        openqasm3.parser.QASM3ParsingError: If a string input is not valid QASM.
+    """
+    if isinstance(circuit, QuantumCircuit):
+        return circuit
+
+    try:
+        # Method from_qasm_str uses legacy instructions
+        return QuantumCircuit.from_qasm_str(circuit)
+        # return qiskit.qasm2.loads(circuit)
+    except qiskit.qasm2.exceptions.QASM2ParseError:
+        return qasm3_parse(circuit)
+
+
+@typecheck
+def from_qpy(encoded: str) -> QuantumCircuit:
+    """Decode a circuit from base64-encoded QPY data.
+
+    Args:
+        encoded (str): Base64-encoded QPY payload.
+
+    Returns:
+        QuantumCircuit: The decoded ``QuantumCircuit``.
     """
     buf = io.BytesIO(base64.b64decode(encoded))
     circuits = qpy.load(buf)
     return circuits[0]  # We get a list back even if we only dumped a single circuit.
 
 
-def to_qpy(circuit: QuantumCircuit):
-    """Dump circuit to qiskit.QPY binary format. Then Base64 encode to use in JSON.
+@typecheck
+def to_qpy(circuit: QuantumCircuit) -> str:
+    """Encode a circuit as base64-wrapped QPY data.
 
     Args:
-        circuit (QuantumCircuit): The input circuit, Qiskit object.
+        circuit (QuantumCircuit): Circuit to serialize.
 
     Returns:
-        str: Base64 encoded binary data.
+        str: Base64-encoded QPY payload suitable for JSON transport.
     """
     buf = io.BytesIO()
     qpy.dump(circuit, buf, version=QPY_DUMP_VERSION)
@@ -169,14 +203,15 @@ def to_qpy(circuit: QuantumCircuit):
     return base64.b64encode(buf.read()).decode("utf-8")
 
 
-def to_npy(arr: np.ndarray):
-    """Dump numpy array to NPY binary format. Then Base64 encode to use in JSON.
+@typecheck
+def to_npy(arr: np.ndarray) -> str:
+    """Encode a NumPy array as base64-wrapped NPY data.
 
     Args:
-        arr (np.ndarray): The input array, NumPy object.
+        arr (np.ndarray): Array to serialize.
 
     Returns:
-        str: Base64 encoded binary data.
+        str: Base64-encoded NPY payload suitable for JSON transport.
     """
     buf = io.BytesIO()
     np.save(buf, arr)
@@ -184,29 +219,54 @@ def to_npy(arr: np.ndarray):
     return base64.b64encode(buf.read()).decode("utf-8")
 
 
-def from_npy(encoded: str):
-    """Load numpy array from base64-encoded NPY binary format.
+@typecheck
+def from_npy(encoded: str) -> np.ndarray:
+    """Decode a NumPy array from base64-encoded NPY data.
 
     Args:
-        encoded (str): Base64-encoded binary data.
+        encoded (str): Base64-encoded NPY payload.
 
     Returns:
-        np.ndarray: The decoded array.
+        np.ndarray: The decoded NumPy array.
     """
     buf = io.BytesIO(base64.b64decode(encoded))
     return np.load(buf)
 
 
-def to_qasm(circuit):
-    """Dump circuit to QASM 2, in case of incompatibility - to QASM 3"""
+@typecheck
+def to_qasm(circuit: QuantumCircuit) -> str:
+    """Serialize a circuit to QASM text.
+
+    The serializer prefers QASM 2 for compatibility and falls back to QASM 3
+    when QASM 2 export is not supported by the circuit.
+
+    Args:
+        circuit (QuantumCircuit): Circuit to serialize.
+
+    Returns:
+        str: QASM 2 output when possible, otherwise QASM 3 output.
+    """
     try:
         return qiskit.qasm2.dumps(circuit)
     except qiskit.qasm2.QASM2ExportError:
         return qiskit.qasm3.dumps(circuit)
 
 
+@typecheck
 def get_circuit_hash(circuit: QuantumCircuit) -> str:
-    """Calculate Hash for qiskit.QuantumCircuit."""
+    """Compute a stable hash string for a circuit.
+
+    The circuit is normalized before hashing by rewriting decomposable
+    operations into the supported gate set (`rx`, `ry`, `rz`, `cx`) while
+    leaving Haiqu-specific circuit operations intact, and by binding any
+    remaining parameters to zero.
+
+    Args:
+        circuit (QuantumCircuit): Circuit to normalize and hash.
+
+    Returns:
+        str: Deterministic hash value for the normalized circuit.
+    """
     decompose_gates = HAIQU_OPERATIONS + ["rx", "ry", "rz", "cx"]
     pm = PassManager(
         [UnrollCustomDefinitions(SessionEquivalenceLibrary, decompose_gates)]  # will only unroll ops that have definitions
@@ -224,14 +284,15 @@ def get_circuit_hash(circuit: QuantumCircuit) -> str:
     return str(hash_value)
 
 
+@typecheck
 def find_shared_parameters(circuit: QuantumCircuit) -> list[str]:
-    """Find parameters that are used in more than one gate.
+    """Find parameter names reused across multiple operations.
 
     Args:
-        circuit: A parameterized QuantumCircuit.
+        circuit (QuantumCircuit): Parameterized circuit to inspect.
 
     Returns:
-        List of parameter names that appear in multiple gates.
+        list[str]: Parameter names that appear in more than one operation.
     """
     param_counts: Counter = Counter()
 
@@ -317,17 +378,41 @@ def get_job_name(job_data):
     return "Local job"
 
 
-def get_ibmq_temporary_token(user_token: str, ibmq_api_url: str = "https://auth.quantum-computing.ibm.com/api") -> dict:
-    """
-    Login to IBMQ account using User Token and generate a Temporary Token.
+def job_name_from_circuits(circuits):
+    """Construct a default job name from a list of circuits."""
+
+    if not circuits:
+        return None
+
+    job_name = circuits[0].name
+    num_others = len(circuits) - 1
+
+    if num_others > 0:
+        job_name += f" + {num_others} other"
+
+        if num_others > 1:
+            job_name += "s"
+
+    return job_name
+
+
+@typecheck
+def get_ibmq_temporary_token(
+    user_token: str,
+    ibmq_api_url: str = "https://auth.quantum-computing.ibm.com/api",
+) -> dict[str, Any]:
+    """Exchange an IBM Quantum user token for a temporary token payload.
+
+    The IBM Runtime API returns the temporary token under the ``id`` key. This
+    helper normalizes the response by remapping that field to ``token``.
 
     Args:
-        user_token (str): User's IBMQ API Token from https://quantum.ibm.com/
-        ibmq_api_url (str): IBMQ API URL.
+        user_token (str): IBM Quantum API token.
+        ibmq_api_url (str): IBM Quantum authentication API base URL.
 
     Returns:
-        A response dictionary with Temporary Token, it's Creation Time
-        and Time-To-Live.
+        dict[str, Any]: Authentication response with the temporary token exposed
+        as ``"token"``.
     """
 
     ibmq_api = Api(RetrySession(base_url=ibmq_api_url))
@@ -338,19 +423,23 @@ def get_ibmq_temporary_token(user_token: str, ibmq_api_url: str = "https://auth.
     return response
 
 
-def sparse_op_to_tuple(sparse_op):
-    """
-    Convert a single SparsePauliOp to a tuple of (paulis, coeffs).
+@typecheck
+def sparse_op_to_tuple(sparse_op: SparsePauliOp) -> tuple[list[str], list[float]]:
+    """Convert a sparse Pauli operator to serializable term and coefficient lists.
+
+    The coefficients are required to be real-valued. Complex coefficients
+    trigger an assertion because observables are expected to be Hermitian.
 
     Args:
-        sparse_op: A single SparsePauliOp object
+        sparse_op (SparsePauliOp): Sparse Pauli operator to convert.
 
     Returns:
-        tuple: (paulis, coeffs) where paulis is list of Pauli strings and coeffs is list of real coefficients
-    """
-    if not isinstance(sparse_op, SparsePauliOp):
-        raise ValueError("sparse_op must be a single SparsePauliOp object")
+        tuple[list[str], list[float]]: Pauli strings and their real
+        coefficients.
 
+    Raises:
+        AssertionError: If any Pauli coefficient has a non-zero imaginary part.
+    """
     paulis = []
     coeffs = []
 
@@ -362,7 +451,7 @@ def sparse_op_to_tuple(sparse_op):
         )
         coeffs.append(coeff.real)
 
-    return (paulis, coeffs)
+    return paulis, coeffs
 
 
 def validate_and_normalize_parameters_and_observables(parameters, observables, num_circuits):
@@ -468,14 +557,16 @@ def validate_and_normalize_parameters_and_observables(parameters, observables, n
     return parameters, observables
 
 
+@typecheck
 def is_haiqu_generated(circuit: QuantumCircuit) -> bool:
-    """
-    Check if the circuit contains HaiquCircuitGate, indicating it was generated by Haiqu.
+    """Check whether a circuit contains Haiqu-generated operations.
 
     Args:
-        circuit (QuantumCircuit): The input circuit.
+        circuit (QuantumCircuit): Circuit to inspect.
+
     Returns:
-        bool: True if the circuit contains HaiquCircuitGate, False otherwise.
+        bool: ``True`` if the circuit contains a Haiqu operation, otherwise
+        ``False``.
     """
     for instruction in circuit.data:
         if instruction.operation.name in HAIQU_OPERATIONS:
@@ -483,15 +574,19 @@ def is_haiqu_generated(circuit: QuantumCircuit) -> bool:
     return False
 
 
-def preprocess_metrics(**kwargs) -> dict:
-    """
-    Preprocess user-defined metrics dictionary.
-    These metrics are arbitrary key-value pairs provided by the user.
-    If any value is a Drawer object or a Matplotlib plot object, it is serialized
-    to a base64-encoded PNG string.
+def preprocess_metrics(**kwargs: Any) -> dict[str, Any]:
+    """Normalize user-defined metrics into JSON-friendly values.
+
+    Drawer plots, Matplotlib figures, and Pandas data frames are converted into
+    serialized forms that can be sent to the API. Other values are passed
+    through unchanged.
+
+    Args:
+        **kwargs (Any): Arbitrary metric names and values.
 
     Returns:
-        dict: The metrics dictionary.
+        dict[str, Any]: Dictionary of normalized metric values ready for
+        transport.
     """
     from haiqu.sdk.wiz.drawer import Drawer
 
@@ -515,7 +610,18 @@ def preprocess_metrics(**kwargs) -> dict:
 
 
 def generate_artifact_name(parent_ctx: Any, child_ctx: Any) -> str:
-    """Generate an artifact name based on user input."""
+    """Generate an artifact name from the provided context.
+
+    The prefix is inferred from common object types such as Drawer plots,
+    Matplotlib figures, and Pandas data frames.
+
+    Args:
+        parent_ctx (Any): Primary object being logged.
+        child_ctx (Any): Secondary object associated with the log entry.
+
+    Returns:
+        str: Timestamped artifact name with a type-appropriate prefix.
+    """
     from haiqu.sdk.wiz.drawer import Drawer
     from haiqu.sdk.wiz.jupyter import DATE_TIME_FORMAT
 
@@ -531,8 +637,19 @@ def generate_artifact_name(parent_ctx: Any, child_ctx: Any) -> str:
     return f"{prefix} {datetime.now().strftime(DATE_TIME_FORMAT)}"
 
 
-def check_circuit_context(ctx: Any) -> Union[QuantumCircuit, None]:
-    """Check if the context is a QuantumCircuit or QASM string."""
+def check_circuit_context(ctx: Any) -> QuantumCircuit | None:
+    """Interpret a logging context as a quantum circuit when possible.
+
+    String inputs are treated as potential QASM payloads and parsed through
+    ``ensure_qc()``. Invalid QASM strings are treated as non-circuit inputs.
+
+    Args:
+        ctx (Any): Context object to inspect.
+
+    Returns:
+        QuantumCircuit | None: Parsed ``QuantumCircuit`` when the input
+        represents a circuit; otherwise ``None``.
+    """
     if isinstance(ctx, str):
         # Test if string is a QASM 2.0 / 3.0 dump
         try:
@@ -557,10 +674,11 @@ def is_jupyter() -> bool:
 
 
 def detect_notebook() -> str | None:
-    """Detect if we are running inside a Jupyter Notebook environment.
+    """Detect whether execution is happening inside a Jupyter notebook.
 
-    Returns the notebook path if detected, otherwise None.
-    Example return value: /examples/run_examples/200_GHZStatePreparation.ipynb
+    Returns:
+        str | None: Notebook path when it can be determined, otherwise
+        ``None``. Example: ``/examples/run_examples/200_GHZStatePreparation.ipynb``.
     """
     if not is_jupyter():
         return
@@ -580,8 +698,20 @@ def detect_notebook() -> str | None:
     return bits[1]
 
 
-def setup_logger(logger_name: str, log_level=logging.INFO) -> logging.Logger:
-    """Initialize the logger."""
+@typecheck
+def setup_logger(logger_name: str, log_level: int = logging.INFO) -> logging.Logger:
+    """Create and configure a stream logger.
+
+    The logger and its stream handler both use the provided log level and a
+    consistent SDK log format.
+
+    Args:
+        logger_name (str): Logger name.
+        log_level (int): Logging level applied to the logger and stream handler.
+
+    Returns:
+        logging.Logger: Configured logger instance.
+    """
     LOG_FORMAT = "%(asctime)s - %(name)s:%(lineno)d - %(levelname)s - %(message)s"
 
     logger = logging.getLogger(logger_name)

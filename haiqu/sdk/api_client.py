@@ -5,7 +5,8 @@ Client for Haiqu REST API service.
 
 import functools
 import types
-from typing import Mapping, Optional, List, Union, Dict, Tuple, TYPE_CHECKING
+from collections.abc import Mapping
+from typing import Optional, List, Union, Dict, Tuple, TYPE_CHECKING
 from urllib.parse import urljoin
 
 import requests
@@ -15,9 +16,10 @@ from json import dumps
 from urllib3.util import Retry
 
 from . import schemas
-from .constants import REST_API_URI
-from .exceptions import InvalidAPIKeyError, CircuitNotFoundError
+from .constants import REST_API_URI, SDK_VERSION_HEADER
+from .exceptions import InvalidAPIKeyError, CircuitNotFoundError, OutdatedSDKError
 from .utils import HaiquJSONEncoder
+from .version import get_version
 
 if TYPE_CHECKING:
     from .optimization import QUBO
@@ -110,6 +112,9 @@ class ApiClient:
         self.rest_api_uri = rest_api_uri
         self.session = requests.Session()
         self.session.headers["Content-Type"] = "application/json"
+        self.session.headers["authorization"] = api_access_key
+        # Send the installed SDK version with every request.
+        self.session.headers[SDK_VERSION_HEADER] = get_version()
         retries = Retry(
             total=retry_total,
             backoff_factor=0.5,
@@ -617,21 +622,14 @@ class ApiClient:
 
     # ------------------------------------------------------------------------
     # Helper functions
-    def _build_url(self, endpoint: str, with_auth=False) -> str:
+    def _build_url(self, endpoint: str) -> str:
         """Build full REST API endpoint URL."""
-        params = ""
-        if with_auth:
-            params = f"?HAIQU_API_KEY={self.api_access_key}"
-        return urljoin(self.rest_api_uri, endpoint) + params
-
-    def _required_params(self) -> Mapping:
-        """Compose required REST API params."""
-        return {"HAIQU_API_KEY": self.api_access_key}
+        return urljoin(self.rest_api_uri, endpoint)
 
     def _get(
         self,
         endpoint: str,
-        query_params: Optional[Mapping] = {},
+        query_params: Optional[Mapping] = None,
         timeout=None,
     ) -> requests.Response:
         """Helper method for GET requests.
@@ -643,12 +641,9 @@ class ApiClient:
         Returns:
             requests.Response: API response.
         """
-        params = self._required_params()
-        params.update(query_params)
-
         response = self.session.get(
             url=self._build_url(endpoint),
-            params=params,
+            params=query_params,
             timeout=timeout,
         )
         self._handle_http_errors(response)
@@ -672,7 +667,6 @@ class ApiClient:
         response = self.session.post(
             url=self._build_url(endpoint),
             data=data,
-            params=self._required_params(),
         )
         self._handle_http_errors(response)
         return response
@@ -695,7 +689,6 @@ class ApiClient:
         response = self.session.put(
             url=self._build_url(endpoint),
             data=data,
-            params=self._required_params(),
         )
         self._handle_http_errors(response)
         return response
@@ -713,20 +706,30 @@ class ApiClient:
 
         response = self.session.delete(
             url=self._build_url(endpoint),
-            params=self._required_params(),
         )
         self._handle_http_errors(response)
 
         return response
 
     def _handle_http_errors(self, response: requests.Response) -> None:
-        """Helper for handling request errors.
+        """Raise SDK-specific exceptions for failed API responses.
 
         Args:
-            response (requests.Response): API response.
-        """
+            response (requests.Response): API response to inspect.
 
-        if response.status_code == codes.UNAUTHORIZED:
+        Raises:
+            OutdatedSDKError: Raised for the API's ``outdated_sdk`` response.
+            InvalidAPIKeyError: Raised for ``401`` responses.
+            requests.HTTPError: Raised by ``response.raise_for_status()`` for
+                other non-OK responses.
+        """
+        if response.status_code == codes.UPGRADE_REQUIRED:  # 426
+            payload = response.json()
+            detail = payload["detail"]
+            if detail.get("error_code") == "outdated_sdk":
+                raise OutdatedSDKError(detail["message"])
+
+        if response.status_code == codes.UNAUTHORIZED:  # 401
             raise InvalidAPIKeyError()
         elif not response.ok:
             response.raise_for_status()

@@ -14,7 +14,6 @@ from typing import Any, Optional, Union
 from collections.abc import Sequence
 from inspect import signature
 from numbers import Number, Real
-import importlib.metadata
 
 
 from .optimization import (
@@ -35,6 +34,7 @@ from . import constants
 from . import errors
 from .api_client import ApiClient
 from .backpropagation import backpropagation
+from .qml.compression_options import CompressionOptions
 from .qml.problem import VariationalProblem
 from .utils import find_shared_parameters
 from .qml.optimizer import NFTOptimizerOptions, OptimizerOptions
@@ -47,6 +47,7 @@ from .exceptions import (
     JobNotRegisteredInExperimentError,
 )
 from .errors import error_widget_or_string
+from .version import get_version
 from .schemas import (
     JOB_MODELS,
     PretrainingJobModel,
@@ -95,6 +96,7 @@ from .utils import (
     get_job_shots,
     check_circuit_context,
     is_haiqu_generated,
+    job_name_from_circuits,
     preprocess_metrics,
     to_qpy,
     from_qpy,
@@ -149,7 +151,7 @@ class Haiqu:
         # shorthand to omit additional import in user code
         self.JobType = JobType
 
-        self.version = importlib.metadata.version("haiqu-sdk")
+        self.version = get_version()
 
     def login(
         self,
@@ -184,7 +186,6 @@ class Haiqu:
             api_access_key=api_access_key,
             rest_api_uri=edge_uri,
         )
-
         # Test the API Key and the connection to API service.
         res = self.user(raise_on_error=raise_on_error)
         if not isinstance(res, UserModel):
@@ -387,10 +388,7 @@ class Haiqu:
                 else:
                     name = name or generate_artifact_name(None, child_ctx)
                     self._log_circuit_metrics(circuit=circuit_meta, **{name: child_ctx})
-                return (
-                    f"Logged objects to the circuit {circuit_meta.name!r}. "
-                    f"View on Dashboard: {constants.DASHBOARD_CIRCUIT_SCHEMA.format(circuit_id=circuit_meta.id)}"
-                )
+                return f"Logged objects to the circuit {circuit_meta.name!r}."
             return circuit_meta
 
         circuit = check_circuit_context(parent_ctx)
@@ -1173,6 +1171,7 @@ class Haiqu:
         data,
         num_blocks,
         target_num_qubits,
+        overlap,
         num_layers,
         truncation_cutoff,
         fine_tuning_iterations,
@@ -1182,6 +1181,7 @@ class Haiqu:
             "data": np.array(data),
             "num_blocks": num_blocks,
             "target_num_qubits": target_num_qubits,
+            "overlap": overlap,
             "num_layers": num_layers,
             "truncation_cutoff": truncation_cutoff,
             "fine_tuning_iterations": fine_tuning_iterations,
@@ -1203,6 +1203,10 @@ class Haiqu:
             target_num_qubits (int | None): The qubit budget to assume when automatically determining the number of blocks. If
                                             ``None`` (default), the number of qubits depends on ``num_blocks``, which must be
                                             specified.
+            overlap (int | float | None): The overlap blocks have with each other.
+                                          An integer indicates the exact number of overlapping indices between consecutive blocks.
+                                          A float in [0, 1) indicates fractional overlap between consecutive blocks.
+                                          If ``None`` (default), the blocks do not overlap.
             num_layers (int): The number of layers in the generated circuit (from 1 to 15 layers).
                               More layers can improve the quality of the circuit
                               blocks at the cost of a deeper circuit. Defaults to 2.
@@ -1222,6 +1226,7 @@ class Haiqu:
         data: Sequence[Number] | Sequence[Sequence[Number]],
         num_blocks: int | Sequence[int] | None = None,
         target_num_qubits: int | None = None,
+        overlap: float | int | None = None,
         num_layers: int = 2,
         truncation_cutoff: Real = 1e-6,
         fine_tuning_iterations: int = 20,
@@ -1276,7 +1281,7 @@ class Haiqu:
         """
         self._check_experiment()
         name, parameters = self._prepare_block_vector_loading_params(
-            data, num_blocks, target_num_qubits, num_layers, truncation_cutoff, fine_tuning_iterations, name
+            data, num_blocks, target_num_qubits, overlap, num_layers, truncation_cutoff, fine_tuning_iterations, name
         )
         return self._client.data_loading(
             data=DataLoadingSubmitModel(
@@ -1559,6 +1564,9 @@ class Haiqu:
             )
         )
 
+    # TODO: accept CompressionOptions instead of raw string params (compression_level,
+    # noise_profile, fine_tuning, approximation_level). Both state_compression and
+    # state_compression_2d route through here, so a single change covers both.
     def _prepare_state_compression_params(
         self,
         circuit: QuantumCircuit | CircuitModel = None,  # Deprecated
@@ -1621,11 +1629,14 @@ class Haiqu:
             circuits (list[QuantumCircuit] | list[CircuitModel]): The quantum circuit(s) to be compressed.
             compression_level (str): The qualitative compression level. Increased compression level will lead to
                                      larger part of the input circuit being compressed.
-                                     Three options are available:
+                                     Four options are available:
 
                                      * "low": best used for shallow input circuits or very low noise levels
                                      * "balanced" (default): gives the best performance for most circuits and noise profiles
                                      * "high": may sometimes yield better results for very deep circuits
+                                     * "max": the largest possible part of the input circuit will be compressed,
+                                              yielding the most extreme depth reduction. Recommended to combine
+                                              with custom approximation level to tune the quality.
 
             noise_profile (str): The device noise profile to assume during compression. The currently available options are:
                                  "ibm_eagle_r3", "ibm_heron_r1", "ibm_heron_r2" (default), "ibm_heron_r3",
@@ -1745,11 +1756,14 @@ class Haiqu:
             device_id (str | None): The ID of the target device for compression. Defaults to ``None``.
             compression_level (str): The qualitative compression level. Increased compression level will lead to
                                      larger part of the input circuit being compressed.
-                                     Three options are available:
+                                     Four options are available:
 
                                      * "low": best used for shallow input circuits or very low noise levels
                                      * "balanced" (default): gives the best performance for most circuits and noise profiles
                                      * "high": may sometimes yield better results for very deep circuits
+                                     * "max": the largest possible part of the input circuit will be compressed,
+                                              yielding the most extreme depth reduction. Recommended to combine
+                                              with custom approximation level to tune the quality.
 
             noise_profile (str | None): The device noise profile to use during compression. See `state_compression` options.
                                         By default (None) the noise profile is automatically chosen to match the device.
@@ -2187,13 +2201,18 @@ class Haiqu:
         use_packing: bool = False,
         pack_size: Optional[int] = None,
         use_session: bool = False,
+        use_compression: bool = False,
+        compression_options: Optional[CompressionOptions] = None,
         job_name: str | None = None,
+        dry_run: bool = False,
     ) -> VariationalJobModel:
         """Optimize a variational quantum circuit to minimize the expectation value of input observable.
 
-        This method uses the NFT (Nakanishi-Fujii-Todo) optimizer internally, a gradient-free
-        optimizer designed for variational quantum algorithms. For detailed information about
-        the algorithm, see the paper: https://arxiv.org/abs/1903.12166
+        Defaults to the NFT (Nakanishi-Fujii-Todo) optimizer, a gradient-free optimizer
+        designed for variational quantum algorithms (https://arxiv.org/abs/1903.12166).
+        Pass a ``ScipyOptimizerOptions`` instance as ``optimizer_options`` to dispatch
+        to any derivative-free ``scipy.optimize.minimize`` method instead (``cobyla``,
+        ``nelder-mead``, ``powell``, ``cobyqa``).
 
         Args:
             problem (VariationalProblem): problem instance containing the ansatz circuit and observable.
@@ -2205,8 +2224,9 @@ class Haiqu:
                 If neither is provided, random parameters in [-0.1π, 0.1π] are generated.
             seed: Random seed for reproducible generation of initial parameters from a uniform
                 distribution in [-0.1π, 0.1π]. Cannot be used together with initial_parameters.
-            optimizer_options: Configuration for the NFT optimizer. If None, uses NFTOptimizerOptions
-                with default values. See NFTOptimizerOptions for available settings.
+            optimizer_options: Configuration for the optimizer. If None, defaults to
+                NFTOptimizerOptions(). Pass a ScipyOptimizerOptions instance to use any
+                derivative-free scipy method (cobyla, nelder-mead, powell, cobyqa) instead.
             use_mitigation: Whether to use error mitigation techniques. Defaults to False.
             use_packing: Whether to use circuit packing for efficient device utilization. Defaults to False.
                 **Warning:** Experimental — packing replicates circuits on unused device qubits
@@ -2218,13 +2238,25 @@ class Haiqu:
                 Only valid when ``use_packing=True``. If ``None`` (default), the backend will
                 pack into at most 2/3 of the device qubits.
             use_session: Whether to use IBM Qiskit Runtime Session for execution. Defaults to False.
+            use_compression: Whether to apply circuit compression at each training step.
+                Binds parameters and compresses the circuit before each QPU evaluation, reducing
+                2-qubit gate count and thus QPU noise. Defaults to False.
+            compression_options: Configuration for compression-in-training. Only used when
+                ``use_compression=True``. If ``None``, default compression settings are applied.
             job_name: The name for the job. If ``None`` (default), a name will be automatically generated.
+            dry_run (bool): Whether to stop just prior to backend execution for QPU cost estimation. Defaults to ``False``.
+                When ``True``, the job's optimization result will be empty since execution on the device is skipped.
+                The estimated QPU cost is then available via ``job.estimated_qpu_cost``. When ``use_session=True``,
+                the estimate excludes classical optimization and parameter-update time, which session mode also bills;
+                ``job.estimated_qpu_cost["warning"]`` carries this notice. Only supported for the NFT optimizer;
+                passing a ``ScipyOptimizerOptions`` with ``dry_run=True`` raises ``NotImplementedError``.
 
         Returns:
             VariationalJobModel: Job handle to track optimization progress and retrieve results.
                 Call ``job.result()`` to retrieve a ``VariationalResult`` exposing ``optimal_parameters`` (``list[float]``),
                 ``min_loss`` (``float``), and ``loss_history`` (``list[float]``). ``job.info`` exposes auxiliary metadata
                 (``loss_history``, ``qpu_cost``, ``session_cost``).
+                When ``dry_run=True``, ``result()`` is empty; use ``job.estimated_qpu_cost`` instead.
                 Use ``job.progress()`` for live status updates and ``help(job.result)`` for the full description of result
                 and ``info`` contents.
 
@@ -2249,6 +2281,12 @@ class Haiqu:
 
             >>> from haiqu.sdk.qml import NFTOptimizerOptions
             >>> optimizer = NFTOptimizerOptions(maxfev=2048, maxiter=100)
+            >>> job = haiqu.variational_optimization(problem, shots=1000, device_id="aer_simulator", optimizer_options=optimizer)
+
+            Scipy COBYLA instead of NFT:
+
+            >>> from haiqu.sdk.qml import ScipyOptimizerOptions
+            >>> optimizer = ScipyOptimizerOptions(method="cobyla", maxfev=200, options={"rhobeg": 0.5})
             >>> job = haiqu.variational_optimization(problem, shots=1000, device_id="aer_simulator", optimizer_options=optimizer)
         """
         self._check_experiment()
@@ -2280,6 +2318,11 @@ class Haiqu:
         elif not isinstance(optimizer_options, OptimizerOptions):
             raise TypeError("optimizer_options must be an OptimizerOptions subclass (e.g., NFTOptimizerOptions).")
 
+        if dry_run and not isinstance(optimizer_options, NFTOptimizerOptions):
+            raise NotImplementedError(
+                "dry_run QPU cost estimation is only supported for the NFT optimizer (NFTOptimizerOptions)."
+            )
+
         # Warn if parameters are shared across multiple gates (violates NFT precondition 1)
         if isinstance(optimizer_options, NFTOptimizerOptions):
             shared_params = find_shared_parameters(problem.ansatz)
@@ -2310,11 +2353,18 @@ class Haiqu:
         if use_session:
             options["use_session"] = True
 
+        if dry_run:
+            options["dry_run"] = True
+
         # Validate and pass packing options
         self._validate_packing(use_packing, pack_size)
         options["use_packing"] = use_packing
         if pack_size is not None:
             options["pack_size"] = pack_size
+
+        if use_compression:
+            options["use_compression"] = True
+            options["compression_options"] = compression_options.model_dump() if compression_options is not None else {}
 
         submit_data = VariationalProblemSubmitModel(
             experiment_id=self._experiment.id,
@@ -2652,11 +2702,12 @@ class Haiqu:
         for c in circuits:
             if isinstance(c, (QuantumCircuit, CircuitModel)):
                 c_logged = self._get_or_create_circuit(circuit=c)
-                if job_name is None:
-                    job_name = "run-job-" + c_logged.name
-                logged_circuits.append(c_logged.id)
+                logged_circuits.append(c_logged)
             else:
                 raise ValueError("The `circuits` must be a logged circuit or a QuantumCircuit, or a list of these types.")
+
+        if job_name is None:
+            job_name = job_name_from_circuits(logged_circuits)
 
         parameters, observables = validate_and_normalize_parameters_and_observables(parameters, observables, len(circuits))
 
@@ -2681,7 +2732,7 @@ class Haiqu:
         job = self._client.run(
             data=RunSubmitModel(
                 experiment_id=self._experiment.id,
-                circuit_ids=logged_circuits,
+                circuit_ids=[c.id for c in logged_circuits],
                 parameters=parameters,
                 shots=shots,
                 observables=observables,
@@ -2738,11 +2789,12 @@ class Haiqu:
         for c in circuits:
             if isinstance(c, (QuantumCircuit, CircuitModel)):
                 c_logged = self._get_or_create_circuit(circuit=c)
-                if job_name is None:
-                    job_name = "dry-run-job-" + c_logged.name
-                logged_circuits.append(c_logged.id)
+                logged_circuits.append(c_logged)
             else:
                 raise ValueError("The `circuits` must be a logged circuit or a QuantumCircuit, or a list of these types.")
+
+        if job_name is None:
+            job_name = job_name_from_circuits(logged_circuits)
 
         parameters, observables = validate_and_normalize_parameters_and_observables(parameters, observables, len(circuits))
 
@@ -2756,7 +2808,7 @@ class Haiqu:
         insights = self._client.dry_run(
             data=RunSubmitModel(
                 experiment_id=self._experiment.id,
-                circuit_ids=logged_circuits,
+                circuit_ids=[c.id for c in logged_circuits],
                 parameters=parameters,
                 shots=shots,
                 observables=observables,
@@ -2834,17 +2886,18 @@ class Haiqu:
         for c in circuits:
             if isinstance(c, (QuantumCircuit, CircuitModel)):
                 c_logged = self._get_or_create_circuit(circuit=c)
-                if job_name is None:
-                    job_name = "statevector-run-job-" + c_logged.name
-                logged_circuits.append(c_logged.id)
+                logged_circuits.append(c_logged)
             else:
                 raise ValueError("The `circuits` must be a logged circuit or a QuantumCircuit, or a list of these types.")
+
+        if job_name is None:
+            job_name = job_name_from_circuits(logged_circuits)
 
         # Submit the job
         job = self._client.run(
             data=RunSubmitModel(
                 experiment_id=self._experiment.id,
-                circuit_ids=logged_circuits,
+                circuit_ids=[c.id for c in logged_circuits],
                 name=job_name,
                 description=job_description,
                 run_type=RunJobType.STATEVECTOR_RUN.value,
@@ -2938,6 +2991,7 @@ class Haiqu:
         use_packing: bool = False,
         pack_size: Optional[int] = None,
         # Compression parameters
+        # TODO: replace compression_options: Optional[dict] with compression_options: Optional[CompressionOptions]
         compression: bool = False,
         compression_options: Optional[dict] = None,
         # Post-processing parameters
@@ -3235,13 +3289,8 @@ class Haiqu:
                 configuration_recovery, seed).
 
         Returns:
-            SKQDJobModel: Job handle.
-                Call ``job.result()`` to retrieve an ``SKQDResult`` containing the best ground-state ``energy``, the CI
-                subspace dimension, the CI ``amplitudes`` and determinant strings (``ci_strs_a``, ``ci_strs_b``),
-                per-orbital ``orbital_occupancies_alpha`` / ``_beta``, and the per-iteration ``iteration_history``.
-                ``job.info`` exposes the SKQD output payload (same fields as ``SKQDResult``).
-                Use ``job.progress()`` for live status updates and ``help(job.result)`` for the full description of result
-                and ``info`` contents.
+            Job handle. Use `job.result()` to block and get
+                `SKQDResult`, or `job.progress()` for live updates.
 
         Examples:
             >>> from haiqu.sdk.skqd import hubbard_hamiltonian, SKQDOptions, build_hubbard_site_basis_krylov_circuits
@@ -3587,6 +3636,7 @@ class Haiqu:
         aws_access_key_id: str,
         aws_secret_access_key: str,
         aws_default_region: str = AWS_DEFAULT_REGION,
+        aws_session_token: Optional[str] = None,
     ):
         """
         Save AWS credentials in the environment variables:
@@ -3594,17 +3644,21 @@ class Haiqu:
         - "AWS_ACCESS_KEY_ID"
         - "AWS_SECRET_ACCESS_KEY"
         - "AWS_DEFAULT_REGION"
+        - "AWS_SESSION_TOKEN" (optional; required for temporary/STS credentials)
 
         NOTE: overwrites existing environment variables with the same names.
 
         Args:
             aws_access_key_id (str): AWS access key ID.
             aws_secret_access_key (str): AWS secret access key.
-            aws_default_region (str): AWS default region. Defaults to "us-west-2".
+            aws_default_region (str): AWS default region. Defaults to "us-east-1".
+            aws_session_token (Optional[str]): AWS session token for temporary/STS credentials. Defaults to None.
         """
         os.environ["AWS_ACCESS_KEY_ID"] = aws_access_key_id
         os.environ["AWS_SECRET_ACCESS_KEY"] = aws_secret_access_key
         os.environ["AWS_DEFAULT_REGION"] = aws_default_region
+        if aws_session_token is not None:
+            os.environ["AWS_SESSION_TOKEN"] = aws_session_token
 
     @staticmethod
     def update_aws_credentials(options):
@@ -3614,6 +3668,7 @@ class Haiqu:
         - "aws_access_key_id"
         - "aws_secret_access_key"
         - "aws_default_region"
+        - "aws_session_token" (optional; required for temporary/STS credentials)
 
         Priorities:
 
@@ -3649,7 +3704,12 @@ class Haiqu:
             os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", config.get("region", AWS_DEFAULT_REGION))),
         )
 
-        if aws_default_region is None or aws_secret_access_key is None or aws_default_region is None:
+        aws_session_token = options.get(
+            "aws_session_token",
+            os.getenv("AWS_SESSION_TOKEN", config.get("aws_session_token", None)),
+        )
+
+        if aws_default_region is None or aws_secret_access_key is None or aws_access_key_id is None:
             raise ValueError(
                 "AWS credentials are required to run on AWS Braket devices. "
                 "Please provide them in the `options`, save them using "
@@ -3660,6 +3720,8 @@ class Haiqu:
         options["aws_access_key_id"] = aws_access_key_id
         options["aws_secret_access_key"] = aws_secret_access_key
         options["aws_default_region"] = aws_default_region
+        if aws_session_token is not None:
+            options["aws_session_token"] = aws_session_token
 
     @staticmethod
     def save_ibm_credentials(ibm_quantum_token: str, ibm_quantum_instance: str):

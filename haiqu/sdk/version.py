@@ -1,5 +1,8 @@
-__version__ = "1.0.0"
+"""Version helpers for the Haiqu SDK package."""
+
+__version__ = "1.1.0"
 
 
-def get_version():
+def get_version() -> str:
+    """Return the Haiqu SDK package version."""
     return __version__

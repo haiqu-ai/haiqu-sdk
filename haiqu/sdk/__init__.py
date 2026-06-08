@@ -4,13 +4,13 @@ The SDK provides programmatic access to Haiqu API service: log experiments,
 circuits, jobs and other user data.
 """
 
-import importlib.metadata
 from .mpl_style import set_haiqu_mpl_style, unset_haiqu_mpl_style
 from .quantum_haiqu import Haiqu, haiqu
 from .utils import get_ibmq_temporary_token
-from .version import get_version
+from .version import __version__, get_version
 
 __all__ = (
+    "__version__",
     "get_version",
     "get_ibmq_temporary_token",
     "haiqu",
@@ -18,5 +18,3 @@ __all__ = (
     "set_haiqu_mpl_style",
     "unset_haiqu_mpl_style",
 )
-
-__version__ = importlib.metadata.version("haiqu-sdk")

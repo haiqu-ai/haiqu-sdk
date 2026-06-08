@@ -35,6 +35,10 @@ class InvalidAPIKeyError(Exception):
     """
 
 
+class OutdatedSDKError(Exception):
+    """Raised when the API requires a newer SDK version."""
+
+
 class ExperimentSearchByNameError(Exception):
     """
     Raised when the request experiment by name failed with 404 error.

@@ -4,19 +4,25 @@ Haiqu SDK QML: Optimizer configuration classes.
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from typing import Annotated, Any, Dict, Literal, Union
+
+from pydantic import BaseModel, Field, model_validator
 
 
 class OptimizerOptions(BaseModel):
     """Base class for optimizer configuration.
 
     Subclass this to create configuration for specific optimizers.
-    Do not instantiate directly; use a subclass like NFTOptimizerOptions.
+    Do not instantiate directly; use a subclass like NFTOptimizerOptions or
+    ScipyOptimizerOptions.
     """
 
     def __init__(self, **data):
         if type(self) is OptimizerOptions:
-            raise TypeError("OptimizerOptions cannot be instantiated directly. " "Use a subclass such as NFTOptimizerOptions.")
+            raise TypeError(
+                "OptimizerOptions cannot be instantiated directly. "
+                "Use a subclass such as NFTOptimizerOptions or ScipyOptimizerOptions."
+            )
         super().__init__(**data)
 
 
@@ -49,8 +55,8 @@ class NFTOptimizerOptions(OptimizerOptions):
         reset_interval: How often to reset the recycled loss value.
             Set to 0 to disable resets. Default: 32.
         maxfev: Maximum number of function evaluations (circuit executions).
-            Optimization stops when this limit is reached. Default: 1024.
-        maxiter: Maximum number of iterations (parameter updates). Default: 500.
+            Optimization stops when this limit is reached. Default: 200.
+        maxiter: Maximum number of iterations (parameter updates). Default: 100.
         eps: Small epsilon value to avoid division by zero in the analytic
             solution. Default: 1e-32.
 
@@ -65,11 +71,95 @@ class NFTOptimizerOptions(OptimizerOptions):
 
     Example:
         >>> from haiqu.sdk.qml import NFTOptimizerOptions
-        >>> optimizer = NFTOptimizerOptions(maxfev=2048, maxiter=100)
+        >>> optimizer = NFTOptimizerOptions(maxfev=500, maxiter=200)
     """
 
+    type: Literal["nft"] = "nft"
     randomized_order: bool = False
     reset_interval: int = 32
-    maxfev: int = 1024
-    maxiter: int = 500
+    maxfev: int = 200
+    maxiter: int = 100
     eps: float = 1e-32
+
+
+# Per-method whitelist of keys that may appear in ScipyOptimizerOptions.options.
+# 'maxfev' is excluded because it is exposed as a typed top-level field. Update
+# this dict when adding a new supported method.
+_KNOWN_OPTIONS = {
+    "cobyla": {"rhobeg", "catol", "disp"},
+    "nelder-mead": {"xatol", "fatol", "adaptive", "disp"},
+    "powell": {"xtol", "ftol", "direc", "disp"},
+    "cobyqa": {"rhobeg", "final_tr_radius", "disp"},
+}
+
+
+class ScipyOptimizerOptions(OptimizerOptions):
+    """Configuration for any derivative-free ``scipy.optimize.minimize`` method.
+
+    The Haiqu backend wraps ``scipy.optimize.minimize`` for the four supported
+    derivative-free methods. ``maxfev`` is the only option that is universal
+    across all of them, so it gets a typed slot; everything else goes in the
+    free-form ``options`` dict and is validated against a per-method whitelist
+    at construction time, mirroring what ``scipy.optimize.minimize`` accepts.
+
+    Methods:
+        - ``cobyla``: Constrained Optimization BY Linear Approximation. Trust-region
+          method with linear surrogates; robust default on noisy expectation values.
+        - ``nelder-mead``: Downhill simplex. No surrogate model; forgiving on noisy
+          or non-smooth objectives but tends to need more evaluations.
+        - ``powell``: Direction-set method that minimizes along conjugate directions;
+          often fast on well-conditioned problems.
+        - ``cobyqa``: COBYLA's quadratic-approximation successor; typically higher
+          quality per evaluation than COBYLA at modest extra cost.
+
+    Args:
+        method: scipy method name. One of ``cobyla``, ``nelder-mead``, ``powell``, ``cobyqa``.
+        maxfev: Maximum number of function evaluations (circuit executions).
+            Default: 200. The Haiqu backend enforces this cap uniformly across
+            methods even when scipy's native option name differs.
+        options: Per-method options forwarded to ``scipy.optimize.minimize``.
+            Allowed keys are validated at construction time; an unknown key raises
+            ``ValueError``.
+
+            Per-method allowed keys:
+
+            - ``cobyla``: ``rhobeg``, ``catol``, ``disp``
+            - ``nelder-mead``: ``xatol``, ``fatol``, ``adaptive``, ``disp``
+            - ``powell``: ``xtol``, ``ftol``, ``direc``, ``disp``
+            - ``cobyqa``: ``rhobeg``, ``final_tr_radius``, ``disp``
+
+            ``maxfev`` is intentionally excluded; pass it via the top-level field.
+
+    Notes:
+        Final result selection: scipy methods can wander after they have found a
+        good point. Haiqu therefore returns the best-so-far parameters tracked
+        across the optimization, not the final scipy iterate.
+
+    Example:
+        >>> from haiqu.sdk.qml import ScipyOptimizerOptions
+        >>> ScipyOptimizerOptions(method="cobyla", maxfev=200, options={"rhobeg": 0.5})
+        >>> ScipyOptimizerOptions(method="powell", maxfev=500, options={"xtol": 1e-6})
+        >>> ScipyOptimizerOptions(method="nelder-mead", options={"adaptive": True})
+    """
+
+    type: Literal["scipy"] = "scipy"
+    method: Literal["cobyla", "nelder-mead", "powell", "cobyqa"]
+    maxfev: int = 200
+    options: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_options(self) -> "ScipyOptimizerOptions":
+        allowed = _KNOWN_OPTIONS[self.method]
+        unknown = set(self.options) - allowed
+        if unknown:
+            raise ValueError(
+                f"Unknown options for method={self.method!r}: {sorted(unknown)}. "
+                f"Allowed: {sorted(allowed)}. (maxfev is a top-level field, not an option key.)"
+            )
+        return self
+
+
+OptimizerOptionsUnion = Annotated[
+    Union[NFTOptimizerOptions, ScipyOptimizerOptions],
+    Field(discriminator="type"),
+]
