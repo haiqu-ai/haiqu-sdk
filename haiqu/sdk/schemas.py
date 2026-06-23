@@ -7,7 +7,7 @@ import enum
 from datetime import datetime
 from functools import cached_property
 import time
-from typing import Any, Iterable, Optional, Union, List, Tuple, cast
+from typing import Annotated, Any, Iterable, Optional, Union, List, Tuple, cast
 import json
 import numpy as np
 
@@ -20,6 +20,7 @@ from . import gates
 from . import errors
 from . import exceptions
 from .errors import JUPYTER_LAB  # TODO: find better place for this constant
+from .hybrid import HybridProgram
 from .utils import from_qpy, setup_logger
 from .qml.optimizer import NFTOptimizerOptions, OptimizerOptionsUnion
 
@@ -939,6 +940,7 @@ class JobType(enum.Enum):
     ANALYTICS = "Analytics"  # circuit.analytics & circuit.evolution
     DEVICE_ANALYTICS = "Device specific analytics"  # circuit.transpilation
     DATA_LOADING = "Data Loading"
+    HYBRID = "Hybrid"
     RUN = "Run"
     COMPRESSION = "State Compression"
     TRANSPILATION = "Transpilation"
@@ -1259,6 +1261,114 @@ class StateCompressionEstimatesModel(DataLoadingEstimatesModel):
         from haiqu.sdk.wiz.jupyter import compression_estimates
 
         return compression_estimates(data=self, help=help)
+
+
+class HybridSubmitModel(BaseModel):
+    """Hybrid submit payload data model."""
+
+    experiment_id: str
+
+    name: Optional[str] = ""
+    description: Optional[str] = ""
+
+    program: HybridProgram
+
+    circuit_ids: Annotated[list[str], Field(min_length=1)]
+    shots: Annotated[int, Field(ge=1)] = 1000
+    parameters: Optional[list] = None
+    observables: Optional[List[List[Tuple[List[str], List[float]]]]] = None
+
+    device_credentials: dict = {}
+    dry_run: bool = False
+
+
+class HybridJobModel(BaseJobModel):
+    """
+    Hybrid Job (running on Haiqu backend).
+    """
+
+    program: HybridProgram
+
+    input_circuit_ids: list[str]
+    shots: int
+    parameters: Optional[list] = None
+    observables: Optional[List[List[Tuple[List[str], List[float]]]]] = None
+
+    # device_credentials omitted
+    dry_run: bool
+
+    # Populated after job finishes
+    quantum_results: Optional[list] = None
+    estimated_qpu_cost_: Annotated[Optional[dict], Field(alias="estimated_qpu_cost")] = None
+
+    def retrieve_status(self) -> JobStatus:
+        """
+        Query backend for the job status.
+        """
+        response = cast(HybridJobModel, self._retrieve_status())
+        self.quantum_results = response.quantum_results
+        self.estimated_qpu_cost_ = response.estimated_qpu_cost_
+
+        return self.status
+
+    def progress(self):
+        """
+        Display the progress widget, stream logs from the job.
+        """
+        self._progress("HYBRID JOB PROGRESS")
+
+    def result(self) -> Union[list, None]:
+        """
+        Block and wait for the job to complete, then return the results.
+
+        Raises an exception if the job failed, with the logs attached.
+
+        Returns:
+            list: Results of the job unless interrupted or failed.
+        """
+        super().result()
+        return self.quantum_results
+
+    @property
+    def estimated_qpu_cost(self) -> Optional[dict]:
+        """
+        Return the estimated QPU cost for the job, based on circuit depth,
+        shot count, and device rep delay.
+
+        Returns:
+            dict or None: ``{"native": {"amount": <seconds>, "unit": "s"},
+            "converted": {"amount": <dollars>, "unit": "USD"}}``
+
+        Warning:
+            This property blocks the current CPU thread until the job reaches a
+            terminal state (Done/Error), similarly to ``result()``. Use ``retrieve_status()``
+            to first check the state of the job to omit the prolonged thread blockade.
+        """
+        self.result()
+
+        return self.estimated_qpu_cost_
+
+    @property
+    def qpu_cost(self) -> Optional[dict]:
+        """
+        Actual QPU cost after execution. Pricing varies by vendor
+        (e.g. time-based for IBM, shot-based for AWS).
+        Returns None if there is no QPU cost (e.g. simulator execution).
+
+        Returns:
+            dict or None: ``{"native": {"amount": <float>, "unit": "<vendor_unit>"},
+            "converted": {"amount": <dollars>, "unit": "USD"}}``
+
+        Warning:
+            This property blocks the current CPU thread until the job reaches a
+            terminal state (Done/Error), similarly to ``result()``. Use ``retrieve_status()``
+            to first check the state of the job to omit the prolonged thread blockade.
+        """
+        self.result()
+
+        if self.info is None:
+            return None
+        return self.info.get("qpu_cost")
 
 
 class RunSubmitModel(BaseModel):
@@ -2232,6 +2342,7 @@ JOB_MODELS = (
     AnalyticsJobModel
     | BaseJobModel
     | DataLoadingJobModel
+    | HybridJobModel
     | LocalJobModel
     | RunJobModel
     | StateCompressionJobModel

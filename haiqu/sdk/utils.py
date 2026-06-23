@@ -490,11 +490,11 @@ def validate_and_normalize_parameters_and_observables(parameters, observables, n
         ValueError: If the input shape doesn't match any accepted form.
     """
 
-    def is_float_list(lst):
-        return isinstance(lst, list) and all(isinstance(x, (int, float)) for x in lst)
+    def is_nonempty_float_list(lst):
+        return isinstance(lst, list) and lst and all(isinstance(x, (int, float)) for x in lst)
 
-    def is_sparse_list(lst):
-        return isinstance(lst, list) and all(isinstance(o, SparsePauliOp) for o in lst)
+    def is_nonempty_sparse_list(lst):
+        return isinstance(lst, list) and lst and all(isinstance(o, SparsePauliOp) for o in lst)
 
     # Parameters validation - accepts either 2D or 3D
     if parameters is not None:
@@ -503,14 +503,14 @@ def validate_and_normalize_parameters_and_observables(parameters, observables, n
 
         if num_circuits == 1:
             # Single circuit: accept 2D [[p1, p2], [q1, q2], ...]
-            if not all(is_float_list(row) for row in parameters):
+            if not all(is_nonempty_float_list(row) for row in parameters):
                 raise ValueError("Single circuit: `parameters` must be 2D list of floats, " "[[p1, p2], [q1, q2], ...].")
         else:
             # Multiple circuits: accept 3D [[[c1p1, c1p2], [c1q1, c1q2]], [[c2r1, c2r2], [c2s1, c2s2]]]
             if len(parameters) != num_circuits:
                 raise ValueError(f"Multiple circuits: `parameters` must have {num_circuits} entries, one per circuit.")
 
-            if not all(all(is_float_list(row) for row in group) for group in parameters):
+            if not all(all(is_nonempty_float_list(row) for row in group) for group in parameters):
                 raise ValueError(
                     "Multiple circuits: `parameters` must be 3D list of floats, "
                     "[[[c1p1, c1p2], [c1q1, c1q2]], [[c2r1, c2r2], [c2s1, c2s2]]]."
@@ -523,10 +523,10 @@ def validate_and_normalize_parameters_and_observables(parameters, observables, n
             if isinstance(observables, SparsePauliOp):
                 # Single operator → [[tuple]]
                 observables = [[sparse_op_to_tuple(observables)]]
-            elif isinstance(observables, list) and len(observables) == 1 and is_sparse_list(observables[0]):
+            elif isinstance(observables, list) and len(observables) == 1 and is_nonempty_sparse_list(observables[0]):
                 # Nested form [[op1, op2, ...]] → [[tuple1, tuple2, ...]]
                 observables = [[sparse_op_to_tuple(op) for op in observables[0]]]
-            elif is_sparse_list(observables):
+            elif is_nonempty_sparse_list(observables):
                 # Bare list of operators → [[tuple1, tuple2, ...]]
                 observables = [[sparse_op_to_tuple(op) for op in observables]]
             else:
@@ -544,7 +544,7 @@ def validate_and_normalize_parameters_and_observables(parameters, observables, n
                 if isinstance(circuit_obs, SparsePauliOp):
                     # Single operator for this circuit → [tuple]
                     processed.append([sparse_op_to_tuple(circuit_obs)])
-                elif is_sparse_list(circuit_obs):
+                elif is_nonempty_sparse_list(circuit_obs):
                     # List of operators for this circuit → [tuple1, tuple2, ...]
                     processed.append([sparse_op_to_tuple(op) for op in circuit_obs])
                 else:

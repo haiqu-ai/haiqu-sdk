@@ -34,6 +34,7 @@ from . import constants
 from . import errors
 from .api_client import ApiClient
 from .backpropagation import backpropagation
+from .hybrid import HybridProgram, layers
 from .qml.compression_options import CompressionOptions
 from .qml.problem import VariationalProblem
 from .utils import find_shared_parameters
@@ -60,6 +61,8 @@ from .schemas import (
     JobStatus,
     LocalJobModel,
     LocalJobSubmitModel,
+    HybridSubmitModel,
+    HybridJobModel,
     RunSubmitModel,
     RunJobModel,
     JobInsights,
@@ -103,6 +106,7 @@ from .utils import (
     validate_and_normalize_parameters_and_observables,
     AWS_DEFAULT_REGION,
 )
+from .constants import MAX_DATA_LOADING_TIME, MAX_COMPRESSION_TIME
 
 __all__ = ["haiqu", "Haiqu"]
 
@@ -227,7 +231,7 @@ class Haiqu:
 
     @errors.graceful_api_errors_message
     def init(self, experiment_ctx: str, experiment_description: str = "") -> str:
-        """Set the current experiment.
+        """Set the current experiment (create or use existing own or shared experiment).
 
         If an experiment with this name doesn't exist yet, it will be created with the given description.
 
@@ -235,7 +239,7 @@ class Haiqu:
         experiment will be used if one is not set explicitly.
 
         Args:
-            experiment_ctx (str): The experiment name.
+            experiment_ctx (str): The experiment name or ID of the shared experiment.
             experiment_description (str): An optional text description of the experiment. Only used when creating the experiment.
 
         Returns:
@@ -244,6 +248,10 @@ class Haiqu:
         Examples:
             >>> haiqu.init("Example Experiment", "The experiment to use for all examples.")
             'Set current experiment to: Example Experiment. View on Dashboard: https://dashboard.haiqu.ai/experiments/...'
+
+            Shared experiment can be set by its ID:
+
+            >>> haiqu.init("exp-12345678-1234-5678-1234-567812345678")
         """
         self._init(experiment_ctx, experiment_description)
         return (
@@ -521,23 +529,15 @@ class Haiqu:
 
             >>> transpiled_circuit = haiqu.transpile(circuit, device, seed_transpiler=[0, 1, 2, 3, 4])
         """
-        if not isinstance(circuits, list):
-            circuits = [circuits]
-
-        logged_circuits = []
-        for c in circuits:
-            if isinstance(c, (QuantumCircuit, CircuitModel)):
-                c_logged = self._get_or_create_circuit(circuit=c)
-                logged_circuits.append(c_logged.id)
-            else:
-                raise ValueError("The `circuits` must be a logged circuit or a QuantumCircuit, or a list of these types.")
+        self._check_experiment()
+        logged_circuits = self._prepare_circuits(circuits)
 
         if not isinstance(device, DeviceModel):
             raise ValueError("The device must be a DeviceModel instance as returned by haiqu.get_device().")
 
         submit_data = SubmitTranspilationModel(
             experiment_id=self._experiment.id,
-            circuit_ids=logged_circuits,
+            circuit_ids=[c.id for c in logged_circuits],
             device_id=device.id,
             transpilation_options=transpilation_options,
         )
@@ -1075,13 +1075,18 @@ class Haiqu:
         num_layers,
         truncation_cutoff,
         fine_tuning_iterations,
+        max_time,
         name,
     ):
+        if max_time < 0 or max_time > MAX_DATA_LOADING_TIME:
+            raise ValueError(f"max_time must be non-negative but no more than {MAX_DATA_LOADING_TIME} seconds")
+
         parameters = {
             "data": np.array(data),
             "num_layers": num_layers,
             "truncation_cutoff": truncation_cutoff,
             "fine_tuning_iterations": fine_tuning_iterations,
+            "max_time": max_time,
         }
 
         if name is None:
@@ -1089,7 +1094,7 @@ class Haiqu:
 
         return name, parameters
 
-    _vector_loading_args = """
+    _vector_loading_args = f"""
             data (Sequence[Number]): The vector with data to encode (length of data is from 1 to ``2**20`` values).
             num_qubits: (int | None): The number of qubits in the generated circuit (from 1 to 20 qubits).
                                       If ``None`` (default), it is set automatically from the size of the data.
@@ -1101,6 +1106,13 @@ class Haiqu:
             fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
                                           Increasing this limit may improve the quality of the circuit by using more classical
                                           resources. Defaults to 20, maximal is 200.
+            max_time (int | float): Soft time limit for the job (in seconds).
+                            The data loading job will first always produce the initial result and then limit the fine-tuning
+                            stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
+                            current result will be returned. Defaults to {MAX_DATA_LOADING_TIME}
+                            ({MAX_DATA_LOADING_TIME//60} min). Max allowed job time is {MAX_DATA_LOADING_TIME//60} min.
+                            The job can take more wall clock time than user specified `max_time` due to latency,
+                            initialization overheads or if the initial result already takes more time.
             name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be automatically
                                generated.
     """
@@ -1114,6 +1126,7 @@ class Haiqu:
         num_layers: int = 2,
         truncation_cutoff: Real = 1e-6,
         fine_tuning_iterations: int = 20,
+        max_time: int | float = MAX_DATA_LOADING_TIME,
         name: str | None = None,
     ) -> DataLoadingJobModel:
         """Generate a quantum circuit that prepares an arbitrary real or complex vector.
@@ -1154,7 +1167,9 @@ class Haiqu:
                  └────────────────────────────────────────────────────────────┘
         """
         self._check_experiment()
-        name, parameters = self._prepare_vector_loading_params(data, num_layers, truncation_cutoff, fine_tuning_iterations, name)
+        name, parameters = self._prepare_vector_loading_params(
+            data, num_layers, truncation_cutoff, fine_tuning_iterations, max_time, name
+        )
 
         return self._client.data_loading(
             data=DataLoadingSubmitModel(
@@ -1175,8 +1190,12 @@ class Haiqu:
         num_layers,
         truncation_cutoff,
         fine_tuning_iterations,
+        max_time,
         name,
     ):
+        if max_time < 0 or max_time > MAX_DATA_LOADING_TIME:
+            raise ValueError(f"max_time must be non-negative but no more than {MAX_DATA_LOADING_TIME} seconds")
+
         parameters = {
             "data": np.array(data),
             "num_blocks": num_blocks,
@@ -1185,6 +1204,7 @@ class Haiqu:
             "num_layers": num_layers,
             "truncation_cutoff": truncation_cutoff,
             "fine_tuning_iterations": fine_tuning_iterations,
+            "max_time": max_time,
         }
 
         if name is None:
@@ -1193,7 +1213,7 @@ class Haiqu:
 
         return name, parameters
 
-    _block_vector_loading_args = """
+    _block_vector_loading_args = f"""
             data (Sequence[Number] | Sequence[Sequence[Number]]): The vector or matrix with data to encode.
             num_blocks (int | Sequence[int] | None): The number of blocks into which to split the data. It must be a single number
                                                      in one dimension and a pair of numbers (rows and columns) in two dimensions.
@@ -1215,6 +1235,14 @@ class Haiqu:
             fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
                                           Increasing this limit may improve the quality of the circuit by using more classical
                                           resources. Defaults to 20, maximal is 200.
+            max_time (int | float): Soft time limit for the job (in seconds).
+                            The data loading job will first always produce the initial result and then limit the fine-tuning
+                            stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
+                            current result will be returned. Defaults to {MAX_DATA_LOADING_TIME}
+                            ({MAX_DATA_LOADING_TIME//60} min). Max allowed job time is {MAX_DATA_LOADING_TIME//60} min.
+                            The job can take more wall clock time than user specified `max_time` due to latency,
+                            initialization overheads or if the initial result already takes more time. This time limit
+                            will be evenly split across generation of each block.
             name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be automatically
                                generated.
     """
@@ -1230,6 +1258,7 @@ class Haiqu:
         num_layers: int = 2,
         truncation_cutoff: Real = 1e-6,
         fine_tuning_iterations: int = 20,
+        max_time: int | float = MAX_DATA_LOADING_TIME,
         name: str | None = None,
     ) -> DataLoadingJobModel:
         """Generate a block-wise quantum circuit that prepares an arbitrary vector or matrix.
@@ -1281,7 +1310,7 @@ class Haiqu:
         """
         self._check_experiment()
         name, parameters = self._prepare_block_vector_loading_params(
-            data, num_blocks, target_num_qubits, overlap, num_layers, truncation_cutoff, fine_tuning_iterations, name
+            data, num_blocks, target_num_qubits, overlap, num_layers, truncation_cutoff, fine_tuning_iterations, max_time, name
         )
         return self._client.data_loading(
             data=DataLoadingSubmitModel(
@@ -1301,8 +1330,12 @@ class Haiqu:
         num_layers,
         truncation_cutoff,
         fine_tuning_iterations,
+        max_time,
         name,
     ):
+        if max_time < 0 or max_time > MAX_DATA_LOADING_TIME:
+            raise ValueError(f"max_time must be non-negative but no more than {MAX_DATA_LOADING_TIME} seconds")
+
         parameters = {
             "data": np.array(data),
             "density": density,
@@ -1311,6 +1344,7 @@ class Haiqu:
             "num_layers": num_layers,
             "truncation_cutoff": truncation_cutoff,
             "fine_tuning_iterations": fine_tuning_iterations,
+            "max_time": max_time,
         }
 
         if name is None:
@@ -1318,7 +1352,7 @@ class Haiqu:
 
         return name, parameters
 
-    _entangled_manifold_embedding_args = """
+    _entangled_manifold_embedding_args = f"""
                 data (Sequence[Real]): The real vector with data to encode.
                 density: (int | None): Feature density of the encoding (from 1 to 8). Larger values result in more features
                                        encoded per qubit but resulting quantum states are more entangled. Ignored if
@@ -1343,6 +1377,13 @@ class Haiqu:
                 fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
                                               Increasing this limit may improve the quality of the circuit by using more classical
                                               resources. Defaults to 20, maximum is 200.
+                max_time (int | float): Soft time limit for the job (in seconds).
+                                The data loading job will first always produce the initial result and then limit the fine-tuning
+                                stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
+                                current result will be returned. Defaults to {MAX_DATA_LOADING_TIME}
+                                ({MAX_DATA_LOADING_TIME//60} min). Max allowed job time is {MAX_DATA_LOADING_TIME//60} min.
+                                The job can take more wall clock time than user specified `max_time` due to latency,
+                                initialization overheads or if the initial result already takes more time.
                 name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be
                                    automatically generated.
         """
@@ -1359,6 +1400,7 @@ class Haiqu:
         num_layers: int = 2,
         truncation_cutoff: Real = 1e-6,
         fine_tuning_iterations: int = 20,
+        max_time: int | float = MAX_DATA_LOADING_TIME,
         name: str | None = None,
     ) -> DataLoadingJobModel:
         """Generate a quantum circuit that produces entangled manifold embedding of the real data into a quantum state of a
@@ -1419,7 +1461,7 @@ class Haiqu:
         """
         self._check_experiment()
         name, parameters = self._prepare_entangled_manifold_embedding_params(
-            data, density, real, periodicity, num_layers, truncation_cutoff, fine_tuning_iterations, name
+            data, density, real, periodicity, num_layers, truncation_cutoff, fine_tuning_iterations, max_time, name
         )
 
         return self._client.data_loading(
@@ -1448,14 +1490,19 @@ class Haiqu:
         num_layers,
         truncation_cutoff,
         fine_tuning_iterations,
+        max_time,
         name,
     ):
+        if max_time < 0 or max_time > MAX_DATA_LOADING_TIME:
+            raise ValueError(f"max_time must be non-negative but no more than {MAX_DATA_LOADING_TIME} seconds")
+
         parameters = {
             "mps": mps,
             "shape": shape,
             "num_layers": num_layers,
             "truncation_cutoff": truncation_cutoff,
             "fine_tuning_iterations": fine_tuning_iterations,
+            "max_time": max_time,
         }
 
         if name is None:
@@ -1463,7 +1510,7 @@ class Haiqu:
 
         return name, parameters
 
-    _mps_loading_args = """
+    _mps_loading_args = f"""
             mps (Sequence): The MPS in either standard or Vidal form. Standard form expects a list of rank-3
                              site tensors (one per each qubit). Vidal form is a tuple of site and bond tensors,
                              where bonds tensors are rank-1 or diagonal rank-2 tensors. The MPS type is determined automatically.
@@ -1480,6 +1527,13 @@ class Haiqu:
             fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
                                           Increasing this limit may improve the quality of the circuit by using more classical
                                           resources. Defaults to 20.
+            max_time (int | float): Soft time limit for the job (in seconds).
+                            The data loading job will first always produce the initial result and then limit the fine-tuning
+                            stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
+                            current result will be returned. Defaults to {MAX_DATA_LOADING_TIME}
+                            ({MAX_DATA_LOADING_TIME//60} min). Max allowed job time is {MAX_DATA_LOADING_TIME//60} min.
+                            The job can take more wall clock time than user specified `max_time` due to latency,
+                            initialization overheads or if the initial result already takes more time.
             name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be automatically
                                generated.
     """
@@ -1493,6 +1547,7 @@ class Haiqu:
         num_layers: int = 2,
         truncation_cutoff: Real = 1e-6,
         fine_tuning_iterations: int = 20,
+        max_time: int | float = MAX_DATA_LOADING_TIME,
         name: str | None = None,
     ) -> DataLoadingJobModel:
         """Generate a quantum circuit that prepares a quantum state from matrix product state (MPS).
@@ -1552,7 +1607,7 @@ class Haiqu:
         """
         self._check_experiment()
         name, parameters = self._prepare_mps_loading_params(
-            mps, shape, num_layers, truncation_cutoff, fine_tuning_iterations, name
+            mps, shape, num_layers, truncation_cutoff, fine_tuning_iterations, max_time, name
         )
 
         return self._client.data_loading(
@@ -1574,29 +1629,26 @@ class Haiqu:
         compression_level: str = "balanced",
         noise_profile: str = "default",
         fine_tuning: str = "low",
+        max_time: int | float = MAX_COMPRESSION_TIME,
         approximation_level: int | None = None,
         device_id: str | None = None,
     ):
+        if max_time < 0 or max_time > MAX_COMPRESSION_TIME:
+            raise ValueError(f"max_time must be non-negative but no more than {MAX_COMPRESSION_TIME} seconds")
         if circuit is not None and circuits is not None:
             raise ValueError("Only one of `circuit` and `circuits` can be specified.")
         if circuit is not None:
             circuits = [circuit]
             warnings.warn("The 'circuit' parameter is deprecated; use 'circuits' instead.", DeprecationWarning, stacklevel=2)
 
-        # Log the circuits if they are not logged yet
-        logged_circuits = []
-        for c in circuits:
-            if isinstance(c, (QuantumCircuit, CircuitModel)):
-                c_logged = self._get_or_create_circuit(circuit=c)
-                logged_circuits.append(c_logged.id)
-            else:
-                raise ValueError("The `circuits` must be a logged circuit or a QuantumCircuit, or a list of these types.")
+        logged_circuits = self._prepare_circuits(circuits)
 
         parameters = {
             "compression_level": compression_level,
             "noise_profile": noise_profile,
             "fine_tuning": fine_tuning,
             "approximation_level": approximation_level,
+            "max_time": max_time,
         }
         if device_id is not None:
             parameters["device_id"] = device_id
@@ -1604,6 +1656,7 @@ class Haiqu:
         return parameters, logged_circuits
 
     @errors.graceful_api_errors_message
+    @format_docstring(MAX_TIME=MAX_COMPRESSION_TIME, MAX_TIME_MIN=MAX_COMPRESSION_TIME // 60)
     def state_compression(
         self,
         circuit: QuantumCircuit | CircuitModel = None,
@@ -1611,6 +1664,7 @@ class Haiqu:
         compression_level: str = "balanced",
         noise_profile: str = "default",
         fine_tuning: str = "low",
+        max_time: int | float = MAX_COMPRESSION_TIME,
         approximation_level: int | None = None,
     ) -> StateCompressionJobModel | list[StateCompressionJobModel]:
         """Compress an arbitrary quantum circuit.
@@ -1649,6 +1703,13 @@ class Haiqu:
                                * "low" (default): best balance between speed and accuracy
                                * "heavy": improved circuit accuracy, but time-intensive
 
+            max_time (int | float): Soft time limit for the job (in seconds).
+                            The compression job will first always produce the initial result and then limit the fine-tuning
+                            stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
+                            current result will be returned. Defaults to {MAX_TIME}
+                            ({MAX_TIME_MIN} min). Max allowed job time is {MAX_TIME_MIN} min.
+                            The job can take more wall clock time than user specified `max_time` due to latency,
+                            initialization overheads or if the initial result already takes more time.
             approximation_level (int | None): A small integer related to circuit complexity. Larger values improve the noiseless
                                               quality metric, but may degrade noisy performance. Defaults to ``None``, which
                                               corresponds to auto-selection using the chosen ``noise_profile``. Can be set from
@@ -1671,7 +1732,7 @@ class Haiqu:
             >>> from qiskit.circuit.random import random_circuit
             >>> qc = random_circuit(num_qubits=50, depth=5, max_operands=4, seed=2025, measure=False)
             >>> circuit_aer = haiqu.transpile(qc, device=haiqu.get_device("aer_simulator"), basis_gates=["cx", "u3"])
-            >>> print(f"{circuit_aer.analytics.gates_2q} two-qubit gates in the original circuit")
+            >>> print(f"{{circuit_aer.analytics.gates_2q}} two-qubit gates in the original circuit")
             278 two-qubit gates in the original circuit
 
             Submit a State Compression job to shrink it:
@@ -1679,14 +1740,14 @@ class Haiqu:
             >>> job = haiqu.state_compression(qc)
             >>> circuit_comp = job.result()
             >>> quality = job.quality
-            >>> print(f"Circuit is compressed with quality {quality:.6f}")
+            >>> print(f"Circuit is compressed with quality {{quality:.6f}}")
             Circuit is compressed with quality 0.898719
 
             Submit an Analytics job to confirm that the compressed circuit has far fewer two-qubit gates:
 
             >>> circuit_comp_aer = haiqu.transpile(circuit_comp, device=haiqu.get_device("aer_simulator"),
             ...                                    basis_gates=["cx", "u3"])
-            >>> print(f"{circuit_comp_aer.analytics.gates_2q} two-qubit gates in the compressed circuit")
+            >>> print(f"{{circuit_comp_aer.analytics.gates_2q}} two-qubit gates in the compressed circuit")
             95 two-qubit gates in the compressed circuit
 
             Batch submission of the State Compression jobs:
@@ -1696,7 +1757,7 @@ class Haiqu:
             >>> for job in jobs:
             ...     circuit_comp = job.result()
             ...     quality = job.quality
-            ...     print(f"Circuit is compressed with quality {quality:.6f}")
+            ...     print(f"Circuit is compressed with quality {{quality:.6f}}")
         """
         self._check_experiment()
 
@@ -1706,13 +1767,14 @@ class Haiqu:
             compression_level=compression_level,
             noise_profile=noise_profile,
             fine_tuning=fine_tuning,
+            max_time=max_time,
             approximation_level=approximation_level,
         )
 
         jobs = self._client.compression(
             data=StateCompressionSubmitModel(
                 experiment_id=self._experiment.id,
-                circuit_ids=logged_circuits,
+                circuit_ids=[c.id for c in logged_circuits],
                 parameters=parameters,
                 compression_type=CompressionJobType.STATE_COMPRESSION.value,
             )
@@ -1722,6 +1784,7 @@ class Haiqu:
         return jobs
 
     @errors.graceful_api_errors_message
+    @format_docstring(MAX_TIME=MAX_COMPRESSION_TIME, MAX_TIME_MIN=MAX_COMPRESSION_TIME // 60)
     def state_compression_2d(
         self,
         circuit: QuantumCircuit | CircuitModel = None,
@@ -1731,6 +1794,7 @@ class Haiqu:
         compression_level: str = "balanced",
         noise_profile: str | None = None,
         fine_tuning: str = "disabled",
+        max_time: int | float = MAX_COMPRESSION_TIME,
         approximation_level: int | None = None,
     ) -> StateCompressionJobModel | list[StateCompressionJobModel]:
         """Compress an arbitrary quantum circuit on a targeted device.
@@ -1776,6 +1840,13 @@ class Haiqu:
                                * "low": best balance between speed and accuracy
                                * "heavy": improved circuit accuracy, but time-intensive
 
+            max_time (int | float): Soft time limit for the job (in seconds).
+                            The compression job will first always produce the initial result and then limit the fine-tuning
+                            stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
+                            current result will be returned. Defaults to {MAX_TIME}
+                            ({MAX_TIME_MIN} min). Max allowed job time is {MAX_TIME_MIN} min.
+                            The job can take more wall clock time than user specified `max_time` due to latency,
+                            initialization overheads or if the initial result already takes more time.
             approximation_level (int | None): A small integer related to circuit complexity. Larger values improve the noiseless
                                               quality metric, but may degrade noisy performance. Defaults to ``None``, which
                                               corresponds to auto-selection using the chosen ``noise_profile``. Can be set from
@@ -1799,7 +1870,7 @@ class Haiqu:
             >>> quantum_device = "fake_fez"
             >>> qc = random_circuit(num_qubits=50, depth=5, max_operands=4, seed=2025, measure=False)
             >>> circuit_fez = haiqu.transpile(qc, device=haiqu.get_device(quantum_device))
-            >>> print(f"{circuit_fez.analytics.gates_2q} two-qubit gates in the circuit transpiled to a device")
+            >>> print(f"{{circuit_fez.analytics.gates_2q}} two-qubit gates in the circuit transpiled to a device")
             1125 two-qubit gates in the circuit transpiled to a device
 
             Submit a 2D State Compression job to shrink it:
@@ -1807,13 +1878,13 @@ class Haiqu:
             >>> job = haiqu.state_compression_2d(qc, device_id=quantum_device)
             >>> circuit_comp = job.result()
             >>> quality = job.quality
-            >>> print(f"Circuit is compressed with quality {quality:.6f}")
+            >>> print(f"Circuit is compressed with quality {{quality:.6f}}")
             Circuit is compressed with quality 0.950118
 
             Check the analytics to compare amount of two-qubit gates on a device.
             Note that it is already transpiled to a device chosen in the compression call.
 
-            >>> print(f"{circuit_comp.analytics.gates_2q} two-qubit gates in the compressed circuit")
+            >>> print(f"{{circuit_comp.analytics.gates_2q}} two-qubit gates in the compressed circuit")
             66 two-qubit gates in the compressed circuit
 
             Batch submission of the 2D State Compression jobs:
@@ -1823,7 +1894,7 @@ class Haiqu:
             >>> for job in jobs:
             ...     circuit_comp = job.result()
             ...     quality = job.quality
-            ...     print(f"Circuit is compressed with quality {quality:.6f}")
+            ...     print(f"Circuit is compressed with quality {{quality:.6f}}")
         """
         self._check_experiment()
 
@@ -1845,6 +1916,7 @@ class Haiqu:
             compression_level=compression_level,
             noise_profile=noise_profile,
             fine_tuning=fine_tuning,
+            max_time=max_time,
             approximation_level=approximation_level,
             device_id=device_id,
         )
@@ -1852,7 +1924,7 @@ class Haiqu:
         jobs = self._client.compression(
             data=StateCompressionSubmitModel(
                 experiment_id=self._experiment.id,
-                circuit_ids=logged_circuits,
+                circuit_ids=[c.id for c in logged_circuits],
                 parameters=parameters,
                 compression_type=CompressionJobType.STATE_COMPRESSION_2D.value,
             )
@@ -1927,6 +1999,7 @@ class Haiqu:
         num_layers: int = 2,
         truncation_cutoff: Real = 1e-6,
         fine_tuning_iterations: int = 20,
+        max_time: int | float = MAX_DATA_LOADING_TIME,
         name: str | None = None,
     ) -> DataLoadingEstimatesModel:
         """Estimate the cost and time of a Data Loading job created by :meth:`vector_loading`.
@@ -1952,6 +2025,7 @@ class Haiqu:
             num_layers,
             truncation_cutoff,
             fine_tuning_iterations,
+            max_time,
             name,
         )
         if num_qubits is None:
@@ -2382,6 +2456,332 @@ class Haiqu:
         return self._client.variational_optimization(data=submit_data)
 
     @errors.graceful_api_errors_message
+    def flow(
+        self,
+        program: HybridProgram,
+        circuits: QuantumCircuit | list[QuantumCircuit] | CircuitModel | list[CircuitModel],
+        shots: int = 1000,
+        parameters: list | None = None,
+        observables: SparsePauliOp | list[SparsePauliOp] | list[list[SparsePauliOp]] | None = None,
+        job_name: str | None = None,
+        job_description: str | None = None,
+        device_credentials: dict | None = None,
+        dry_run: bool = False,
+    ) -> HybridJobModel:
+        """
+        Run a flow (hybrid program).
+
+        This flexible method supports multiple execution scenarios, with different combinations of circuits, parameters, and
+        observables. When multiple values are provided for any of them, the results are returned as nested lists with up to 3
+        layers, ordered by circuits, then observables, and finally parameters.
+
+        Args:
+            program (HybridProgram): The hybrid program to execute.
+            circuits: The quantum circuit(s) to pass to the hybrid program. Can be a single circuit or a list of circuits.
+            shots (int): The number of shots for each circuit execution. Defaults to 1000.
+            parameters: The parameters for the circuits. Can be a single set of parameters or nested lists of parameter sets. For
+                        multiple circuits, must be a list where each element corresponds to parameters for that circuit. Defaults
+                        to ``None``, in which case the circuits must not have any parameters.
+            observables: The observable(s) to measure. The order of Pauli terms in a single string follows the Qiskit
+                         reversed-order convention (e.g., ``"IZ"`` measures qubit 0 in the Z basis). Defaults to ``None``,
+                         in which case the circuits must include their own measurements.
+
+                         Accepted shapes:
+
+                         - **Single circuit:** a single ``SparsePauliOp``, the nested form
+                           ``[[op1, op2, ...]]``, or a bare list ``[op1, op2, ...]``.
+                         - **Multiple circuits:** a list of length ``num_circuits``, where each element is independently
+                           either a single ``SparsePauliOp`` (one observable on that circuit) or a list of
+                           ``SparsePauliOp`` (multiple observables on that circuit). Mixing is allowed —
+                           ``[[op1, op2], op3]`` for two circuits is valid.
+
+                         The fully-nested form is the unambiguous canonical shape and is recommended when the same code
+                         path handles both single and multi-circuit submissions.
+            job_name (str | None): The name for the job. If ``None`` (default), a name will be automatically generated.
+            job_description (str | None): The description for the job.
+            device_credentials (dict | None): Credentials for device access.
+            dry_run (bool): Whether to stop just prior to backend execution for QPU cost estimation. Defaults to ``False``.
+                When ``True``, the job result will be empty since execution on the device is skipped.
+                The estimated QPU cost is then available via ``job.estimated_qpu_cost``.
+
+        Returns:
+            HybridJobModel: The Hybrid job that will execute the hybrid program.
+                Call ``job.result()`` to retrieve the execution results as a nested list ordered by
+                *circuits → observables → parameters*:
+
+                * Without observables: list of measurement distributions (``dict[bitstring, quasi-probability]``), one per
+                  circuit, in Qiskit bit-order.
+                * With observables, no parameter sweep: 2D list of expectation values, indexed ``[circuit][observable]``.
+                * With observables and a parameter sweep: 3D list of expectation values, indexed
+                  ``[circuit][observable][parameter]``.
+
+                When ``dry_run=True``, ``result()`` is empty; use ``job.estimated_qpu_cost`` instead. ``job.info`` exposes
+                auxiliary metadata (``uncertainty`` when observables are supplied, ``qpu_cost``).
+                Run ``help(job.result)`` for the full description of result and ``info`` contents.
+
+        Examples:
+            Single circuit, no parameters, no observables:
+
+            >>> from qiskit import QuantumCircuit
+            >>> from haiqu.sdk.hybrid import HybridProgram, layers
+            >>> program = HybridProgram(layers=[
+            ...     layers.InputLayer(),
+            ...     layers.DeviceLayer(device_id="aer_simulator"),
+            ... ])
+            >>> qc = QuantumCircuit(2)
+            >>> qc.h(0)
+            >>> qc.cx(0, 1)
+            >>> qc.measure_all()
+            >>> job = haiqu.flow(program, circuits=qc)
+            >>> job.result()  # Returns: [dist_c1] (bitstrings in Qiskit convention)
+            [{'00': 0.504, '11': 0.496}]
+
+            Single circuit, multiple parameters, no observables:
+
+            >>> from qiskit import QuantumCircuit
+            >>> from qiskit.circuit import Parameter
+            >>> from haiqu.sdk.hybrid import HybridProgram, layers
+            >>> program = HybridProgram(layers=[
+            ...     layers.InputLayer(),
+            ...     layers.DeviceLayer(device_id="aer_simulator"),
+            ... ])
+            >>> theta = Parameter('θ')
+            >>> qc = QuantumCircuit(2)
+            >>> qc.ry(theta, 0)
+            >>> qc.cx(0, 1)
+            >>> qc.measure_all()
+            >>> job = haiqu.flow(
+            ...     program,
+            ...     circuits=qc,
+            ...     parameters=[[0.5], [1.0]],
+            ... )
+            >>> job.result()  # Returns: [[dist_c1_p1, dist_c1_p2]]
+            [[{'00': 0.934, '11': 0.066}, {'00': 0.802, '11': 0.198}]]
+
+            Single circuit, no parameters, multiple observables:
+
+            >>> from qiskit import QuantumCircuit
+            >>> from qiskit.quantum_info import SparsePauliOp
+            >>> from haiqu.sdk.hybrid import HybridProgram, layers
+            >>> program = HybridProgram(layers=[
+            ...     layers.InputLayer(),
+            ...     layers.EstimatorLayer(),
+            ...     layers.DeviceLayer(device_id="aer_simulator"),
+            ... ])
+            >>> qc = QuantumCircuit(2)
+            >>> qc.h(0)
+            >>> qc.cx(0, 1)
+            >>> obs = [SparsePauliOp("ZZ"), SparsePauliOp("XY")]
+            >>> job = haiqu.flow(
+            ...     program,
+            ...     circuits=qc,
+            ...     observables=obs,
+            ... )
+            >>> job.result()  # Returns: [[exp_c1_obs1, exp_c1_obs2]]
+            [[1.0, 0.018000000000000016]]
+
+            Single circuit, multiple parameters, multiple observables:
+
+            >>> from qiskit import QuantumCircuit
+            >>> from qiskit.circuit import Parameter
+            >>> from qiskit.quantum_info import SparsePauliOp
+            >>> from haiqu.sdk.hybrid import HybridProgram, layers
+            >>> program = HybridProgram(layers=[
+            ...     layers.InputLayer(),
+            ...     layers.EstimatorLayer(),
+            ...     layers.DeviceLayer(device_id="aer_simulator"),
+            ... ])
+            >>> theta = Parameter('θ')
+            >>> qc = QuantumCircuit(2)
+            >>> qc.ry(theta, 0)
+            >>> qc.cx(0, 1)
+            >>> params = [[0.5], [1.0]]
+            >>> obs = [SparsePauliOp("ZZ"), SparsePauliOp("XX")]
+            >>> job = haiqu.flow(
+            ...     program,
+            ...     circuits=qc,
+            ...     parameters=params,
+            ...     observables=obs,
+            ... )
+            >>> job.result()  # Returns: [[[exp_c1_obs1_p1, exp_c1_obs1_p2], [exp_c1_obs2_p1, exp_c1_obs2_p2]]]
+            [[[1.0, 1.0], [0.49, 0.846]]]
+
+            Multiple circuits, no parameters, no observables:
+
+            >>> from qiskit import QuantumCircuit
+            >>> from haiqu.sdk.hybrid import HybridProgram, layers
+            >>> program = HybridProgram(layers=[
+            ...     layers.InputLayer(),
+            ...     layers.DeviceLayer(device_id="aer_simulator"),
+            ... ])
+            >>> qc1 = QuantumCircuit(2)
+            >>> qc1.h(0)
+            >>> qc1.cx(0, 1)
+            >>> qc1.measure_all()
+            >>> qc2 = QuantumCircuit(2)
+            >>> qc2.x(0)
+            >>> qc2.cx(0, 1)
+            >>> qc2.measure_all()
+            >>> circuits = [qc1, qc2]
+            >>> job = haiqu.flow(program, circuits=circuits)
+            >>> job.result()  # Returns: [dist_c1, dist_c2]
+            [{'11': 0.524, '00': 0.476}, {'11': 1.0}]
+
+            Multiple circuits, multiple parameters, no observables:
+
+            >>> from qiskit import QuantumCircuit
+            >>> from qiskit.circuit import Parameter
+            >>> from haiqu.sdk.hybrid import HybridProgram, layers
+            >>> program = HybridProgram(layers=[
+            ...     layers.InputLayer(),
+            ...     layers.DeviceLayer(device_id="aer_simulator"),
+            ... ])
+            >>> theta = Parameter('θ')
+            >>> qc1 = QuantumCircuit(2)
+            >>> qc1.ry(theta, 0)
+            >>> qc1.cx(0, 1)
+            >>> qc1.measure_all()
+            >>> qc2 = QuantumCircuit(2)
+            >>> qc2.rx(theta, 0)
+            >>> qc2.cz(0, 1)
+            >>> qc2.measure_all()
+            >>> circuits = [qc1, qc2]
+            >>> params = [[[0.5], [1.0]], [[0.3], [0.7]]]  # Parameters for each circuit
+            >>> job = haiqu.flow(
+            ...     program,
+            ...     circuits=circuits,
+            ...     parameters=params,
+            ... )
+            >>> job.result()  # Returns: [[dist_c1_p1, dist_c1_p2], [dist_c2_p1, dist_c2_p2]]
+            [[{'00': 0.955, '11': 0.045}, {'00': 0.783, '11': 0.217}],
+             [{'00': 0.982, '01': 0.018}, {'00': 0.882, '01': 0.118}]]
+
+            Multiple circuits, no parameters, multiple observables:
+
+            >>> from qiskit import QuantumCircuit
+            >>> from qiskit.quantum_info import SparsePauliOp
+            >>> from haiqu.sdk.hybrid import HybridProgram, layers
+            >>> program = HybridProgram(layers=[
+            ...     layers.InputLayer(),
+            ...     layers.EstimatorLayer(),
+            ...     layers.DeviceLayer(device_id="aer_simulator"),
+            ... ])
+            >>> qc1 = QuantumCircuit(2)
+            >>> qc1.h(0)
+            >>> qc1.cx(0, 1)
+            >>> qc2 = QuantumCircuit(2)
+            >>> qc2.x(0)
+            >>> qc2.cx(0, 1)
+            >>> circuits = [qc1, qc2]
+            >>> obs = [[SparsePauliOp("ZZ"), SparsePauliOp("XX")],
+            ...        [SparsePauliOp("YY"), SparsePauliOp("ZX")]]  # Observables for each circuit
+            >>> job = haiqu.flow(
+            ...     program,
+            ...     circuits=circuits,
+            ...     observables=obs,
+            ... )
+            >>> job.result()  # Returns: [[exp_c1_obs1, exp_c1_obs2], [exp_c2_obs1, exp_c2_obs2]]
+            [[1.0, 1.0], [0.0, -0.0020000000000000018]]
+
+            Multiple circuits, multiple parameters, multiple observables:
+
+            >>> from qiskit import QuantumCircuit
+            >>> from qiskit.circuit import Parameter
+            >>> from qiskit.quantum_info import SparsePauliOp
+            >>> from haiqu.sdk.hybrid import HybridProgram, layers
+            >>> program = HybridProgram(layers=[
+            ...     layers.InputLayer(),
+            ...     layers.EstimatorLayer(),
+            ...     layers.DeviceLayer(device_id="aer_simulator"),
+            ... ])
+            >>> theta = Parameter('θ')
+            >>> qc1 = QuantumCircuit(2)
+            >>> qc1.ry(theta, 0)
+            >>> qc1.cx(0, 1)
+            >>> qc2 = QuantumCircuit(2)
+            >>> qc2.rx(theta, 0)
+            >>> qc2.cz(0, 1)
+            >>> circuits = [qc1, qc2]
+            >>> params = [[[0.5], [1.0]], [[0.3], [0.7]]]  # Parameters for each circuit
+            >>> obs = [[SparsePauliOp("ZZ"), SparsePauliOp("XX")],
+            ...        [SparsePauliOp("YY"), SparsePauliOp("ZX")]]  # Observables for each circuit
+            >>> job = haiqu.flow(
+            ...     program,
+            ...     circuits=circuits,
+            ...     parameters=params,
+            ...     observables=obs,
+            ... )
+            >>> job.result()
+            # Returns: [
+            #     [[exp_c1_obs1_p1, exp_c1_obs1_p2], [exp_c1_obs2_p1, exp_c1_obs2_p2]],
+            #     [[exp_c2_obs1_p1, exp_c2_obs1_p2], [exp_c2_obs2_p1, exp_c2_obs2_p2]],
+            # ]
+            [[[1.0, 1.0], [0.482, 0.8280000000000001]],
+             [[-0.016000000000000014, 0.003999999999999963],
+              [-0.02400000000000002, 0.008000000000000007]]]
+        """
+        self._check_experiment()
+        logged_circuits = self._prepare_circuits(circuits)
+
+        if job_name is None:
+            job_name = job_name_from_circuits(logged_circuits)
+
+        device_id = None
+        new_layers = []
+
+        for layer in program.layers:
+            match layer:
+                case layers.DeviceLayer():
+                    if device_id is not None:
+                        raise ValueError("More than one DeviceLayer found in HybridProgram")
+
+                    device_id = layer.device_id
+                    options = copy.deepcopy(layer.options)
+
+                    self._normalize_noise_model_option(device_id=device_id, options=options)
+
+                    new_layer = layers.DeviceLayer.model_validate(layer.model_copy(update={"options": options}))
+                    new_layers.append(new_layer)
+                case _:
+                    new_layers.append(layer)
+
+        program = HybridProgram.model_validate(program.model_copy(update={"layers": new_layers}))
+
+        if device_id is None:
+            raise ValueError("No DeviceLayer in HybridProgram")
+
+        # Validate that device exists
+        self.get_device(device_id=device_id)
+
+        device_credentials = copy.deepcopy(device_credentials) if device_credentials is not None else {}
+
+        if not dry_run:
+            if "aws" in device_id.lower():
+                self.update_aws_credentials(device_credentials)
+            if "ibm" in device_id.lower():
+                self.update_ibm_credentials(device_credentials)
+
+        parameters, observables = validate_and_normalize_parameters_and_observables(parameters, observables, len(logged_circuits))
+
+        job = self._client.flow(
+            data=HybridSubmitModel(
+                experiment_id=self._experiment.id,
+                name=job_name,
+                description=job_description,
+                program=program,
+                circuit_ids=[c.id for c in logged_circuits],
+                shots=shots,
+                parameters=parameters,
+                observables=observables,
+                device_credentials=device_credentials,
+                dry_run=dry_run,
+            )
+        )
+
+        return job
+
+    # TODO: reimplement haiqu.run using the flow endpoint
+    @errors.graceful_api_errors_message
     def run(
         self,
         circuits: QuantumCircuit | list[QuantumCircuit] | CircuitModel | list[CircuitModel],
@@ -2653,22 +3053,37 @@ class Haiqu:
             emo = options["error_mitigation_options"]
             if not isinstance(emo, dict):
                 raise ValueError("`error_mitigation_options` in `options` must be a dictionary.")
-            valid_emo_keys = {"dynamical_decoupling", "readout_mitigation", "noise_tailoring", "advanced_mitigation"}
+            dict_type_keys = {"readout_mitigation_options"}
+            bool_type_keys = {
+                "dynamical_decoupling",
+                "readout_mitigation",
+                "noise_tailoring",
+                "advanced_mitigation",
+            }
+            valid_emo_keys = dict_type_keys | bool_type_keys
             unknown_keys = set(emo.keys()) - valid_emo_keys
             if unknown_keys:
                 raise ValueError(
                     f"Unknown key(s) in `error_mitigation_options`: {unknown_keys}. " f"Valid keys are: {valid_emo_keys}."
                 )
             for key, val in emo.items():
-                if not isinstance(val, bool):
-                    raise ValueError(
-                        f"All values in `error_mitigation_options` must be booleans. "
-                        f"Got {type(val).__name__!r} for key '{key}'."
-                    )
+                if key in dict_type_keys:
+                    if not isinstance(val, dict):
+                        raise ValueError(f"{key} must be a `dict`." f"Got {type(val).__name__!r} for key '{key}'.")
+                elif key in bool_type_keys:
+                    if not isinstance(val, bool):
+                        raise ValueError(f"{key} must be a `bool`." f"Got {type(val).__name__!r} for key '{key}'.")
             if not use_mitigation:
                 warnings.warn(
                     "`error_mitigation_options` provided but `use_mitigation=False`. "
                     "Mitigation options will have no effect unless `use_mitigation=True`.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            if not emo.get("readout_mitigation", False) and emo.get("readout_mitigation_options", None):
+                warnings.warn(
+                    "`readout_mitigation_options` provided but `readout_mitigation=False`. "
+                    "Readout mitigation options will have no effect unless `readout_mitigation=True`.",
                     UserWarning,
                     stacklevel=2,
                 )
@@ -2693,34 +3108,12 @@ class Haiqu:
             if "ibm" in device_id.lower():
                 self.update_ibm_credentials(options)
 
-        # Validate the circuits
-        if not isinstance(circuits, list):
-            circuits = [circuits]
-
-        # Log the circuits if they are not logged yet
-        logged_circuits = []
-        for c in circuits:
-            if isinstance(c, (QuantumCircuit, CircuitModel)):
-                c_logged = self._get_or_create_circuit(circuit=c)
-                logged_circuits.append(c_logged)
-            else:
-                raise ValueError("The `circuits` must be a logged circuit or a QuantumCircuit, or a list of these types.")
+        logged_circuits = self._prepare_circuits(circuits)
 
         if job_name is None:
             job_name = job_name_from_circuits(logged_circuits)
 
-        parameters, observables = validate_and_normalize_parameters_and_observables(parameters, observables, len(circuits))
-
-        # TODO: this handles the special case where the user provides empty list and a single circuit
-        # this would throw an API error. If set to None here, the API is likely to complain about the circuit
-        # having no measurements. Currently the user won't see any details in the error message.
-        # Thus raising an error here for now. Change to observable = None after better error handling in the API.
-        if observables is not None and len(observables) == 0:
-            raise ValueError(
-                "Empty list of observables provided. "
-                "The `observables` must be a list of observables for each circuit or a single observable for "
-                "all circuits or None."
-            )
+        parameters, observables = validate_and_normalize_parameters_and_observables(parameters, observables, len(logged_circuits))
 
         # Validate and pass packing options
         self._validate_packing(use_packing, pack_size)
@@ -2782,28 +3175,12 @@ class Haiqu:
         if device is not None:
             device_id = device.id
 
-        if not isinstance(circuits, list):
-            circuits = [circuits]
-
-        logged_circuits = []
-        for c in circuits:
-            if isinstance(c, (QuantumCircuit, CircuitModel)):
-                c_logged = self._get_or_create_circuit(circuit=c)
-                logged_circuits.append(c_logged)
-            else:
-                raise ValueError("The `circuits` must be a logged circuit or a QuantumCircuit, or a list of these types.")
+        logged_circuits = self._prepare_circuits(circuits)
 
         if job_name is None:
             job_name = job_name_from_circuits(logged_circuits)
 
-        parameters, observables = validate_and_normalize_parameters_and_observables(parameters, observables, len(circuits))
-
-        if observables is not None and len(observables) == 0:
-            raise ValueError(
-                "Empty list of observables provided. "
-                "The `observables` must be a list of observables for each circuit or a single observable for "
-                "all circuits or None."
-            )
+        parameters, observables = validate_and_normalize_parameters_and_observables(parameters, observables, len(logged_circuits))
 
         insights = self._client.dry_run(
             data=RunSubmitModel(
@@ -2876,19 +3253,7 @@ class Haiqu:
                    [ 0.707+0.j   ,  0.   +0.j   ,  0.   +0.j   , -0.   +0.707j]])
         """
         self._check_experiment()
-
-        # Validate the circuits
-        if not isinstance(circuits, list):
-            circuits = [circuits]
-
-        # Log the circuits if they are not logged yet
-        logged_circuits = []
-        for c in circuits:
-            if isinstance(c, (QuantumCircuit, CircuitModel)):
-                c_logged = self._get_or_create_circuit(circuit=c)
-                logged_circuits.append(c_logged)
-            else:
-                raise ValueError("The `circuits` must be a logged circuit or a QuantumCircuit, or a list of these types.")
+        logged_circuits = self._prepare_circuits(circuits)
 
         if job_name is None:
             job_name = job_name_from_circuits(logged_circuits)
@@ -3520,6 +3885,27 @@ class Haiqu:
                 description=kwargs.get("description", ""),
             )
         )
+
+    def _prepare_circuits(
+        self,
+        circuits: QuantumCircuit | CircuitModel | list[QuantumCircuit | CircuitModel],
+    ) -> list[CircuitModel]:
+        """Validate and log circuits."""
+
+        if not isinstance(circuits, list):
+            circuits = [circuits]
+
+        # Log the circuits if they are not logged yet
+        logged_circuits = []
+
+        for c in circuits:
+            if isinstance(c, (QuantumCircuit, CircuitModel)):
+                c_logged = self._get_or_create_circuit(circuit=c)
+                logged_circuits.append(c_logged)
+            else:
+                raise ValueError("The `circuits` must be a logged circuit or a QuantumCircuit, or a list of these types.")
+
+        return logged_circuits
 
     def _get_circuit(self, circuit: QuantumCircuit) -> Union[CircuitModel, None]:
         """Query API for the circuit by hash.

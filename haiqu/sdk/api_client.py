@@ -56,6 +56,7 @@ API_ACTIONS = {
     "device_gate_map": "/devices/{device_id}/gate_map",
     "data_loading": "/data_loading",
     "data_loading_estimates": "/data_loading_estimates",
+    "flow": "/flow",
     "run": "/run",
     "dry_run": "/dry-run",
     "hemistich": "/hemistich",
@@ -488,6 +489,12 @@ class ApiClient:
         response = self._post(endpoint=API_ACTIONS["hemistich_estimates"], json=data.model_dump())
         return schemas.StateCompressionEstimatesModel.model_validate_json(response.text)
 
+    def flow(self, data: schemas.HybridSubmitModel) -> schemas.HybridJobModel:
+        """Post Flow (hybrid program) request"""
+        response = self._post(endpoint=API_ACTIONS["flow"], json=data.model_dump())
+        job = schemas.HybridJobModel.model_validate_json(response.text)
+        return job
+
     def run(self, data: schemas.RunSubmitModel) -> schemas.RunJobModel:
         """Post Run request"""
         response = self._post(endpoint=API_ACTIONS["run"], json=data.model_dump())
@@ -743,6 +750,8 @@ class ApiClient:
         match job_type:
             case schemas.JobType.ANALYTICS:
                 job_class = schemas.AnalyticsJobModel
+            case schemas.JobType.HYBRID:
+                job_class = schemas.HybridJobModel
             case schemas.JobType.RUN:
                 job_class = schemas.RunJobModel
             case schemas.JobType.DATA_LOADING:
