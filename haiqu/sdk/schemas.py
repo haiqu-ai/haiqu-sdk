@@ -7,7 +7,7 @@ import enum
 from datetime import datetime
 from functools import cached_property
 import time
-from typing import Annotated, Any, Iterable, Optional, Union, List, Tuple, cast
+from typing import Annotated, Any, Dict, Iterable, Optional, Union, List, Tuple, cast
 import json
 import numpy as np
 
@@ -71,6 +71,16 @@ class ParseIterableMixin:
         """Parses JSON list with items"""
         ItemsList = TypeAdapter(Iterable[cls])
         return list(ItemsList.validate_python(items))
+
+
+class ArtifactModel(BaseModel, ParseIterableMixin):
+    """Artifact model."""
+
+    name: str
+    artifact_type: str
+    artifact_data: Optional[Any] = None
+    creation_date: Optional[datetime] = None
+    last_updated: Optional[datetime] = None
 
 
 class ExperimentSubmitModel(BaseModel):
@@ -957,6 +967,7 @@ class DataLoadingType(enum.Enum):
     BLOCK_VECTOR_LOADING = "BlockVectorLoading"
     ENTANGLED_MANIFOLD_EMBEDDING = "EntangledManifoldEmbedding"
     MPS_LOADING = "MpsLoading"
+    FUNCTION_LOADING = "FunctionLoading"
 
 
 class RunJobType(enum.Enum):
@@ -971,6 +982,7 @@ class CompressionJobType(enum.Enum):
 
     STATE_COMPRESSION = "StateCompression"
     STATE_COMPRESSION_2D = "StateCompression2D"
+    SU2_EQUIVARIANT_COMPILATION = "Su2EquivariantCompilation"
 
 
 class JobStatus(enum.Enum):
@@ -1159,6 +1171,7 @@ class DataLoadingSubmitModel(BaseModel):
 
     experiment_id: Optional[str] = ""  # not used in data_loading_estimates()
     name: Optional[str] = ""  # not used in data_loading_estimates()
+    description: Optional[str] = ""
     parameters: dict
     num_qubits: Optional[int] = None  # not used in vector/samples loading
     distribution_name: Optional[str] = None  # used only in distribution loading
@@ -1642,6 +1655,51 @@ class StateCompressionJobModel(BaseJobModel):
         self._progress(f"{title} JOB PROGRESS")
 
 
+class Su2EquivariantCompilationJobModel(BaseJobModel):
+    """Job returned for SU(2)-equivariant gate compilation.
+
+    Mirrors the state-compression surface: ``result()`` returns the
+    compressed circuit and ``fidelity`` is the achieved process fidelity of
+    the compressed brick to the target unitary. The fit runs server-side;
+    only the circuit and the fidelity are exposed.
+    """
+
+    parameters: dict
+    # Populated after job finishes
+    circuit_id: Optional[str] = None
+    compression_type: CompressionJobType
+
+    def retrieve_status(self) -> JobStatus:
+        """
+        Query backend for the job status.
+        """
+        response = cast(Su2EquivariantCompilationJobModel, self._retrieve_status())
+        self.circuit_id = response.circuit_id
+
+        return self.status
+
+    @property
+    def fidelity(self) -> Optional[float]:
+        """Process fidelity of the compressed brick to the target unitary."""
+        return self.quality
+
+    def result(self) -> CircuitModel:
+        """
+        Return job result - the compressed circuit.
+        Block and wait for the job to complete.
+        """
+        super().result()
+
+        circuit = self._client.get_circuit(circuit_id=self.circuit_id)
+        return circuit
+
+    def progress(self):
+        """
+        Display the progress widget, stream logs from the job.
+        """
+        self._progress("EQUIVARIANT COMPRESSION JOB PROGRESS")
+
+
 class TranspilationJobModel(BaseJobModel):
     """Job model for transpilation jobs."""
 
@@ -1684,6 +1742,8 @@ class SubmitTranspilationModel(BaseModel):
     circuit_ids: list = []
     device_id: str
     transpilation_options: Optional[dict] = {}
+    name: Optional[str] = ""
+    description: Optional[str] = ""
 
 
 class SubmitObservableBackpropagationModel(BaseModel):
@@ -2247,55 +2307,88 @@ class VariationalJobModel(BaseJobModel):
         self._progress("VARIATIONAL JOB PROGRESS")
 
 
+class PretrainingJobType(enum.Enum):
+    """Class for `pretrain_type`."""
+
+    PRETRAIN = "Pretrain"
+    MPS_GRADIENT = "MpsGradient"
+
+
 class PretrainingSubmitModel(BaseModel):
     """Submit model for pretraining variational circuits."""
 
     experiment_id: str
     circuit_id: str  # The logged ansatz circuit ID
-    observable: Tuple[List[str], List[float]]  # ([pauli_strings], [coefficients])
+    loss_expression: str  # sympy objective as a string; "x" for a linear single-observable problem
+    observables: Dict[str, Tuple[List[str], List[float]]]  # {symbol_name: ([term_strings], [coefficients])}
     name: Optional[str] = ""
     description: Optional[str] = ""
-    max_time: float
+    max_time: Optional[float] = None
     seed: Optional[int] = None
     initial_parameters: Optional[List[float]] = None
+    options: Optional[dict] = None
+    pretrain_type: str = PretrainingJobType.PRETRAIN.value
 
 
 class PretrainingJobModel(BaseJobModel):
     """Job model for pretraining variational circuits."""
 
     circuit_id: str
-    observable: Tuple[List[str], List[float]]  # ([pauli_strings], [coefficients])
-    max_time: float = 60
+    loss_expression: str  # sympy objective as a string; "x" for a linear single-observable problem
+    observables: Dict[str, Tuple[List[str], List[float]]]  # {symbol_name: ([term_strings], [coefficients])}
+    max_time: Optional[float] = None
     seed: Optional[int] = None
     initial_parameters: Optional[List[float]] = None
+    options: Optional[dict] = None
+    pretrain_type: PretrainingJobType = PretrainingJobType.PRETRAIN
 
     # Populated after job finishes
-    pretrained_parameters: Optional[List[float]] = None
+    result_vector: Optional[List[float]] = None  # optimized weights for pretrain, or gradient vector for gradient
+    loss: Optional[float] = None  # observable expectation value, only populated for gradient
 
     def retrieve_status(self) -> JobStatus:
         """Query backend for the job status."""
         response = cast(PretrainingJobModel, self._retrieve_status())
-        self.pretrained_parameters = response.pretrained_parameters
+        self.result_vector = response.result_vector
+        self.loss = response.loss
         return self.status
 
-    def result(self) -> List | None:
+    def result(self) -> List | Tuple[float, List[float]] | None:
         """Return the pretraining result.
 
         Blocks until the job completes.
 
         Returns:
-            List[float] | None: list of weights after the pretraining or None if the call is interrupted.
+            For ``pretrain`` jobs: ``List[float] | None`` — optimized ansatz weights, or ``None`` if
+            interrupted.
+            For ``gradient`` jobs: ``Tuple[float, List[float]] | None`` — ``(loss, gradient)``
+            where ``loss`` is the observable expectation value and ``gradient`` is the list of partial
+            derivatives (one per ansatz parameter), or ``None`` if interrupted.
 
         Raises:
             Exception: If the job failed or was cancelled.
         """
         super().result()
 
-        return self.pretrained_parameters
+        if self.pretrain_type == PretrainingJobType.PRETRAIN:
+            return self.result_vector
+        elif self.pretrain_type == PretrainingJobType.MPS_GRADIENT:
+            if self.result_vector is None:
+                # matches keyboard interruption behavior where no result is yet retrieved
+                # and job.result() supposed to return just None
+                return None
+            return self.loss, self.result_vector
+        else:
+            raise ValueError(f"Unrecognized pretrain type: {self.pretrain_type}")
 
     def progress(self):
         """Display the progress widget, stream logs from the job."""
-        self._progress("PRETRAIN JOB PROGRESS")
+        if self.pretrain_type == PretrainingJobType.MPS_GRADIENT:
+            pretrain_type_words = "GRADIENT"
+        else:
+            pretrain_type_words = "".join([(" " + s if s.isupper() else s) for s in self.pretrain_type.value]).strip()
+            pretrain_type_words = pretrain_type_words.upper()
+        self._progress(f"{pretrain_type_words} JOB PROGRESS")
 
 
 class QECReferenceModel(BaseModel):

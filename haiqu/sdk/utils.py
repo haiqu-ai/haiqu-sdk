@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import os
+import sys
 from typing import Any
 
 import openqasm3.parser
@@ -17,6 +18,7 @@ import numpy as np
 import pandas as pd
 import qiskit.qasm2
 from ._typecheck import typecheck
+from .constants import MAX_SOURCE_FILE_SIZE
 from qiskit import QuantumCircuit, qpy
 from qiskit.circuit import ParameterExpression
 from qiskit.primitives import BasePrimitiveJob, EstimatorResult, SamplerResult
@@ -673,6 +675,14 @@ def is_jupyter() -> bool:
         return False
 
 
+def _notebook_full_path() -> str | None:
+    """Return the absolute path of the running Jupyter notebook, or ``None``.
+
+    Example: ``/user_storage/examples/run_examples/200_GHZStatePreparation.ipynb``.
+    """
+    return globals().get("__session__") or os.environ.get("JPY_SESSION_NAME")
+
+
 def detect_notebook() -> str | None:
     """Detect whether execution is happening inside a Jupyter notebook.
 
@@ -683,8 +693,7 @@ def detect_notebook() -> str | None:
     if not is_jupyter():
         return
 
-    full_path = globals().get("__session__") or os.environ.get("JPY_SESSION_NAME")
-    # Example: /user_storage/examples/run_examples/200_GHZStatePreparation.ipynb
+    full_path = _notebook_full_path()
 
     if full_path is None:
         return
@@ -696,6 +705,86 @@ def detect_notebook() -> str | None:
         return full_path
 
     return bits[1]
+
+
+def detect_source_file() -> str | None:
+    """Detect the absolute on-disk path of the running notebook or script.
+
+    Unlike :func:`detect_notebook`, which returns a display path for the
+    Dashboard, this returns the actual filesystem path so the file's content
+    can be read. Works both inside a Jupyter notebook and for a plain
+    ``python script.py`` invocation.
+
+    Returns:
+        str | None: Absolute path of the notebook or script, or ``None`` when it
+        cannot be determined (e.g. an interactive REPL or ``python -c``).
+    """
+    if is_jupyter():
+        return _notebook_full_path()
+
+    # Plain script execution: ``sys.argv[0]`` is the entry-point script.
+    argv0 = sys.argv[0] if sys.argv else ""
+    if not argv0:
+        return None
+
+    abspath = os.path.abspath(argv0)
+    if abspath.endswith(".py") and os.path.isfile(abspath):
+        return abspath
+
+    return None
+
+
+def _strip_notebook_outputs(raw: str) -> str:
+    """Drop cell outputs from a notebook's JSON to shrink the logged payload.
+
+    Only code-cell ``outputs`` and ``execution_count`` are cleared; source is
+    preserved. Returns the input unchanged if it is not parseable notebook JSON.
+
+    Args:
+        raw (str): Raw ``.ipynb`` file content.
+
+    Returns:
+        str: Notebook JSON with outputs stripped, or the original ``raw``.
+    """
+    try:
+        notebook = json.loads(raw)
+        for cell in notebook.get("cells", []):
+            if cell.get("cell_type") == "code":
+                cell["outputs"] = []
+                cell["execution_count"] = None
+        return json.dumps(notebook)
+    except Exception:
+        return raw
+
+
+def read_source_file(path: str) -> str | None:
+    """Read notebook/script content for logging, best-effort.
+
+    Notebook outputs are stripped before sizing. Content exceeding
+    :data:`~haiqu.sdk.constants.MAX_SOURCE_FILE_SIZE` (after stripping) is
+    skipped; in that case ``None`` is returned and no source content is logged.
+    Never raises: any read/parse error yields ``None``.
+
+    Args:
+        path (str): Absolute path returned by :func:`detect_source_file`.
+
+    Returns:
+        str | None: File content ready to log, or ``None`` when unavailable or
+        too large.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        return None
+
+    if path.endswith(".ipynb"):
+        content = _strip_notebook_outputs(content)
+
+    if len(content.encode("utf-8")) > MAX_SOURCE_FILE_SIZE:
+        return None
+
+    return content
 
 
 @typecheck

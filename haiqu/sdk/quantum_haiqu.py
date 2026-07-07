@@ -23,8 +23,11 @@ from .optimization import (
 )
 import numpy as np
 import pandas as pd
+import sympy
 
 from qiskit import QuantumCircuit
+from qiskit.circuit import Gate
+from qiskit.circuit.library import UnitaryGate
 from qiskit.quantum_info import SparsePauliOp
 from qiskit_ibm_runtime import QiskitRuntimeService
 
@@ -36,7 +39,7 @@ from .api_client import ApiClient
 from .backpropagation import backpropagation
 from .hybrid import HybridProgram, layers
 from .qml.compression_options import CompressionOptions
-from .qml.problem import VariationalProblem
+from .qml.problem import NonlinearVariationalProblem, VariationalProblem
 from .utils import find_shared_parameters
 from .qml.optimizer import NFTOptimizerOptions, OptimizerOptions
 from .exceptions import (
@@ -51,10 +54,12 @@ from .errors import error_widget_or_string
 from .version import get_version
 from .schemas import (
     JOB_MODELS,
+    ArtifactModel,
     PretrainingJobModel,
     PretrainingSubmitModel,
     StateCompressionJobModel,
     StateCompressionSubmitModel,
+    Su2EquivariantCompilationJobModel,
     # StateCompressionEstimatesModel,
     # StateCompressionEstimatesSubmitModel,
     JobType,
@@ -80,6 +85,7 @@ from .schemas import (
     DataLoadingType,
     RunJobType,
     CompressionJobType,
+    PretrainingJobType,
     UserModel,
     VariationalProblemSubmitModel,
     VariationalJobModel,
@@ -90,6 +96,8 @@ from .schemas import (
 from .skqd import SKQDOptions
 from .utils import (
     detect_notebook,
+    detect_source_file,
+    read_source_file,
     generate_artifact_name,
     get_circuit_hash,
     get_job_device,
@@ -140,6 +148,25 @@ def check_parameters_match(f_other):
         return f
 
     return decorator
+
+
+def _prepare_nonlinear_problem(
+    problem: Union[VariationalProblem, NonlinearVariationalProblem],
+) -> tuple[QuantumCircuit, str, dict[str, tuple[list[str], list[float]]]]:
+    """Normalize a pretraining/gradient problem to the nonlinear wire form.
+
+    A linear ``VariationalProblem`` is wrapped into the trivial nonlinear objective ``"x"`` over a
+    single observable, so both methods share one serialization path. Returns the ansatz, the loss
+    expression string, and the observables map ``{symbol_name: ([term_strings], [coefficients])}``.
+    """
+    if isinstance(problem, VariationalProblem):
+        problem = NonlinearVariationalProblem(problem.ansatz, "x", {"x": problem.observable})
+    elif not isinstance(problem, NonlinearVariationalProblem):
+        raise TypeError("problem must be a VariationalProblem or NonlinearVariationalProblem.")
+
+    loss_expression = str(problem.loss)
+    observables = {name: ([t for t, _ in pairs], [c for _, c in pairs]) for name, pairs in problem.observables.items()}
+    return problem.ansatz, loss_expression, observables
 
 
 class Haiqu:
@@ -230,7 +257,12 @@ class Haiqu:
         return user
 
     @errors.graceful_api_errors_message
-    def init(self, experiment_ctx: str, experiment_description: str = "") -> str:
+    def init(
+        self,
+        experiment_ctx: str,
+        experiment_description: str = "",
+        log_source_code: bool = False,
+    ) -> str:
         """Set the current experiment (create or use existing own or shared experiment).
 
         If an experiment with this name doesn't exist yet, it will be created with the given description.
@@ -241,6 +273,13 @@ class Haiqu:
         Args:
             experiment_ctx (str): The experiment name or ID of the shared experiment.
             experiment_description (str): An optional text description of the experiment. Only used when creating the experiment.
+            log_source_code (bool): If True, the source code of the running script or notebook is read and sent to the
+                Haiqu cloud as an experiment metric (``source_code``). Defaults to False. Enable this only if you are
+                comfortable uploading your source to the server. When stored, the source code is available on the
+                Dashboard so it can be accessed and shared among other users. Its visibility follows the experiment's:
+                anyone who can see the experiment can see the stored source code, with no additional option to toggle.
+                Every version is preserved, giving you and your collaborators the full history of the experiment's
+                source code.
 
         Returns:
             str: Status message, URL to view the experiment on the dashboard.
@@ -252,8 +291,12 @@ class Haiqu:
             Shared experiment can be set by its ID:
 
             >>> haiqu.init("exp-12345678-1234-5678-1234-567812345678")
+
+            Opt in to uploading the running script/notebook source code to the Haiqu cloud:
+
+            >>> haiqu.init("Example Experiment", log_source_code=True)
         """
-        self._init(experiment_ctx, experiment_description)
+        self._init(experiment_ctx, experiment_description, log_source_code=log_source_code)
         return (
             f"Set current experiment to: {self._experiment.name}. "
             f"View on Dashboard: {constants.DASHBOARD_EXPERIMENT_SCHEMA.format(experiment_id=self._experiment.id)}"
@@ -488,6 +531,8 @@ class Haiqu:
         self,
         circuits: QuantumCircuit | list[QuantumCircuit] | CircuitModel | list[CircuitModel],
         device: DeviceModel,
+        job_name: str | None = None,
+        job_description: str | None = None,
         **transpilation_options: Any,
     ) -> CircuitModel | list[CircuitModel]:
         """Transpile a quantum circuit for a specific device.
@@ -495,6 +540,8 @@ class Haiqu:
         Args:
             circuits (QuantumCircuit | list[QuantumCircuit] | CircuitModel | list[CircuitModel]): The circuit(s) to transpile.
             device (DeviceModel): The target device for execution.
+            job_name (str | None): The name for the job. If ``None`` (default), a name will be automatically generated.
+            job_description (str | None): The description for the job.
             **transpilation_options: Additional arguments passed to the Qiskit transpiler. All parameters
                 follow the Qiskit ``transpile()`` interface. A notable extension is ``seed_transpiler``:
                 it accepts either a single integer (standard Qiskit behaviour) or a list of integers.
@@ -540,6 +587,8 @@ class Haiqu:
             circuit_ids=[c.id for c in logged_circuits],
             device_id=device.id,
             transpilation_options=transpilation_options,
+            name=job_name,
+            description=job_description,
         )
         job = self._client.transpile_circuit(submit_data=submit_data)
         result = job.result()
@@ -574,6 +623,60 @@ class Haiqu:
             from haiqu.sdk.wiz.jupyter import list_experiments
 
             return list_experiments(items)
+        return items
+
+    @errors.graceful_api_errors_message
+    def get_artifact(self, artifact_name: str) -> ArtifactModel:
+        """Get an artifact by name how it was logged with haiqu.log().
+
+        Args:
+            artifact_name (str): The name of the artifact.
+
+        Returns:
+            ArtifactModel: The requested artifact.
+
+        Examples:
+            >>> haiqu.log(12.34, name="Some value")
+            >>> haiqu.get_artifact("Some value")
+            ArtifactModel(...)
+        """
+        self._check_experiment()
+        try:
+            return self._client.get_artifact(experiment_id=self._experiment.id, artifact_name=artifact_name)
+        except HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                raise ValueError(
+                    f"The artifact `{artifact_name}` not found for experiment `{self._experiment.name}`. "
+                    "Please check input or use `haiqu.list_artifacts()` to get available artifacts. "
+                    "Artifacts are logged with `haiqu.log()` and can be retrieved with `haiqu.get_artifact()`."
+                ) from None
+            raise e
+
+    @errors.graceful_api_errors_message
+    def list_artifacts(self, limit: int = 10, widget: bool = True, pandas: bool = False) -> list | pd.DataFrame | None:
+        """List available artifacts in the current experiment.
+
+        Args:
+            limit (int): Limit the number of artifacts returned.
+            widget (bool): If ``True`` (default), render the list as a Jupyter widget and return ``None``.
+            pandas (bool): If ``True``, return the list as a Pandas DataFrame instead of a Python list. Defaults to ``False``.
+
+        Returns:
+            list | pandas.DataFrame | None: Artifacts in a Python list or Pandas DataFrame, or ``None``.
+
+        Examples:
+            >>> haiqu.list_artifacts()  # in Jupyter notebook
+            >>> haiqu.list_artifacts(widget=False)
+            [Artifact 'Example Artifact', Artifact 'Another Artifact']
+        """
+        self._check_experiment()
+        items = self._client.list_artifacts(experiment_id=self._experiment.id, limit=limit)
+        if pandas:
+            return pd.DataFrame(c.model_dump() for c in items)
+        elif widget:
+            from haiqu.sdk.wiz.jupyter import list_artifacts
+
+            return list_artifacts(items)
         return items
 
     @errors.graceful_api_errors_message
@@ -977,20 +1080,22 @@ class Haiqu:
 
     _distribution_loading_args = """
             num_qubits (int): The number of qubits in the generated circuit (from 1 to 1000 qubits).
-            distribution_name (str): The name of the distribution. Can be any of the continuous distributions in ``scipy.stats``.
+            distribution_name (str): The name of the distribution. Can be any of the continuous distributions in ``scipy.stats``
+                or charachteristic function from docs.haiqu.ai/catalog/characteristic_functions.
             interval_start (Real): The beginning of the interval.
             interval_end (Real): The end of the interval.
             loc (Real): The location to which to shift the distribution. Defaults to 0.
             scale (Real): The scaling factor by which to stretch the distribution. Defaults to 1.
-            num_layers (int): The number of layers in the generated circuit (from 1 to 15 layers).
+            num_layers (int): The number of layers in the generated circuit (from 1 to 100 layers).
                               More layers can improve the quality of the output
                               distribution at the cost of a deeper circuit. Defaults to 1.
             truncation_cutoff (Real): The entanglement cutoff for later layers. Increasing this threshold may result in a smaller
                                       (but more approximate) circuit. Defaults to ``1e-6``.
             name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be automatically
                                generated.
+            job_description (str | None): The description for the job.
             **shape: Additional distribution parameters, required by some distributions. Refer to the distribution documentation
-                     in ``scipy.stats`` for more details.
+                     in ``scipy.stats`` or docs.haiqu.ai/catalog/characteristic_functions for more details.
     """
 
     @errors.graceful_api_errors_message
@@ -1006,6 +1111,7 @@ class Haiqu:
         num_layers: int = 1,
         truncation_cutoff: Real = 1e-6,
         name: str | None = None,
+        job_description: str | None = None,
         **shape,
     ) -> DataLoadingJobModel:
         """Generate a quantum circuit that prepares a probability distribution.
@@ -1062,6 +1168,7 @@ class Haiqu:
             data=DataLoadingSubmitModel(
                 dl_type=DataLoadingType.DISTRIBUTION_LOADING.value,
                 name=name,
+                description=job_description,
                 experiment_id=self._experiment.id,
                 num_qubits=num_qubits,
                 distribution_name=distribution_name,
@@ -1098,14 +1205,14 @@ class Haiqu:
             data (Sequence[Number]): The vector with data to encode (length of data is from 1 to ``2**20`` values).
             num_qubits: (int | None): The number of qubits in the generated circuit (from 1 to 20 qubits).
                                       If ``None`` (default), it is set automatically from the size of the data.
-            num_layers (int): The number of layers in the generated circuit (from 1 to 15 layers).
+            num_layers (int): The number of layers in the generated circuit (from 1 to 100 layers).
                               More layers can improve the quality of the output
                               vector at the cost of a deeper circuit. Defaults to 2.
             truncation_cutoff (Real): The entanglement cutoff for later layers. Increasing this threshold may result in a smaller
                                       (but more approximate) circuit. Defaults to ``1e-6``.
             fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
                                           Increasing this limit may improve the quality of the circuit by using more classical
-                                          resources. Defaults to 20, maximal is 200.
+                                          resources. Defaults to 20, maximal is 500.
             max_time (int | float): Soft time limit for the job (in seconds).
                             The data loading job will first always produce the initial result and then limit the fine-tuning
                             stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
@@ -1128,6 +1235,7 @@ class Haiqu:
         fine_tuning_iterations: int = 20,
         max_time: int | float = MAX_DATA_LOADING_TIME,
         name: str | None = None,
+        job_description: str | None = None,
     ) -> DataLoadingJobModel:
         """Generate a quantum circuit that prepares an arbitrary real or complex vector.
 
@@ -1175,6 +1283,7 @@ class Haiqu:
             data=DataLoadingSubmitModel(
                 dl_type=DataLoadingType.VECTOR_LOADING.value,
                 name=name,
+                description=job_description,
                 num_qubits=num_qubits,
                 experiment_id=self._experiment.id,
                 parameters=parameters,
@@ -1227,14 +1336,14 @@ class Haiqu:
                                           An integer indicates the exact number of overlapping indices between consecutive blocks.
                                           A float in [0, 1) indicates fractional overlap between consecutive blocks.
                                           If ``None`` (default), the blocks do not overlap.
-            num_layers (int): The number of layers in the generated circuit (from 1 to 15 layers).
+            num_layers (int): The number of layers in the generated circuit (from 1 to 100 layers).
                               More layers can improve the quality of the circuit
                               blocks at the cost of a deeper circuit. Defaults to 2.
             truncation_cutoff (Real): The entanglement cutoff for later layers. Increasing this threshold may result in a smaller
                                       (but more approximate) circuit. Defaults to ``1e-6``.
             fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
                                           Increasing this limit may improve the quality of the circuit by using more classical
-                                          resources. Defaults to 20, maximal is 200.
+                                          resources. Defaults to 20, maximal is 500.
             max_time (int | float): Soft time limit for the job (in seconds).
                             The data loading job will first always produce the initial result and then limit the fine-tuning
                             stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
@@ -1260,6 +1369,7 @@ class Haiqu:
         fine_tuning_iterations: int = 20,
         max_time: int | float = MAX_DATA_LOADING_TIME,
         name: str | None = None,
+        job_description: str | None = None,
     ) -> DataLoadingJobModel:
         """Generate a block-wise quantum circuit that prepares an arbitrary vector or matrix.
 
@@ -1316,6 +1426,7 @@ class Haiqu:
             data=DataLoadingSubmitModel(
                 dl_type=DataLoadingType.BLOCK_VECTOR_LOADING.value,
                 name=name,
+                description=job_description,
                 experiment_id=self._experiment.id,
                 parameters=parameters,
             )
@@ -1369,14 +1480,14 @@ class Haiqu:
                 periodicity (bool): if True, then additional tangent transform is performed over data, adding periodicity
                                     properties to the encoding. With ``density==1`` it matches angular encoding.
                                     Defaults to ``False``.
-                num_layers (int): The number of layers in the generated circuit (from 1 to 15 layers).
+                num_layers (int): The number of layers in the generated circuit (from 1 to 100 layers).
                                   More layers can improve the quality of the output
                                   vector at the cost of a deeper circuit. Defaults to 2.
                 truncation_cutoff (Real): The entanglement cutoff for later layers. Increasing this threshold may result in
                                           a smaller (but more approximate) circuit. Defaults to ``1e-6``.
                 fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
                                               Increasing this limit may improve the quality of the circuit by using more classical
-                                              resources. Defaults to 20, maximum is 200.
+                                              resources. Defaults to 20, maximum is 500.
                 max_time (int | float): Soft time limit for the job (in seconds).
                                 The data loading job will first always produce the initial result and then limit the fine-tuning
                                 stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
@@ -1402,6 +1513,7 @@ class Haiqu:
         fine_tuning_iterations: int = 20,
         max_time: int | float = MAX_DATA_LOADING_TIME,
         name: str | None = None,
+        job_description: str | None = None,
     ) -> DataLoadingJobModel:
         """Generate a quantum circuit that produces entangled manifold embedding of the real data into a quantum state of a
         controllable entanglement.
@@ -1468,6 +1580,7 @@ class Haiqu:
             data=DataLoadingSubmitModel(
                 dl_type=DataLoadingType.ENTANGLED_MANIFOLD_EMBEDDING.value,
                 name=name,
+                description=job_description,
                 num_qubits=num_qubits,
                 experiment_id=self._experiment.id,
                 parameters=parameters,
@@ -1549,6 +1662,7 @@ class Haiqu:
         fine_tuning_iterations: int = 20,
         max_time: int | float = MAX_DATA_LOADING_TIME,
         name: str | None = None,
+        job_description: str | None = None,
     ) -> DataLoadingJobModel:
         """Generate a quantum circuit that prepares a quantum state from matrix product state (MPS).
         The MPS is normalized in the process, and expect physical index to be of size 2.
@@ -1614,6 +1728,178 @@ class Haiqu:
             data=DataLoadingSubmitModel(
                 dl_type=DataLoadingType.MPS_LOADING.value,
                 name=name,
+                description=job_description,
+                experiment_id=self._experiment.id,
+                parameters=parameters,
+            )
+        )
+
+    @staticmethod
+    def _prepare_function_loading_params(
+        num_qubits,
+        func,
+        interval_start,
+        interval_end,
+        num_layers,
+        truncation_cutoff,
+        fine_tuning_iterations,
+        max_time,
+        name,
+    ):
+        if not isinstance(num_qubits, int) or num_qubits < 1:
+            raise ValueError("Invalid number of qubits.")
+
+        if not isinstance(num_layers, int) or num_layers < 1:
+            raise ValueError("Invalid number of layers.")
+
+        if not isinstance(interval_start, (float, int)) or not isinstance(interval_end, (float, int)):
+            raise ValueError(f"Invalid interval start/end ({interval_start}, {interval_end}).")
+
+        if interval_end <= interval_start:
+            raise ValueError("Interval start must be smaller than interval end.")
+
+        if isinstance(truncation_cutoff, (float, int)):
+            if truncation_cutoff < 0 or truncation_cutoff > 1:
+                raise ValueError("Truncation cutoff must be a real value between 0 and 1")
+
+        if max_time < 0 or max_time > MAX_DATA_LOADING_TIME:
+            raise ValueError(f"max_time must be non-negative but no more than {MAX_DATA_LOADING_TIME} seconds")
+
+        # `func` is accepted as a SymPy expression or a string and normalized to a string for transport.
+        # Only the single real variable `x` is allowed. The imaginary unit `I` is a SymPy constant, not a
+        # free symbol, so complex-valued functions such as `exp(I*x)` pass the single-variable check.
+        try:
+            expression = sympy.sympify(func)
+        except (sympy.SympifyError, SyntaxError, TypeError) as exc:
+            raise ValueError(f"Could not parse `func` as a SymPy expression: {func!r}") from exc
+
+        extra_symbols = {s for s in expression.free_symbols if s.name != "x"}
+        if extra_symbols:
+            raise ValueError(f"`func` must be an expression in the single variable `x`, but also got symbols {extra_symbols}")
+
+        func_str = str(expression)
+
+        parameters = {
+            "func": func_str,
+            "interval_start": interval_start,
+            "interval_end": interval_end,
+            "num_layers": num_layers,
+            "truncation_cutoff": truncation_cutoff,
+            "fine_tuning_iterations": fine_tuning_iterations,
+            "max_time": max_time,
+        }
+
+        if name is None:
+            name = f"FunctionLoading({func_str})"
+
+        return name, parameters
+
+    _function_loading_args = f"""
+            num_qubits (int): The number of qubits in the generated circuit (from 1 to 1000 qubits).
+            func (str | sympy.Expr): The function to encode, given as a SymPy expression or a string in the single
+                                     variable ``x``.
+            interval_start (Real): The beginning of the interval on which the function is sampled.
+            interval_end (Real): The end of the interval on which the function is sampled.
+            num_layers (int): The number of layers in the generated circuit (from 1 to 100 layers).
+                              More layers can improve the quality of the output
+                              function at the cost of a deeper circuit. Defaults to 2.
+            truncation_cutoff (Real): The entanglement cutoff for later layers. Increasing this threshold may result in a smaller
+                                      (but more approximate) circuit. Defaults to ``1e-6``.
+            fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
+                                          Increasing this limit may improve the quality of the circuit by using more classical
+                                          resources. Defaults to 20, maximal is 500.
+            max_time (int | float): Soft time limit for the job (in seconds).
+                            The data loading job will first always produce the initial result and then limit the fine-tuning
+                            stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
+                            current result will be returned. Defaults to {MAX_DATA_LOADING_TIME}
+                            ({MAX_DATA_LOADING_TIME//60} min). Max allowed job time is {MAX_DATA_LOADING_TIME//60} min.
+                            The job can take more wall clock time than user specified `max_time` due to latency,
+                            initialization overheads or if the initial result already takes more time.
+            name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be automatically
+                               generated.
+    """
+
+    @errors.graceful_api_errors_message
+    @format_docstring(ARGS=_function_loading_args)
+    def function_loading(
+        self,
+        num_qubits: int,
+        func: str | sympy.Expr,
+        interval_start: Real,
+        interval_end: Real,
+        num_layers: int = 2,
+        truncation_cutoff: Real = 1e-6,
+        fine_tuning_iterations: int = 20,
+        max_time: int | float = MAX_DATA_LOADING_TIME,
+        name: str | None = None,
+    ) -> DataLoadingJobModel:
+        """Generate a quantum circuit that prepares the values of a single-variable function in its amplitudes.
+
+        Given a function ``f(x)``, this method creates a Data Loading job that runs in the Haiqu cloud. The result of this
+        job is a circuit gate which prepares a state whose amplitudes are the function values, L2-normalized as a quantum state.
+        The resulting gate can be used to supply the function to a quantum algorithm for processing.
+
+        The function is provided as a `SymPy <https://www.sympy.org>`_ expression or as a string, and must depend on the
+        single variable ``x`` only (e.g. ``"sin(x)"``, ``"exp(-x**2)"``, ``"x**2 + 1"``). The variable ``x`` is real-valued
+        and ranges over the real interval ``[interval_start, interval_end]``. The function values may be complex even though
+        ``x`` is real; the imaginary unit can be written Python-style as ``1j`` or SymPy-style as ``I``
+        (e.g. ``"exp(1j*x)"`` or ``"exp(I*x)"``).
+
+        The function is discretized on a grid of ``2**num_qubits`` points: it is evaluated at the center (midpoint) of each
+        bin of the interval, and the resulting values are normalized as a quantum state. Singularities and non-finite values
+        (``nan``, ``+/-inf``) are nullified (set to 0).
+
+        The complexity and quality of the generated circuit can be controlled by the ``num_layers``, ``truncation_cutoff``,
+        and ``fine_tuning_iterations`` parameters.
+
+        Args:{ARGS}
+        Returns:
+            DataLoadingJobModel: The Data Loading job that will generate the circuit for the function.
+                Call ``job.result()`` to retrieve a Qiskit-compatible gate (``HaiquCircuitGate``) that prepares the function
+                values. ``job.quality`` is the achieved state fidelity vs. the ideal target function; ``job.info`` exposes
+                loader metadata (``fidelity``).
+                Run ``help(job.result)`` for the full description of result and ``info`` contents.
+
+        Examples:
+            Encoding a Gaussian given as a SymPy expression:
+
+            >>> import sympy
+            >>> x = sympy.Symbol("x")
+            >>> job = haiqu.function_loading(num_qubits=6, func=sympy.exp(-x**2), interval_start=-3, interval_end=3)
+            >>> fl_gate = job.result()  # fl_gate is a Qiskit-compatible gate
+            >>> print(f"Function was loaded with fidelity {{job.quality:.6f}}")
+            Function was loaded with fidelity 0.999518
+
+            The same function given as a string:
+
+            >>> job = haiqu.function_loading(num_qubits=6, func="exp(-x**2)", interval_start=-3, interval_end=3)
+
+            Encoding a sine wave:
+
+            >>> job = haiqu.function_loading(num_qubits=6, func="sin(x)", interval_start=-5, interval_end=5)
+
+            Encoding a complex-valued function (``1j`` and ``I`` are equivalent):
+
+            >>> job = haiqu.function_loading(num_qubits=6, func="exp(1j*x)", interval_start=0, interval_end=10)
+        """
+        self._check_experiment()
+        name, parameters = self._prepare_function_loading_params(
+            num_qubits,
+            func,
+            interval_start,
+            interval_end,
+            num_layers,
+            truncation_cutoff,
+            fine_tuning_iterations,
+            max_time,
+            name,
+        )
+
+        return self._client.data_loading(
+            data=DataLoadingSubmitModel(
+                dl_type=DataLoadingType.FUNCTION_LOADING.value,
+                name=name,
+                num_qubits=num_qubits,
                 experiment_id=self._experiment.id,
                 parameters=parameters,
             )
@@ -1713,8 +1999,9 @@ class Haiqu:
             approximation_level (int | None): A small integer related to circuit complexity. Larger values improve the noiseless
                                               quality metric, but may degrade noisy performance. Defaults to ``None``, which
                                               corresponds to auto-selection using the chosen ``noise_profile``. Can be set from
-                                              1 (very weak approximation) to 8 (very high approximation). Larger approximation
-                                              level values lead to slower fine-tuning.
+                                              1 (very weak approximation) to 100 (very high approximation). Larger approximation
+                                              level values lead to slower fine-tuning. For majority of applications recommended
+                                              values are generally ranged from 1 to 5.
 
         Returns:
             StateCompressionJobModel | list[StateCompressionJobModel]: The State Compression job(s) that will generate the
@@ -1850,8 +2137,9 @@ class Haiqu:
             approximation_level (int | None): A small integer related to circuit complexity. Larger values improve the noiseless
                                               quality metric, but may degrade noisy performance. Defaults to ``None``, which
                                               corresponds to auto-selection using the chosen ``noise_profile``. Can be set from
-                                              1 (very weak approximation) to 8 (very high approximation). Larger approximation
-                                              level values lead to slower fine-tuning.
+                                              1 (very weak approximation) to 100 (very high approximation). Larger approximation
+                                              level values lead to slower fine-tuning. For majority of applications recommended
+                                              values are generally ranged from 1 to 5.
 
         Returns:
             StateCompressionJobModel | list[StateCompressionJobModel]: The State Compression job(s) that will generate the
@@ -1934,6 +2222,106 @@ class Haiqu:
         return jobs
 
     @errors.graceful_api_errors_message
+    def su2_equivariant_compilation(
+        self,
+        target: QuantumCircuit | Gate | np.ndarray,
+        *,
+        target_fidelity: float = 0.99,
+        max_layers: int = 6,
+        num_restarts: int = 10,
+        seed: int = 0,
+    ) -> Su2EquivariantCompilationJobModel:
+        """Compress an SU(2)-equivariant gate into a brick of 2-qubit ``su2`` gates.
+
+        Submits a job that fits a shallow brickwork of 2-qubit ``su2`` gates to
+        ``target`` and returns the compressed circuit. The headline use is
+        compressing the exact 3-qubit equivariant gate into a 2q brick, which
+        transpiles to substantially fewer two-qubit gates.
+
+        The target must be SU(2)-equivariant (commute with the global spin
+        generators); non-equivariant inputs fail the job. Inherently small-n:
+        the fit needs the dense ``2^n`` by ``2^n`` target unitary, so the
+        target is capped at 10 qubits. For larger systems, build a
+        parametrized :func:`~haiqu.sdk.qml.su2_equivariant_ansatz` and optimise
+        at the state level instead.
+
+        Args:
+            target (QuantumCircuit | Gate | np.ndarray): SU(2)-equivariant
+                target. Accepts a ``QuantumCircuit``, a ``Gate``, or a
+                ``2^n`` by ``2^n`` ``numpy.ndarray``.
+            target_fidelity (float): Requested process fidelity to the target
+                unitary (default ``0.99``); a gate (process) fidelity, distinct
+                from the state fidelity used elsewhere in the SDK. This is the
+                goal the fit aims for, not a guarantee: the returned circuit may
+                fall short, so check ``job.fidelity`` on the result. The fit
+                escalates brickwork depth trying to clear this bar.
+            max_layers (int): Cap on brickwork depth before giving up.
+            num_restarts (int): Number of optimiser restarts.
+            seed (int): Random seed for restart initialisation.
+
+        Returns:
+            Su2EquivariantCompilationJobModel: The compression job. Call
+            ``job.result()`` to retrieve the compressed circuit as a
+            ``CircuitModel`` and read ``job.fidelity`` for the achieved
+            process fidelity.
+
+        Raises:
+            ValueError: If ``target`` exceeds the 10-qubit limit.
+            TypeError: If ``target`` is not a QuantumCircuit, Gate, or ndarray.
+
+        Example:
+            >>> from haiqu.sdk.qml import su2_equivariant_3_qubit_gate
+            >>> target = su2_equivariant_3_qubit_gate(0.8, 1.2, 0.5, 2.1)
+            >>> job = haiqu.su2_equivariant_compilation(target, target_fidelity=0.99)
+            >>> circuit = job.result()
+            >>> job.fidelity >= 0.99
+            True
+
+            Transpiling both to a device basis shows the two-qubit-gate drop:
+
+            >>> dev = haiqu.get_device("aer_simulator")
+            >>> orig = haiqu.transpile(target, device=dev, basis_gates=["cx", "u3"])
+            >>> comp = haiqu.transpile(circuit, device=dev, basis_gates=["cx", "u3"])
+            >>> comp.analytics.gates_2q < orig.analytics.gates_2q
+            True
+        """
+        if isinstance(target, QuantumCircuit):
+            qc = target
+        elif isinstance(target, Gate):
+            qc = QuantumCircuit(target.num_qubits)
+            qc.append(target, list(range(target.num_qubits)))
+        elif isinstance(target, np.ndarray):
+            unitary = UnitaryGate(target)
+            qc = QuantumCircuit(unitary.num_qubits)
+            qc.append(unitary, list(range(unitary.num_qubits)))
+        else:
+            raise TypeError("target must be a QuantumCircuit, Gate, or numpy.ndarray; " f"got {type(target).__name__}")
+
+        if qc.num_qubits > constants.MAX_SU2_EQUIVARIANT_COMPILATION_QUBITS:
+            raise ValueError(
+                f"su2_equivariant_compilation supports at most {constants.MAX_SU2_EQUIVARIANT_COMPILATION_QUBITS} qubits "
+                f"(the fit builds a dense 2^n x 2^n unitary); got {qc.num_qubits}."
+            )
+
+        self._check_experiment()
+
+        logged_circuit = self._get_or_create_circuit(circuit=qc)
+        jobs = self._client.su2_equivariant_compilation(
+            data=StateCompressionSubmitModel(
+                experiment_id=self._experiment.id,
+                circuit_ids=[logged_circuit.id],
+                parameters={
+                    "fidelity": target_fidelity,
+                    "max_layers": max_layers,
+                    "num_restarts": num_restarts,
+                    "seed": seed,
+                },
+                compression_type=CompressionJobType.SU2_EQUIVARIANT_COMPILATION.value,
+            )
+        )
+        return jobs[0]
+
+    @errors.graceful_api_errors_message
     @format_docstring(ARGS=_distribution_loading_args)
     @check_parameters_match(distribution_loading)
     def distribution_loading_estimates(
@@ -1947,6 +2335,7 @@ class Haiqu:
         num_layers: int = 1,
         truncation_cutoff: Real = 1e-6,
         name: str | None = None,
+        job_description: str | None = None,
         **shape,
     ) -> DataLoadingEstimatesModel:
         """Estimate the cost and time of a Data Loading job created by :meth:`distribution_loading`.
@@ -2001,6 +2390,7 @@ class Haiqu:
         fine_tuning_iterations: int = 20,
         max_time: int | float = MAX_DATA_LOADING_TIME,
         name: str | None = None,
+        job_description: str | None = None,
     ) -> DataLoadingEstimatesModel:
         """Estimate the cost and time of a Data Loading job created by :meth:`vector_loading`.
 
@@ -2185,7 +2575,7 @@ class Haiqu:
     @errors.graceful_api_errors_message
     def pretrain(
         self,
-        problem: VariationalProblem,
+        problem: Union[VariationalProblem, NonlinearVariationalProblem],
         *,
         max_time: float = 60,
         seed: Optional[int] = 42,
@@ -2195,8 +2585,15 @@ class Haiqu:
     ) -> PretrainingJobModel:
         """Pretrain parameters for a variational quantum circuit to minimize the expectation value of input observable.
 
+        Accepts either a linear ``VariationalProblem`` (minimize a single observable's expectation) or a
+        ``NonlinearVariationalProblem`` (minimize a sympy objective over several named observables, whose
+        terms may include the ``0``/``1`` projector symbols). A linear problem is treated internally as the
+        trivial objective ``"x"`` over its single observable.
+
         Args:
-            problem (VariationalProblem): problem instance containing the ansatz circuit and observable.
+            problem (VariationalProblem | NonlinearVariationalProblem): problem instance containing the
+                ansatz circuit and either a single observable (linear) or a loss expression with named
+                observables (nonlinear).
             max_time (float): maximal time (in seconds) the pretraining can take. If this time exceeds (not counting
                               initialization and other overheads), then the current best result is returned. Defaults to 1 minute.
                               Current maximal pretraining time is 15 minutes.
@@ -2215,12 +2612,11 @@ class Haiqu:
 
         Examples:
             >>> from qiskit import QuantumCircuit
-            >>> from qiskit.circuit.library import EfficientSU2
+            >>> from qiskit.circuit.library import efficient_su2
             >>> from qiskit.quantum_info import SparsePauliOp
-            >>> from haiqu.sdk import haiqu
             >>> from haiqu.sdk.qml import VariationalProblem
-            >>> pqc = qiskit.QuantumCircuit(5)
-            >>> pqc.compose(EfficientSU2(num_qubits=pqc.num_qubits, reps=1), inplace=True)
+            >>> pqc = QuantumCircuit(5)
+            >>> pqc.compose(efficient_su2(num_qubits=pqc.num_qubits, reps=1), inplace=True)
             >>> loss = SparsePauliOp(["ZIIII", "IIZXI"])
             >>> problem = VariationalProblem(pqc, loss)
             >>> job = haiqu.pretrain(problem, max_time=10)
@@ -2228,21 +2624,27 @@ class Haiqu:
             >>> haiqu.run([problem.ansatz], observables=[problem.observable], parameters=[pretrained_params],
             ...           device=haiqu.get_device("aer_simulator")).result()  # checking the result
             [[[-2.0]]]  # result may vary. -2 is the optimal loss for two independent pauli strings
-        """
-        # Log the ansatz circuit
-        circuit = self._get_or_create_circuit(problem.ansatz)
 
-        # Extract observable as tuple of (pauli_strings, coefficients) - same format as run()
-        pauli_strings = [str(pauli) for pauli in problem.observable.paulis]
-        coefficients = [float(coeff.real) for coeff in problem.observable.coeffs]
-        observable = (pauli_strings, coefficients)
+            Nonlinear objective over several observables (terms may include the ``0``/``1`` projectors):
+
+            >>> from haiqu.sdk.qml import NonlinearVariationalProblem
+            >>> problem = NonlinearVariationalProblem(
+            ...     pqc, "1 - x/y", {"x": [("ZIIII", 1.0)], "y": [("0IIII", 0.5), ("1IIZI", -0.5)]}
+            ... )
+            >>> job = haiqu.pretrain(problem, max_time=10)
+        """
+        self._check_experiment()
+
+        ansatz, loss_expression, observables = _prepare_nonlinear_problem(problem)
+
+        # Log the ansatz circuit
+        circuit = self._get_or_create_circuit(ansatz)
 
         if name is None:
             name = f"pretrain-{circuit.id}-{circuit.name}"
         if description is None:
             description = (
-                f"Pretraining of {circuit.name} with an observable with {len(pauli_strings)} Pauli terms "
-                f"for {max_time} seconds."
+                f"Pretraining of {circuit.name} with a loss over {len(observables)} observable(s) " f"for {max_time} seconds."
             )
         if initial_parameters is not None:
             initial_parameters = list(initial_parameters)
@@ -2251,12 +2653,94 @@ class Haiqu:
             data=PretrainingSubmitModel(
                 experiment_id=self._experiment.id,
                 circuit_id=circuit.id,
-                observable=observable,
+                loss_expression=loss_expression,
+                observables=observables,
                 max_time=max_time,
                 seed=seed,
                 initial_parameters=initial_parameters,
                 name=name,
                 description=description,
+                pretrain_type=PretrainingJobType.PRETRAIN.value,
+            )
+        )
+
+    @errors.graceful_api_errors_message
+    def gradient(
+        self,
+        problem: Union[VariationalProblem, NonlinearVariationalProblem],
+        weights: list[float],
+        *,
+        max_bond_dimension: int = 40,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> PretrainingJobModel:
+        """Compute the loss and gradient vector of a parametrized circuit at given weights.
+        Result is returned as a tuple (loss, gradient) and compatible with various optimizers,
+        which expect the gradient input such as scipy's minimize with ``jac=True``.
+
+        Accepts either a linear ``VariationalProblem`` or a ``NonlinearVariationalProblem`` (a sympy
+        objective over several named observables whose terms may include the ``0``/``1`` projector
+        symbols). A linear problem is treated internally as the trivial objective ``"x"`` over its
+        single observable.
+
+        Args:
+            problem (VariationalProblem | NonlinearVariationalProblem): problem instance containing the
+                ansatz circuit and either a single observable (linear) or a loss expression with named
+                observables (nonlinear).
+            weights (list[float]): parameter values at which to evaluate the loss and gradient.
+                Must match the parameters in the ansatz circuit, in the order returned by
+                Qiskit's ``QuantumCircuit.parameters``.
+            max_bond_dimension (int): maximum bond dimension for the MPS representation. Defaults to 40.
+                Maximum allowed value is 256.
+            name (str|None): optional name of the job. If not set, then automatic will be generated.
+            description (str|None): optional description of the job. If not set, then automatic will be generated.
+
+        Returns:
+            PretrainingJobModel: Job handle to track progress and retrieve results.
+                Call ``job.result()`` to retrieve a ``(loss, gradient)`` tuple, where ``loss``
+                is the observable expectation value (float) and ``gradient`` is a list of partial
+                derivatives (one float per parameter in the ansatz).
+
+        Examples:
+            >>> import numpy as np
+            >>> from qiskit import QuantumCircuit
+            >>> from qiskit.circuit.library import efficient_su2
+            >>> from qiskit.quantum_info import SparsePauliOp
+            >>> from haiqu.sdk.qml import VariationalProblem
+            >>> pqc = QuantumCircuit(2)
+            >>> pqc.compose(efficient_su2(num_qubits=2, reps=1), inplace=True)
+            >>> problem = VariationalProblem(pqc, SparsePauliOp(["ZI", "IZ"]))
+            >>> weights = [0.1] * pqc.num_parameters
+            >>> job = haiqu.gradient(problem, weights)
+            >>> loss, grad = job.result()
+            >>> print(loss)
+            1.9642185222880129
+            >>> print(np.round(grad, 3))
+            [-0.208 -0.207  0.     0.001 -0.109 -0.198  0.     0.   ]
+        """
+        self._check_experiment()
+
+        ansatz, loss_expression, observables = _prepare_nonlinear_problem(problem)
+
+        # Log the ansatz circuit
+        circuit = self._get_or_create_circuit(ansatz)
+
+        if name is None:
+            name = f"gradient-{circuit.id}-{circuit.name}"
+        if description is None:
+            description = f"Gradient of {circuit.name} with a loss over {len(observables)} observable(s)."
+
+        return self._client.pretraining(
+            data=PretrainingSubmitModel(
+                experiment_id=self._experiment.id,
+                circuit_id=circuit.id,
+                loss_expression=loss_expression,
+                observables=observables,
+                initial_parameters=list(weights),
+                options={"max_bond_dimension": max_bond_dimension},
+                name=name,
+                description=description,
+                pretrain_type=PretrainingJobType.MPS_GRADIENT.value,
             )
         )
 
@@ -2278,6 +2762,7 @@ class Haiqu:
         use_compression: bool = False,
         compression_options: Optional[CompressionOptions] = None,
         job_name: str | None = None,
+        job_description: str | None = None,
         dry_run: bool = False,
     ) -> VariationalJobModel:
         """Optimize a variational quantum circuit to minimize the expectation value of input observable.
@@ -2318,6 +2803,7 @@ class Haiqu:
             compression_options: Configuration for compression-in-training. Only used when
                 ``use_compression=True``. If ``None``, default compression settings are applied.
             job_name: The name for the job. If ``None`` (default), a name will be automatically generated.
+            job_description: The description for the job.
             dry_run (bool): Whether to stop just prior to backend execution for QPU cost estimation. Defaults to ``False``.
                 When ``True``, the job's optimization result will be empty since execution on the device is skipped.
                 The estimated QPU cost is then available via ``job.estimated_qpu_cost``. When ``use_session=True``,
@@ -2451,6 +2937,7 @@ class Haiqu:
             optimizer_options=optimizer_options,
             use_mitigation=use_mitigation,
             name=job_name,
+            description=job_description,
         )
 
         return self._client.variational_optimization(data=submit_data)
@@ -2837,6 +3324,17 @@ class Haiqu:
                 - ``"advanced_mitigation"`` (bool): Toggle advanced mitigation. Defaults to ``True``.
 
                 To use MPS simulation on ``aer_simulator``, pass ``{"method": "matrix_product_state"}``.
+
+                An optional ``"noise_model"`` key runs a noisy simulation. It is only supported when
+                ``device_id="aer_simulator"`` or ``device_id="ionq_simulator"``, and the accepted value
+                differs by backend:
+
+                - ``aer_simulator``: a ``dict`` or a ``qiskit_aer.noise.NoiseModel`` object (serialized
+                  automatically before submission).
+                - ``ionq_simulator``: a ``str`` identifier naming a characterized IonQ device
+                  (e.g. ``"aria-1"``).
+
+                Passing ``None`` (or omitting the key) runs a noiseless simulation.
 
                 **Simulator qubit limits** (enforced server-side):
 
@@ -3766,15 +4264,31 @@ class Haiqu:
         draw_neon_circuit(circuit=circuit, style=style)
         return circuit.draw(output="mpl", fold=-1, style="bw")
 
-    def _init(self, experiment_ctx: str, experiment_description: str = "") -> None:
+    def _init(
+        self,
+        experiment_ctx: str,
+        experiment_description: str = "",
+        log_source_code: bool = False,
+    ) -> None:
         """Internal method to set current experiment."""
         self._experiment = self._client.init_experiment(
             data=ExperimentSubmitModel(name=experiment_ctx, description=experiment_description)
         )
 
+        metrics = {}
         notebook_url = detect_notebook()
         if notebook_url is not None:
-            self._log_experiment_metrics(notebook_url=notebook_url)
+            metrics["notebook_url"] = notebook_url
+
+        if log_source_code:
+            source_path = detect_source_file()
+            if source_path is not None:
+                content = read_source_file(source_path)
+                if content is not None:
+                    metrics["source_code"] = content
+
+        if metrics:
+            self._log_experiment_metrics(**metrics)
 
     def _check_login(self):
         """

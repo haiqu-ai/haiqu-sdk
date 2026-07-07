@@ -35,6 +35,8 @@ API_ACTIONS = {
     "submit_experiment_metrics": "/experiments/{experiment_id}/metrics",
     "submit_circuit": "/circuits",
     "backpropagate_observables": "/circuits/{circuit_id}/backpropagate_observables",
+    "get_artifact": "/experiments/{experiment_id}/artifacts/{artifact_name}",
+    "list_artifacts": "/experiments/{experiment_id}/artifacts",
     "list_circuits": "/experiments/{experiment_id}/circuits",
     "get_circuit": "/circuits/{circuit_id}",
     "compute_analytics": "/circuits/{circuit_id}/compute_analytics/{analytics_type}",
@@ -394,6 +396,40 @@ class ApiClient:
         response = self._get(endpoint=API_ACTIONS["list_experiments"])
         return schemas.ExperimentModel.parse_items(response.json())
 
+    def get_artifact(self, experiment_id: str, artifact_name: str) -> schemas.ArtifactModel:
+        """Get artifact from API service by artifact name.
+
+        Args:
+            experiment_id (str): The ID of the experiment.
+            artifact_name (str): The name of the artifact.
+        """
+        response = self._get(
+            endpoint=API_ACTIONS["get_artifact"].format(
+                experiment_id=experiment_id,
+                artifact_name=artifact_name,
+            )
+        )
+        return schemas.ArtifactModel.model_validate_json(response.text)
+
+    def list_artifacts(
+        self,
+        experiment_id: str,
+        limit: int = 10,
+    ) -> list[schemas.ArtifactModel]:
+        """Get artifacts list in the experiment.
+
+        Args:
+            experiment_id (str): Return the artifacts for the provided experiment ID.
+            limit (int): Limit the number of the artifacts returned.
+        """
+        response = self._get(
+            endpoint=API_ACTIONS["list_artifacts"].format(experiment_id=experiment_id),
+            query_params={
+                "limit": limit,
+            },
+        )
+        return schemas.ArtifactModel.parse_items(response.json())
+
     def list_circuits(
         self,
         experiment_id: str,
@@ -525,6 +561,13 @@ class ApiClient:
         """Post compression request"""
         response = self._post(endpoint=API_ACTIONS["hemistich"], json=data.model_dump())
         return schemas.StateCompressionJobModel.parse_items(response.json())
+
+    def su2_equivariant_compilation(
+        self, data: schemas.StateCompressionSubmitModel
+    ) -> list[schemas.Su2EquivariantCompilationJobModel]:
+        """Post SU(2)-equivariant gate compilation request"""
+        response = self._post(endpoint=API_ACTIONS["hemistich"], json=data.model_dump())
+        return schemas.Su2EquivariantCompilationJobModel.parse_items(response.json())
 
     def pretraining(self, data: schemas.PretrainingSubmitModel) -> schemas.PretrainingJobModel:
         """Post pretraining job request."""

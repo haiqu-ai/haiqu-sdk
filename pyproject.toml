@@ -49,6 +49,7 @@ dependencies = [
     "qiskit-addon-utils==0.3.0",
     "qiskit-qasm3-import==0.6.0",
     "qiskit-optimization[cplex]==0.7.0",
+    "sympy>=1.13",
 
     "cplex",  # qiskit-optimization==0.7.0 ignores [cplex] for python>=3.13
     "hashable-list==0.2.*",  # Required by docplex==2.32.257 (via qiskit-optimization)
@@ -84,7 +85,7 @@ skqd = [
 dev = [
     "black==23.7.0",
     "isort",
-    "flake8==6.0.0",
+    "flake8==7.2.0",
 ]
 build = [
     

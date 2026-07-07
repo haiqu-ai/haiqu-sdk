@@ -24,7 +24,6 @@ except ImportError:
 from haiqu.sdk import schemas
 from haiqu.sdk.wiz.job_graph import draw_run_job  # noqa: F401
 
-
 DATE_TIME_FORMAT = "%B %d, %Y %I:%M:%S %p"
 DATE_TIME_FORMAT_JOBS = "%b %d, %I:%M %p"
 
@@ -817,6 +816,46 @@ def list_transpiled_circuits(items: list[schemas.CircuitModel], title: str = "TR
         </tr>"""
     html_str += """</table>"""
     return display(HTML(render_template("TRANSPILED CIRCUITS", html_str, height="150px")))
+
+
+def list_artifacts(items: list[schemas.ArtifactModel]):
+    """
+    Render artifacts widget, ordered by name.
+    """
+    html_str = """<table width="100%"><tr>
+        <th style="font-weight:bold;text-align:left!important">Name</th>
+        <th style="font-weight:bold;text-align:left!important">Type</th>
+        <th style="font-weight:bold;text-align:left!important">Data</th>
+        <th style="font-weight:bold;text-align:left!important">Creation date (UTC)</th>
+        <th style="font-weight:bold;text-align:left!important">Last updated (UTC)</th>
+    </tr>"""
+    for item in sorted(items, key=lambda item: item.name):
+        if item.artifact_data is None:
+            artifact_data = "-"
+        else:
+            if item.artifact_type == "timeseries":
+                artifact_data = str(list(item.artifact_data.values()))
+            else:
+                if not item.artifact_data:
+                    artifact_data = "-"
+                else:
+                    artifact_data = str(list(item.artifact_data.values())[-1])
+
+        if len(artifact_data) > 30:
+            artifact_data = artifact_data[:30] + "..."
+        html_str += f"""<tr>
+            <td style="width: 100px;text-align:left;!important" nowrap>{item.name}</td>
+            <td style="width: 100px;text-align:left!important" nowrap>{item.artifact_type}</td>
+            <td style="width: 100px;text-align:left!important" nowrap>{artifact_data}</td>
+            <td style="width: 100px;text-align:left!important" nowrap>
+                {item.creation_date.strftime(DATE_TIME_FORMAT) if item.creation_date is not None else "-"}
+            </td>
+            <td style="width: 100px;text-align:left!important" nowrap>
+                {item.last_updated.strftime(DATE_TIME_FORMAT) if item.last_updated is not None else "-"}
+            </td>
+        </tr>"""
+    html_str += """</table>"""
+    return display(HTML(render_template("ARTIFACTS", html_str, height="150px")))
 
 
 def list_jobs(items: list[schemas.BaseJobModel]):
