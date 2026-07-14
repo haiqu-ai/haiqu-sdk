@@ -6,6 +6,7 @@ import base64
 import hashlib
 from collections import Counter
 from datetime import datetime
+import functools
 import io
 import json
 import logging
@@ -20,7 +21,10 @@ import qiskit.qasm2
 from ._typecheck import typecheck
 from .constants import MAX_SOURCE_FILE_SIZE
 from qiskit import QuantumCircuit, qpy
-from qiskit.circuit import ParameterExpression
+import qiskit.circuit
+from qiskit.circuit import Instruction, ParameterExpression
+import qiskit.circuit.controlflow
+import qiskit.circuit.library
 from qiskit.primitives import BasePrimitiveJob, EstimatorResult, SamplerResult
 from qiskit.primitives.containers import PrimitiveResult
 from qiskit.providers import Job
@@ -189,20 +193,82 @@ def from_qpy(encoded: str) -> QuantumCircuit:
     return circuits[0]  # We get a list back even if we only dumped a single circuit.
 
 
+def _qpy_check_name_collision(operation):
+    """Determine whether ``operation`` will confuse ``_write_instruction`` in ``qiskit/qpy/binary_io/circuits.py`` by having the
+    same class name as a standard class.
+
+    This is only a sketch of what the actual implementation checks, so it may need to be extended to handle more interesting
+    cases.
+    """
+    if not isinstance(operation, Instruction):
+        return False  # No handling of non-Instruction Operation subclasses
+
+    gate_class = operation.base_class
+
+    for module in [qiskit.circuit.library, qiskit.circuit, qiskit.circuit.controlflow]:
+        if hasattr(module, gate_class.__name__) and getattr(module, gate_class.__name__) is not gate_class:
+            return True  # The name is the same, but the class is different
+
+    return False
+
+
+@functools.cache
+def _qpy_generate_subclass(cls):
+    """Produce a subclass of ``cls`` whose name shouldn't collide with anything in Qiskit."""
+    return type(
+        cls.__name__ + "__haiqu_qpy",
+        (cls,),
+        {"base_class": property(lambda self: type(self))},
+    )
+
+
 @typecheck
-def to_qpy(circuit: QuantumCircuit) -> str:
+def to_qpy(circuit: QuantumCircuit, *, check_load: bool = True) -> str:
     """Encode a circuit as base64-wrapped QPY data.
 
     Args:
         circuit (QuantumCircuit): Circuit to serialize.
+        check_load (bool): Whether to verify that the QPY-serialized circuit can be loaded. Defaults to ``True``.
 
     Returns:
         str: Base64-encoded QPY payload suitable for JSON transport.
     """
+    has_collision = False
+    for instruction in circuit.data:
+        if _qpy_check_name_collision(instruction.operation):
+            has_collision = True
+            break
+
+    if has_collision:
+        out = circuit.copy_empty_like()
+
+        for instruction in circuit.data:
+            if _qpy_check_name_collision(instruction.operation):
+                # The QPY serializer assumes that any operation whose class name it recognizes must be an instance of the standard
+                # operation class, and it doesn't bother serializing the definition. Catch instances of this (e.g. for MSGate in
+                # qiskit-ionq) and trick the serializer into treating it as a custom gate by modifying the class name.
+                operation = instruction.operation.to_mutable()
+                operation.__class__ = _qpy_generate_subclass(operation.__class__)
+                instruction = instruction.replace(operation=operation)
+
+                # TODO: Recurse into operations that can contain gates (e.g. custom definition, AnnotatedOperation, ControlFlowOp)
+
+            out.append(instruction)
+
+        for instruction in out.data:
+            if _qpy_check_name_collision(instruction.operation):
+                raise RuntimeError(f"Failed to resolve name collision for operation: {instruction.operation.base_class.__name__}")
+    else:
+        out = circuit
+
     buf = io.BytesIO()
-    qpy.dump(circuit, buf, version=QPY_DUMP_VERSION)
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode("utf-8")
+    qpy.dump(out, buf, version=QPY_DUMP_VERSION)
+
+    if check_load:
+        buf.seek(0)
+        qpy.load(buf)
+
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 @typecheck

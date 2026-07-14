@@ -2279,9 +2279,9 @@ class Haiqu:
 
             Transpiling both to a device basis shows the two-qubit-gate drop:
 
-            >>> dev = haiqu.get_device("aer_simulator")
-            >>> orig = haiqu.transpile(target, device=dev, basis_gates=["cx", "u3"])
-            >>> comp = haiqu.transpile(circuit, device=dev, basis_gates=["cx", "u3"])
+            >>> dev = haiqu.get_device("fake_marrakesh")
+            >>> orig = haiqu.transpile(target, device=dev)
+            >>> comp = haiqu.transpile(circuit, device=dev)
             >>> comp.analytics.gates_2q < orig.analytics.gates_2q
             True
         """
