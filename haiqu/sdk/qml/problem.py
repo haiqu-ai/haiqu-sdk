@@ -1,5 +1,8 @@
 """
 Haiqu SDK QML: Variational Problem definition.
+
+Observable term strings in :class:`NonlinearVariationalProblem` use Qiskit's
+reversed-order (little-endian) convention: the rightmost character acts on qubit 0.
 """
 
 from __future__ import annotations
@@ -15,6 +18,20 @@ from ..utils import sparse_op_to_tuple
 # single-qubit computational-basis projectors |0><0| ("0") and |1><1| ("1").
 _ALLOWED_TERM_CHARS = frozenset("IXYZ01")
 
+_TERM_STRING_ORDER_NOTE = (
+    "Term strings use Qiskit's reversed-order (little-endian) convention: the "
+    "**rightmost** character acts on **qubit 0** (``q_0``), the leftmost on qubit "
+    "``n - 1``. This applies uniformly to Pauli symbols (``I``, ``X``, ``Y``, ``Z``) "
+    'and projector symbols (``0``, ``1``). For example, on 2 qubits, ``"IZ"`` is '
+    '``Z`` on ``q_0`` and ``"ZI"`` is ``Z`` on ``q_1``; ``"0I"`` is '
+    '``|0⟩⟨0|`` on ``q_1`` and ``I`` on ``q_0``, while ``"I0"`` is '
+    "``|0⟩⟨0|`` on ``q_0`` and ``I`` on ``q_1``. "
+    "``SparsePauliOp`` observables use the same label convention (this matches amplitude / "
+    "bitstring little-endian indexing: rightmost position = ``q_0``). Projector terms "
+    "must be given as ``(term_string, coefficient)`` pairs — ``SparsePauliOp`` "
+    "cannot represent ``0``/``1`` symbols."
+)
+
 
 class VariationalProblem:
     """A variational quantum optimization problem definition.
@@ -23,7 +40,9 @@ class VariationalProblem:
 
     Args:
         ansatz: Parameterized quantum circuit.
-        observable: The observable as a SparsePauliOp.
+        observable: The observable as a SparsePauliOp. Pauli labels follow Qiskit's
+            reversed-order convention (rightmost character = qubit 0), the same as
+            :class:`NonlinearVariationalProblem` term strings.
 
     Raises:
         TypeError: If inputs are wrong types.
@@ -94,6 +113,8 @@ class NonlinearVariationalProblem:
     ``"0"`` (``|0><0|``) and ``"1"`` (``|1><1|``) in addition to the Pauli characters
     ``I``/``X``/``Y``/``Z``.
 
+    {_TERM_STRING_ORDER_NOTE}
+
     Args:
         ansatz: Parameterized quantum circuit.
         loss: The non-linear objective, as a sympy expression or a string that sympifies to
@@ -101,7 +122,8 @@ class NonlinearVariationalProblem:
         observables: Mapping from each free symbol of ``loss`` (given as a ``str`` or a
             ``sympy.Symbol``) to its observable. Each observable may be a ``SparsePauliOp``
             or a list of ``(term_string, coefficient)`` pairs whose term strings are over the
-            alphabet ``{I, X, Y, Z, 0, 1}``.
+            alphabet ``{I, X, Y, Z, 0, 1}``. Each ``term_string`` must have length
+            ``ansatz.num_qubits`` and follow the Qiskit term-string order above.
 
     Raises:
         TypeError: If inputs are wrong types.
@@ -264,3 +286,8 @@ class NonlinearVariationalProblem:
     def num_parameters(self) -> int:
         """Number of variational parameters in the ansatz."""
         return self._ansatz.num_parameters
+
+
+NonlinearVariationalProblem.__doc__ = NonlinearVariationalProblem.__doc__.replace(
+    "{_TERM_STRING_ORDER_NOTE}", _TERM_STRING_ORDER_NOTE
+)

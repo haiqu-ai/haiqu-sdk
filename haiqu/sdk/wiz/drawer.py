@@ -257,10 +257,10 @@ class Drawer:
         self.fig = go.Figure()
 
         if labels is None:
-            labels = [f"Histogram {i+1}" for i in range(len(counts_list))]
+            labels = [f"Histogram {i + 1}" for i in range(len(counts_list))]
         elif len(labels) < len(counts_list):
             # Extend labels if there aren't enough
-            labels = labels + [f"Histogram {i+1}" for i in range(len(labels), len(counts_list))]
+            labels = labels + [f"Histogram {i + 1}" for i in range(len(labels), len(counts_list))]
 
         colors = [] if colors is None else deepcopy(colors)
 
@@ -279,7 +279,7 @@ class Drawer:
         for i, counts in enumerate(counts_list):
             keys = list(counts.keys())
             values = list(counts.values())
-            label = labels[i] if i < len(labels) else f"Histogram {i+1}"
+            label = labels[i] if i < len(labels) else f"Histogram {i + 1}"
 
             self.fig.add_trace(
                 go.Bar(

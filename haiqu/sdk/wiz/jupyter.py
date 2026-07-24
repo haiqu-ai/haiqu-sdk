@@ -913,13 +913,13 @@ def list_jobs(items: list[schemas.BaseJobModel]):
             <td style="max-width:300px;text-align:left!important;word-break: break-all;" nowrap>
                 {item.creation_date.strftime(DATE_TIME_FORMAT_JOBS)}</td>
             <td style="max-width:300px;text-align:left!important;word-break: break-all;" nowrap>
-                { "{:.4f}".format(item.quality) if item.quality is not None else "-" }
+                {"{:.4f}".format(item.quality) if item.quality is not None else "-"}
             </td>
             <td style="max-width:300px;text-align:left!important;word-break: break-all;" nowrap>
-                { "{:.2f} s".format(item.time) if item.time is not None else "-" }
+                {"{:.2f} s".format(item.time) if item.time is not None else "-"}
             </td>
             <td style="max-width:300px;text-align:left!important;word-break: break-all;" nowrap>
-                { "${:.2f}".format(qpu_cost) if qpu_cost is not None else "-" }
+                {"${:.2f}".format(qpu_cost) if qpu_cost is not None else "-"}
             </td>
         </tr>"""
     return display(HTML(render_template("JOBS", html_str, height="150px")))

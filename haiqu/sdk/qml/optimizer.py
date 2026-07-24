@@ -69,6 +69,11 @@ class NFTOptimizerOptions(OptimizerOptions):
         reset interval use 3 evaluations. Subsequent iterations reuse the
         previous optimal value, requiring only 2 evaluations.
 
+        Result histories: ``job.result().loss_history`` and
+        ``weights_history`` record one entry per NFT iteration (parameter
+        update), not per circuit evaluation. History length therefore tracks
+        ``maxiter``, not ``maxfev``.
+
     Example:
         >>> from haiqu.sdk.qml import NFTOptimizerOptions
         >>> optimizer = NFTOptimizerOptions(maxfev=500, maxiter=200)
@@ -86,10 +91,10 @@ class NFTOptimizerOptions(OptimizerOptions):
 # 'maxfev' is excluded because it is exposed as a typed top-level field. Update
 # this dict when adding a new supported method.
 _KNOWN_OPTIONS = {
-    "cobyla": {"rhobeg", "catol", "disp"},
-    "nelder-mead": {"xatol", "fatol", "adaptive", "disp"},
-    "powell": {"xtol", "ftol", "direc", "disp"},
-    "cobyqa": {"rhobeg", "final_tr_radius", "disp"},
+    "cobyla": {"rhobeg", "tol", "maxiter", "catol", "disp", "f_target"},
+    "nelder-mead": {"xatol", "fatol", "adaptive", "maxiter", "disp"},
+    "powell": {"xtol", "ftol", "direc", "maxiter", "disp"},
+    "cobyqa": {"rhobeg", "final_tr_radius", "maxiter", "f_target", "disp"},
 }
 
 
@@ -123,21 +128,38 @@ class ScipyOptimizerOptions(OptimizerOptions):
 
             Per-method allowed keys:
 
-            - ``cobyla``: ``rhobeg``, ``catol``, ``disp``
-            - ``nelder-mead``: ``xatol``, ``fatol``, ``adaptive``, ``disp``
-            - ``powell``: ``xtol``, ``ftol``, ``direc``, ``disp``
-            - ``cobyqa``: ``rhobeg``, ``final_tr_radius``, ``disp``
+            - ``cobyla``: ``rhobeg``, ``tol``, ``maxiter``, ``catol``, ``disp``,
+              ``f_target``
+            - ``nelder-mead``: ``xatol``, ``fatol``, ``adaptive``, ``maxiter``,
+              ``disp``
+            - ``powell``: ``xtol``, ``ftol``, ``direc``, ``maxiter``, ``disp``
+            - ``cobyqa``: ``rhobeg``, ``final_tr_radius``, ``maxiter``,
+              ``f_target``, ``disp``
 
             ``maxfev`` is intentionally excluded; pass it via the top-level field.
+            ``maxiter`` is allowed for every method so scipy's own iteration /
+            evaluation budget can be raised when it would otherwise stop before
+            Haiqu's ``maxfev``.
 
     Notes:
         Final result selection: scipy methods can wander after they have found a
         good point. Haiqu therefore returns the best-so-far parameters tracked
         across the optimization, not the final scipy iterate.
 
+        Result histories: ``job.result().loss_history`` and
+        ``weights_history`` record one entry per objective / circuit
+        evaluation, not per scipy iteration. Length is capped by ``maxfev`` and
+        can exceed ``options["maxiter"]`` (e.g. Nelder–Mead / COBYQA init
+        batches dump n+1 or 2n+1 entries on the first tick).
+
     Example:
         >>> from haiqu.sdk.qml import ScipyOptimizerOptions
         >>> ScipyOptimizerOptions(method="cobyla", maxfev=200, options={"rhobeg": 0.5})
+        >>> ScipyOptimizerOptions(
+        ...     method="cobyla",
+        ...     maxfev=2000,
+        ...     options={"rhobeg": 0.3, "tol": 1e-8, "maxiter": 2000},
+        ... )
         >>> ScipyOptimizerOptions(method="powell", maxfev=500, options={"xtol": 1e-6})
         >>> ScipyOptimizerOptions(method="nelder-mead", options={"adaptive": True})
     """

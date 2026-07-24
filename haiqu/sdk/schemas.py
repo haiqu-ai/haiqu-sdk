@@ -355,7 +355,9 @@ class CircuitModel(ClientMixin, BaseCircuitModel):
 
     Note: that generated circuits (e.g. from data loading or state compression) have the QPY dump available only
     on the Haiqu cloud, but they can be still converted to regular Qiskit gates and used in other circuits or
-    for execution.
+    for execution. Cloud-computed structure metrics live on ``analytics`` (for example ``analytics.depth``,
+    ``analytics.depth_2q``, ``analytics.gates_2q``); use :meth:`core_metrics` or :meth:`wait_for_analytics`
+    if they are not yet populated.
     """
 
     qpy: Optional[str] = None
@@ -1383,6 +1385,30 @@ class HybridJobModel(BaseJobModel):
             return None
         return self.info.get("qpu_cost")
 
+    @property
+    def pre_device_pipeline_time(self) -> Optional[float]:
+        """
+        Wall-clock seconds to run hybrid program layers up to (but not including)
+        the device layer.
+
+        Covers classical work in those layers, such as transpilation, mitigation
+        ordering, and observable processing. Populated for both full runs and
+        ``dry_run=True`` jobs.
+
+        Returns:
+            float or None: Pre-device hybrid pipeline duration in seconds.
+
+        Warning:
+            This property blocks the current CPU thread until the job reaches a
+            terminal state (Done/Error), similarly to ``result()``. Use ``retrieve_status()``
+            to first check the state of the job to omit the prolonged thread blockade.
+        """
+        self.result()
+
+        if self.info is None:
+            return None
+        return self.info.get("pre_device_pipeline_time")
+
 
 class RunSubmitModel(BaseModel):
     """Run submit payload data model."""
@@ -2139,35 +2165,62 @@ class VariationalResult:
     Attributes:
         optimal_parameters: The optimized parameter values.
         min_loss: The minimum loss value found.
-        loss_history: Loss values at each optimization iteration.
+        loss_history: Loss values recorded during optimization. Cadence depends
+            on the optimizer: NFT records one entry per optimizer iteration
+            (parameter update); scipy methods record one entry per objective /
+            circuit evaluation (so length can exceed ``maxiter`` and is capped
+            by ``maxfev``).
+        weights_history: Weight vectors parallel to ``loss_history`` —
+            ``weights_history[i]`` is the weight vector associated with
+            ``loss_history[i]``.
+        compression_stats: Optional per-step compression statistics when
+            compression-in-training was enabled.
     """
 
     def __init__(
         self,
+        *,
         optimal_parameters: List[float],
         min_loss: float,
         loss_history: List[float],
+        weights_history: Optional[List[List[float]]] = None,
         compression_stats: Optional[VariationalCompressionStats] = None,
     ):
         self.optimal_parameters = optimal_parameters
         self.min_loss = min_loss
         self.loss_history = loss_history
+        self.weights_history = weights_history
         self.compression_stats = compression_stats
 
-    def __repr__(self):
-        # Show first 5 values of loss_history, with ... if more
-        if len(self.loss_history) > 5:
-            loss_preview = [f"{v:.6f}" for v in self.loss_history[:5]]
-            loss_str = f"[{', '.join(loss_preview)}, ...] ({len(self.loss_history)} iterations)"
-        else:
-            loss_preview = [f"{v:.6f}" for v in self.loss_history]
-            loss_str = f"[{', '.join(loss_preview)}]"
+    @staticmethod
+    def _format_vector(values: List[float], *, max_vals: int = 5) -> str:
+        if len(values) > max_vals:
+            preview = ", ".join(f"{v:.6g}" for v in values[:max_vals])
+            return f"[{preview}, ...] ({len(values)} values)"
+        return repr(values)
 
+    @staticmethod
+    def _format_history(values: List[float], *, max_entries: int = 5) -> str:
+        if len(values) > max_entries:
+            preview = [f"{v:.6f}" for v in values[:max_entries]]
+            return f"[{', '.join(preview)}, ...] ({len(values)} entries)"
+        return f"[{', '.join(f'{v:.6f}' for v in values)}]"
+
+    @classmethod
+    def _format_weights_history(cls, weights_history: Optional[List[List[float]]], *, max_entries: int = 5) -> str:
+        if weights_history is None:
+            return "None"
+        if len(weights_history) > max_entries:
+            return f"[...] ({len(weights_history)} entries)"
+        return "[" + ", ".join(cls._format_vector(w) for w in weights_history) + "]"
+
+    def __repr__(self):
         return (
             f"VariationalResult(\n"
             f"  min_loss={self.min_loss},\n"
-            f"  optimal_parameters={self.optimal_parameters},\n"
-            f"  loss_history={loss_str}\n"
+            f"  optimal_parameters={self._format_vector(self.optimal_parameters)},\n"
+            f"  loss_history={self._format_history(self.loss_history)},\n"
+            f"  weights_history={self._format_weights_history(self.weights_history)}\n"
             f")"
         )
 
@@ -2187,6 +2240,7 @@ class VariationalJobModel(BaseJobModel):
     optimal_parameters: Optional[List[float]] = None
     min_loss: Optional[float] = None
     loss_history: Optional[List[float]] = None
+    weights_history: Optional[List[List[float]]] = None
     compression_stats: Optional[dict] = None
 
     def retrieve_status(self) -> JobStatus:
@@ -2195,6 +2249,7 @@ class VariationalJobModel(BaseJobModel):
         self.optimal_parameters = response.optimal_parameters
         self.min_loss = response.min_loss
         self.loss_history = response.loss_history
+        self.weights_history = response.weights_history
         self.compression_stats = response.compression_stats
         return self.status
 
@@ -2204,15 +2259,18 @@ class VariationalJobModel(BaseJobModel):
         Blocks until the job completes.
 
         Returns:
-            VariationalResult | None: Object containing optimal_parameters, min_loss, and loss_history, or ``None`` if not
-            available (e.g. from a dry run job).
+            VariationalResult | None: The optimization result, or ``None`` if not
+            available (e.g. from a dry run job). See ``VariationalResult`` for
+            attribute details.
 
         Raises:
             Exception: If the job failed or was cancelled.
 
         Job's ``info`` field contains additional information (not every field may be present):
 
-            * loss_history - history of losses during the optimization
+            * loss_history - history of losses during the optimization (NFT: per
+              iteration; scipy: per circuit evaluation)
+            * weights_history - weight vectors parallel to loss_history
         """
         super().result()
 
@@ -2227,6 +2285,7 @@ class VariationalJobModel(BaseJobModel):
             optimal_parameters=self.optimal_parameters,
             min_loss=self.min_loss,
             loss_history=self.loss_history,
+            weights_history=self.weights_history,
             compression_stats=comp_stats,
         )
 

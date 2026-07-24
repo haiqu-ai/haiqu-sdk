@@ -13,10 +13,12 @@ import logging
 import os
 import sys
 from typing import Any
+from urllib.parse import urljoin
 
 import openqasm3.parser
 import numpy as np
 import pandas as pd
+import requests
 import qiskit.qasm2
 from ._typecheck import typecheck
 from .constants import MAX_SOURCE_FILE_SIZE
@@ -522,7 +524,41 @@ def sparse_op_to_tuple(sparse_op: SparsePauliOp) -> tuple[list[str], list[float]
     return paulis, coeffs
 
 
-def validate_and_normalize_parameters_and_observables(parameters, observables, num_circuits):
+def get_num_parameters_per_circuit(circuits) -> list[int | None]:
+    """Return ``num_parameters`` for each circuit in a run/flow submission.
+
+    ``QuantumCircuit`` inputs use ``circuit.num_parameters``. ``CircuitModel`` inputs use
+    ``analytics.num_parameters`` when available; otherwise ``None`` (length checks are skipped).
+    """
+    if not isinstance(circuits, list):
+        circuits = [circuits]
+
+    nums: list[int | None] = []
+    for circuit in circuits:
+        if isinstance(circuit, QuantumCircuit):
+            nums.append(circuit.num_parameters)
+        elif getattr(circuit, "analytics", None) is not None and circuit.analytics.num_parameters is not None:
+            nums.append(circuit.analytics.num_parameters)
+        else:
+            nums.append(None)
+    return nums
+
+
+_PARAMETER_BINDING_ORDER_MSG = (
+    "Values are bound positionally in the order of Qiskit's ``QuantumCircuit.parameters``. "
+    "That order is usually alphabetical by parameter name when parameters are created one-by-one "
+    "(e.g. ``theta10`` before ``theta2``), regardless of gate addition order; "
+    "``ParameterVector`` and other batch constructors use vector index order instead "
+    "(e.g. ``theta[0]``, ``theta[1]``) — inspect ``list(circuit.parameters)`` to confirm."
+)
+
+
+def validate_and_normalize_parameters_and_observables(
+    parameters,
+    observables,
+    num_circuits,
+    num_parameters_per_circuit: list[int | None] | None = None,
+):
     """Validate and normalize ``parameters`` and ``observables`` for circuit submission.
 
     Coerces user-provided shapes into the canonical internal forms:
@@ -530,6 +566,12 @@ def validate_and_normalize_parameters_and_observables(parameters, observables, n
     - ``parameters``: 3D list of floats ``[[[..], [..]], ...]`` (one parameter group per circuit).
     - ``observables``: 3D list of ``(paulis, coeffs)`` tuples ``[[tup, ...], ...]``
       (one inner list per circuit).
+
+    Each inner parameter list must have length ``circuit.num_parameters``. Values are bound
+    positionally in the order of ``QuantumCircuit.parameters`` (Qiskit's ``ParameterView``).
+    When parameters are created one-by-one, that order is typically alphabetical by name
+    (independent of gate addition order); other construction patterns (e.g. ``ParameterVector``)
+    use vector index order instead — use ``list(circuit.parameters)`` to verify.
 
     Accepted ``observables`` input shapes:
 
@@ -550,6 +592,8 @@ def validate_and_normalize_parameters_and_observables(parameters, observables, n
         parameters: 2D float list (single circuit) or 3D float list (multiple circuits), or ``None``.
         observables: One of the accepted shapes above, or ``None``.
         num_circuits: Number of circuits being submitted.
+        num_parameters_per_circuit: Optional per-circuit parameter counts used to validate inner-list
+            lengths and require ``parameters`` when circuits are parameterized.
 
     Returns:
         Tuple ``(parameters, observables)`` in canonical internal form.
@@ -563,6 +607,54 @@ def validate_and_normalize_parameters_and_observables(parameters, observables, n
 
     def is_nonempty_sparse_list(lst):
         return isinstance(lst, list) and lst and all(isinstance(o, SparsePauliOp) for o in lst)
+
+    def validate_parameter_lengths():
+        # Skip when counts are unavailable (None) or their length disagrees with num_circuits.
+        # A length mismatch would indicate an internal bookkeeping bug rather than bad user
+        # input, so fall back to the (looser) shape validation above instead of raising here.
+        if num_parameters_per_circuit is None or len(num_parameters_per_circuit) != num_circuits:
+            return
+
+        for circuit_idx, expected in enumerate(num_parameters_per_circuit):
+            if expected is None:
+                continue
+            if expected > 0 and parameters is None:
+                raise ValueError(
+                    f"Circuit {circuit_idx} has {expected} parameter(s) but `parameters` was not provided. "
+                    f"{_PARAMETER_BINDING_ORDER_MSG}"
+                )
+
+        if parameters is None:
+            return
+
+        if num_circuits == 1:
+            expected = num_parameters_per_circuit[0]
+            if expected is None:
+                return
+            if expected == 0:
+                raise ValueError("Circuit has no free parameters but `parameters` was provided.")
+            for row_idx, row in enumerate(parameters):
+                if len(row) != expected:
+                    raise ValueError(
+                        f"Parameter sweep row {row_idx} has length {len(row)}, but the circuit has "
+                        f"{expected} parameter(s). Each inner list must have length equal to "
+                        f"circuit.num_parameters. {_PARAMETER_BINDING_ORDER_MSG}"
+                    )
+            return
+
+        for circuit_idx, group in enumerate(parameters):
+            expected = num_parameters_per_circuit[circuit_idx]
+            if expected is None:
+                continue
+            if expected == 0:
+                raise ValueError(f"Circuit {circuit_idx} has no free parameters but parameter values were provided.")
+            for row_idx, row in enumerate(group):
+                if len(row) != expected:
+                    raise ValueError(
+                        f"Circuit {circuit_idx}, parameter sweep row {row_idx} has length {len(row)}, "
+                        f"but the circuit has {expected} parameter(s). Each inner list must have length "
+                        f"equal to circuit.num_parameters. {_PARAMETER_BINDING_ORDER_MSG}"
+                    )
 
     # Parameters validation - accepts either 2D or 3D
     if parameters is not None:
@@ -583,6 +675,8 @@ def validate_and_normalize_parameters_and_observables(parameters, observables, n
                     "Multiple circuits: `parameters` must be 3D list of floats, "
                     "[[[c1p1, c1p2], [c1q1, c1q2]], [[c2r1, c2r2], [c2s1, c2s2]]]."
                 )
+
+    validate_parameter_lengths()
 
     # Observables validation - always return [[tuples]] format
     if observables is not None:
@@ -741,12 +835,109 @@ def is_jupyter() -> bool:
         return False
 
 
+def _ipython_user_ns() -> dict:
+    """Return the IPython user namespace, or an empty dict when unavailable."""
+    try:
+        from IPython import get_ipython
+
+        ipy = get_ipython()
+        if ipy is not None:
+            return ipy.user_ns
+    except Exception:
+        pass
+    return {}
+
+
+def _kernel_id() -> str | None:
+    """Return the id of the running IPython kernel, or ``None``.
+
+    The kernel connection file is named ``kernel-<id>.json``; the ``<id>``
+    matches the ``kernel.id`` reported by the Jupyter server sessions API.
+    """
+    try:
+        from ipykernel.connect import get_connection_file
+
+        name = os.path.basename(get_connection_file())
+        if name.startswith("kernel-") and name.endswith(".json"):
+            return name[len("kernel-") : -len(".json")]  # noqa: E203
+    except Exception:
+        pass
+    return None
+
+
+def _notebook_path_from_server() -> str | None:
+    """Return the notebook's absolute path from the live Jupyter server.
+
+    Queries each running Jupyter server's ``/api/sessions`` endpoint and matches
+    the current kernel. This reflects notebook renames immediately, unlike the
+    ``JPY_SESSION_NAME`` environment variable which is fixed when the kernel
+    starts.
+
+    Returns ``None`` when no session matches, on any error, or when the kernel is
+    shared by more than one notebook — in that ambiguous case there is no single
+    correct path, so we decline to guess and let the caller fall back.
+    """
+    kernel_id = _kernel_id()
+    if kernel_id is None:
+        return None
+
+    try:
+        from jupyter_server.serverapp import list_running_servers
+    except Exception:
+        return None
+
+    matches = set()
+    for server in list_running_servers():
+        try:
+            token = server.get("token", "") or ""
+            resp = requests.get(
+                urljoin(server["url"], "api/sessions"),
+                headers={"Authorization": f"token {token}"} if token else {},
+                timeout=2,
+            )
+            resp.raise_for_status()
+            sessions = resp.json()
+
+            for sess in sessions:
+                if sess.get("kernel", {}).get("id") != kernel_id:
+                    continue
+                rel_path = (sess.get("notebook") or {}).get("path") or sess.get("path")
+                if not rel_path:
+                    continue
+                root_dir = server.get("root_dir") or server.get("notebook_dir") or ""
+                matches.add(os.path.join(root_dir, rel_path) if root_dir else rel_path)
+        except Exception:
+            continue
+
+    # A single unambiguous match is the notebook; anything else is not safe to guess.
+    return matches.pop() if len(matches) == 1 else None
+
+
 def _notebook_full_path() -> str | None:
     """Return the absolute path of the running Jupyter notebook, or ``None``.
 
+    Sources are tried in order of reliability:
+
+    1. The live Jupyter server sessions API, which reflects the current name
+       even after a rename (JupyterLab/Notebook web app).
+    2. ``__vsc_ipynb_file__``, injected by the VS Code Jupyter extension for
+       local notebooks.
+    3. The ``__session__`` variable / ``JPY_SESSION_NAME`` environment variable,
+       which are fixed when the kernel starts (and thus stale after a rename).
+
     Example: ``/user_storage/examples/run_examples/200_GHZStatePreparation.ipynb``.
     """
-    return globals().get("__session__") or os.environ.get("JPY_SESSION_NAME")
+    from_server = _notebook_path_from_server()
+    if from_server:
+        return from_server
+
+    user_ns = _ipython_user_ns()
+
+    vscode_path = user_ns.get("__vsc_ipynb_file__")
+    if vscode_path:
+        return vscode_path
+
+    return user_ns.get("__session__") or os.environ.get("JPY_SESSION_NAME")
 
 
 def detect_notebook() -> str | None:

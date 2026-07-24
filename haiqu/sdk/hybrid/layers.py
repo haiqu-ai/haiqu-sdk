@@ -2,6 +2,12 @@
 
 A program is an ordered list of layers describing how your circuits are processed
 and run. It starts with an :class:`InputLayer` and ends with a :class:`DeviceLayer`.
+
+Use :class:`EstimatorLayer` or :class:`DistributionMitigationLayer` for grouped
+error mitigation, or compose finer processing steps by hand. For advanced
+mitigation in manual pipelines, pick the layer for the mitigation path:
+:class:`AdvancedObsMitigationLayer` for observable-based mitigation and
+:class:`AdvancedDistMitigationLayer` for distribution-based mitigation.
 """
 from typing import Annotated, Literal, Union
 
@@ -60,12 +66,12 @@ class TranspilationLayer(BaseModel):
 class EstimatorLayer(BaseModel):
     """Measure observable expectation values with error mitigation.
 
-    Use this when the job supplies observables.
+    Use this when the job supplies observables. Error mitigation is opt-in.
     """
 
     type: Literal["estimator"] = "estimator"
 
-    mitigation_enabled: bool = True
+    mitigation_enabled: bool = False
     advanced_mitigation: bool = True
     readout_mitigation: bool = True
     noise_tailoring: bool = False
@@ -91,9 +97,7 @@ class DistributionMitigationLayer(BaseModel):
     readout_mitigation_options: dict = {}
 
 
-# --- Individual processing steps ---------------------------------------------
-# Finer-grained steps for building a custom pipeline by hand instead of the
-# grouped error-mitigation layers above.
+# Finer-grained steps for hand-built pipelines; advanced mitigation splits by mitigation path.
 
 
 class ObservableSplitLayer(BaseModel):
@@ -112,6 +116,26 @@ class DynamicalDecouplingLayer(BaseModel):
     """Suppress idle-qubit errors with dynamical-decoupling sequences."""
 
     type: Literal["dynamical_decoupling"] = "dynamical_decoupling"
+
+
+class AdvancedObsMitigationLayer(BaseModel):
+    """Advanced observable-based error mitigation for hand-built pipelines.
+
+    Use this in place of the ``advanced_mitigation`` flag on grouped mitigation
+    layers when manually enabling observable-based advanced mitigation.
+    """
+
+    type: Literal["advanced_obs_mitigation"] = "advanced_obs_mitigation"
+
+
+class AdvancedDistMitigationLayer(BaseModel):
+    """Advanced distribution-based error mitigation for hand-built pipelines.
+
+    Use this in place of the ``advanced_mitigation`` flag on grouped mitigation
+    layers when manually enabling distribution-based advanced mitigation.
+    """
+
+    type: Literal["advanced_dist_mitigation"] = "advanced_dist_mitigation"
 
 
 class AdvancedReadoutMitigationLayer(BaseModel):
@@ -137,6 +161,8 @@ Layer = Annotated[
         ObservableSplitLayer,
         NoiseTailoringLayer,
         DynamicalDecouplingLayer,
+        AdvancedObsMitigationLayer,
+        AdvancedDistMitigationLayer,
         AdvancedReadoutMitigationLayer,
         QWCComputeLayer,
     ],

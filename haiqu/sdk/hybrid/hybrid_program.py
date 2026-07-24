@@ -9,7 +9,7 @@ from .layers import (
 )
 
 # Grouped mitigation variants are mutually exclusive: a program is either an
-# observable (estimator) pipeline or a raw-distribution pipeline, never both.
+# observable-based (estimator) or distribution-based mitigation path, never both.
 _GROUPED_MITIGATION = (EstimatorLayer, DistributionMitigationLayer)
 
 

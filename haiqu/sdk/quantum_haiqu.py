@@ -9,7 +9,6 @@ import os
 import copy
 import configparser
 import warnings
-from typing_extensions import deprecated
 from typing import Any, Optional, Union
 from collections.abc import Sequence
 from inspect import signature
@@ -112,6 +111,7 @@ from .utils import (
     to_qpy,
     from_qpy,
     validate_and_normalize_parameters_and_observables,
+    get_num_parameters_per_circuit,
     AWS_DEFAULT_REGION,
 )
 from .constants import MAX_DATA_LOADING_TIME, MAX_COMPRESSION_TIME
@@ -172,6 +172,9 @@ def _prepare_nonlinear_problem(
 class Haiqu:
     """
     High-level object to access all capabilities of the Haiqu quantum computing environment.
+
+    AI agents: The agent orientation is installed to ``haiqu/sdk/AGENTS.md``, and can also be found at
+    https://github.com/haiqu-ai/haiqu-sdk/blob/main/haiqu/sdk/AGENTS.md
     """
 
     def __init__(self) -> None:
@@ -196,8 +199,9 @@ class Haiqu:
             api_access_key (str | None): The token to access the Haiqu API. Optional in the Haiqu Lab environment. Defaults to
                                          ``None``, in which case the value will be taken from the ``HAIQU_API_KEY`` environment
                                          variable.
-            edge_uri (str | None): The network location of the Haiqu API service. Defaults to ``None``, which will set it
-                                   automatically to an appropriate value.
+            edge_uri (str | None): The network location of the Haiqu API service. Defaults to ``None``, in which case the value
+                                   is taken from the ``HAIQU_EDGE_URI`` environment variable if set, and otherwise from the
+                                   default production endpoint.
             raise_on_error (bool): By default, human-friendly messages are returned. Set this to raise exceptions instead.
 
         Returns:
@@ -536,6 +540,16 @@ class Haiqu:
         **transpilation_options: Any,
     ) -> CircuitModel | list[CircuitModel]:
         """Transpile a quantum circuit for a specific device.
+
+        .. note::
+
+            Transpilation runs in the Haiqu cloud. Circuits containing
+            :class:`~haiqu.sdk.gates.HaiquCircuitGate` instances (for example, from data-loading job
+            results or :meth:`~haiqu.sdk.schemas.CircuitModel.to_gate`) should be transpiled with this
+            method because the gate definitions live server-side. The returned
+            :class:`~haiqu.sdk.schemas.CircuitModel` carries cloud-computed metrics on
+            ``.analytics`` (for example ``.analytics.depth``, ``.analytics.depth_2q``,
+            ``.analytics.gates_2q``) or via ``.core_metrics()``.
 
         Args:
             circuits (QuantumCircuit | list[QuantumCircuit] | CircuitModel | list[CircuitModel]): The circuit(s) to transpile.
@@ -1078,6 +1092,51 @@ class Haiqu:
 
         return name, parameters
 
+    _AMPLITUDE_INDEXING_NOTE = """
+        .. note::
+
+            **Amplitude indexing (Qiskit little-endian).** The prepared state has ``2**num_qubits`` amplitudes.
+            ``data[i]`` is the amplitude for computational-basis index ``i``, where the rightmost bit of ``i`` is
+            qubit 0 (``q_0``). For example, with 2 qubits, ``data = [a, b, c, d]`` prepares
+            ``a|00⟩ + b|01⟩ + c|10⟩ + d|11⟩``. Apply the returned gate with
+            ``circuit.append(gate, range(num_qubits))`` so gate wire ``k`` acts on ``q_k``. Inspect amplitudes
+            after loading with :meth:`statevector_run`.
+    """
+
+    _DISCRETIZATION_INDEXING_NOTE = """
+        .. note::
+
+            **Discretization order.** The interval ``[interval_start, interval_end]`` is divided into ``2**num_qubits``
+            equal bins. Bin ``i`` (counting from 0) spans increasing position along the interval, and its midpoint
+            value becomes amplitude index ``i`` using the same Qiskit little-endian basis indexing as
+            :meth:`vector_loading` (rightmost bit of ``i`` is ``q_0``).
+    """
+
+    _BLOCK_VECTOR_INDEXING_NOTE = """
+        .. note::
+
+            **Block layout.** Flat ``data`` is split into consecutive blocks in list order. Each block is encoded with
+            the same Qiskit little-endian amplitude indexing as :meth:`vector_loading`. Blocks are placed on
+            consecutive qubit subsystems: block 0 uses the lowest-index qubits, block 1 the next qubit range, and so
+            on. Apply the gate with ``circuit.append(gate, range(num_qubits))``.
+    """
+
+    _EME_FEATURE_ORDER_NOTE = """
+        .. note::
+
+            **Feature order (not amplitude indexing).** ``data[k]`` is the ``k``-th classical input feature in list
+            order. This loader performs entangled manifold embedding; it does **not** map list entries to
+            computational-basis amplitudes like :meth:`vector_loading`.
+    """
+
+    _MPS_QUBIT_ORDER_NOTE = """
+        .. note::
+
+            **Qubit / MPS site order.** Site tensor ``A_i`` (0-based) in the input MPS corresponds to circuit qubit
+            ``q_i``. The resulting statevector uses standard Qiskit ordering (rightmost bit = qubit 0), the same
+            convention as :meth:`vector_loading` and :meth:`statevector_run`.
+    """
+
     _distribution_loading_args = """
             num_qubits (int): The number of qubits in the generated circuit (from 1 to 1000 qubits).
             distribution_name (str): The name of the distribution. Can be any of the continuous distributions in ``scipy.stats``
@@ -1099,7 +1158,11 @@ class Haiqu:
     """
 
     @errors.graceful_api_errors_message
-    @format_docstring(ARGS=_distribution_loading_args)
+    @format_docstring(
+        ARGS=_distribution_loading_args,
+        AMP_INDEXING=_AMPLITUDE_INDEXING_NOTE,
+        DISCRETIZATION=_DISCRETIZATION_INDEXING_NOTE,
+    )
     def distribution_loading(
         self,
         num_qubits: int,
@@ -1121,7 +1184,8 @@ class Haiqu:
         processing. The cost and time of this job can be estimated with :meth:`distribution_loading_estimates`.
 
         The complexity of the generated circuit can be controlled by the ``num_layers`` and ``truncation_cutoff`` parameters.
-
+        {AMP_INDEXING}
+        {DISCRETIZATION}
         Args:{ARGS}
         Returns:
             DataLoadingJobModel: The Data Loading job that will generate the circuit for the probability distribution.
@@ -1203,6 +1267,8 @@ class Haiqu:
 
     _vector_loading_args = f"""
             data (Sequence[Number]): The vector with data to encode (length of data is from 1 to ``2**20`` values).
+                                     ``data[i]`` is the amplitude for basis index ``i`` in Qiskit little-endian order
+                                     (rightmost bit of ``i`` is qubit 0).
             num_qubits: (int | None): The number of qubits in the generated circuit (from 1 to 20 qubits).
                                       If ``None`` (default), it is set automatically from the size of the data.
             num_layers (int): The number of layers in the generated circuit (from 1 to 100 layers).
@@ -1217,7 +1283,7 @@ class Haiqu:
                             The data loading job will first always produce the initial result and then limit the fine-tuning
                             stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
                             current result will be returned. Defaults to {MAX_DATA_LOADING_TIME}
-                            ({MAX_DATA_LOADING_TIME//60} min). Max allowed job time is {MAX_DATA_LOADING_TIME//60} min.
+                            ({MAX_DATA_LOADING_TIME // 60} min). Max allowed job time is {MAX_DATA_LOADING_TIME // 60} min.
                             The job can take more wall clock time than user specified `max_time` due to latency,
                             initialization overheads or if the initial result already takes more time.
             name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be automatically
@@ -1225,7 +1291,7 @@ class Haiqu:
     """
 
     @errors.graceful_api_errors_message
-    @format_docstring(ARGS=_vector_loading_args)
+    @format_docstring(ARGS=_vector_loading_args, AMP_INDEXING=_AMPLITUDE_INDEXING_NOTE)
     def vector_loading(
         self,
         data: Sequence[Number],
@@ -1247,6 +1313,11 @@ class Haiqu:
         ``fine_tuning_iterations`` parameters.
 
         If ``len(data) < 2**num_qubits``, the vector will be padded with zeros.
+        {AMP_INDEXING}
+        .. note::
+
+            Multiple calls with identical inputs will generate multiple circuits. To save time, persist the job ID together with
+            your results rather than re-running the loading job.
 
         Args:{ARGS}
         Returns:
@@ -1348,7 +1419,7 @@ class Haiqu:
                             The data loading job will first always produce the initial result and then limit the fine-tuning
                             stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
                             current result will be returned. Defaults to {MAX_DATA_LOADING_TIME}
-                            ({MAX_DATA_LOADING_TIME//60} min). Max allowed job time is {MAX_DATA_LOADING_TIME//60} min.
+                            ({MAX_DATA_LOADING_TIME // 60} min). Max allowed job time is {MAX_DATA_LOADING_TIME // 60} min.
                             The job can take more wall clock time than user specified `max_time` due to latency,
                             initialization overheads or if the initial result already takes more time. This time limit
                             will be evenly split across generation of each block.
@@ -1357,7 +1428,7 @@ class Haiqu:
     """
 
     @errors.graceful_api_errors_message
-    @format_docstring(ARGS=_block_vector_loading_args)
+    @format_docstring(ARGS=_block_vector_loading_args, BLOCK_INDEXING=_BLOCK_VECTOR_INDEXING_NOTE)
     def block_vector_loading(
         self,
         data: Sequence[Number] | Sequence[Sequence[Number]],
@@ -1386,7 +1457,7 @@ class Haiqu:
 
         The complexity and quality of the generated circuit can be controlled by the ``num_layers``, ``truncation_cutoff``, and
         ``fine_tuning_iterations`` parameters.
-
+        {BLOCK_INDEXING}
         Args:{ARGS}
         Returns:
             DataLoadingJobModel: The Data Loading job that will generate the block-wise circuit for the data.
@@ -1464,7 +1535,8 @@ class Haiqu:
         return name, parameters
 
     _entangled_manifold_embedding_args = f"""
-                data (Sequence[Real]): The real vector with data to encode.
+                data (Sequence[Real]): The real vector with data to encode. ``data[k]`` is the ``k``-th input feature in list
+                                       order (not a computational-basis amplitude index).
                 density: (int | None): Feature density of the encoding (from 1 to 8). Larger values result in more features
                                        encoded per qubit but resulting quantum states are more entangled. Ignored if
                                        ``num_qubits`` is set, in which case the minimal density that is compatible
@@ -1476,7 +1548,7 @@ class Haiqu:
                                           which can be encoded, is O(``num_qubits`` * ``density`` ^2), up to small
                                           corrections. Defaults to ``None``.
                 real (bool): if True, then a real quantum state is prepared, otherwise imaginary part is also used, doubling
-                             the amount of features, which can be encoded in the same isometries. Defaults to ``True``.
+                             the amount of features, which can be encoded in the same manifold. Defaults to ``True``.
                 periodicity (bool): if True, then additional tangent transform is performed over data, adding periodicity
                                     properties to the encoding. With ``density==1`` it matches angular encoding.
                                     Defaults to ``False``.
@@ -1492,7 +1564,7 @@ class Haiqu:
                                 The data loading job will first always produce the initial result and then limit the fine-tuning
                                 stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
                                 current result will be returned. Defaults to {MAX_DATA_LOADING_TIME}
-                                ({MAX_DATA_LOADING_TIME//60} min). Max allowed job time is {MAX_DATA_LOADING_TIME//60} min.
+                                ({MAX_DATA_LOADING_TIME // 60} min). Max allowed job time is {MAX_DATA_LOADING_TIME // 60} min.
                                 The job can take more wall clock time than user specified `max_time` due to latency,
                                 initialization overheads or if the initial result already takes more time.
                 name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be
@@ -1500,7 +1572,7 @@ class Haiqu:
         """
 
     @errors.graceful_api_errors_message
-    @format_docstring(ARGS=_entangled_manifold_embedding_args)
+    @format_docstring(ARGS=_entangled_manifold_embedding_args, FEATURE_ORDER=_EME_FEATURE_ORDER_NOTE)
     def entangled_manifold_embedding(
         self,
         data: Sequence[Real],
@@ -1526,7 +1598,7 @@ class Haiqu:
 
         The complexity and quality of the generated circuit can be controlled by the ``num_layers``, ``truncation_cutoff``, and
         ``fine_tuning_iterations`` parameters.
-
+        {FEATURE_ORDER}
         Args:{ARGS}
         Returns:
             DataLoadingJobModel: The Data Loading job that will generate the circuit for the data vector.
@@ -1587,15 +1659,6 @@ class Haiqu:
             )
         )
 
-    @deprecated(
-        "haiqu.isometry_encoding is deprecated and will be removed not earlier than in June 1, 2026. "
-        "Use haiqu.entangled_manifold_embedding instead."
-    )
-    def isometry_encoding(self, *args, **kwargs) -> DataLoadingJobModel:
-        """`isometry_encoding` is deprecated.
-        Alias for `entangled_manifold_embedding`, see its docstring"""
-        return self.entangled_manifold_embedding(*args, **kwargs)
-
     @staticmethod
     def _prepare_mps_loading_params(
         mps,
@@ -1644,7 +1707,7 @@ class Haiqu:
                             The data loading job will first always produce the initial result and then limit the fine-tuning
                             stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
                             current result will be returned. Defaults to {MAX_DATA_LOADING_TIME}
-                            ({MAX_DATA_LOADING_TIME//60} min). Max allowed job time is {MAX_DATA_LOADING_TIME//60} min.
+                            ({MAX_DATA_LOADING_TIME // 60} min). Max allowed job time is {MAX_DATA_LOADING_TIME // 60} min.
                             The job can take more wall clock time than user specified `max_time` due to latency,
                             initialization overheads or if the initial result already takes more time.
             name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be automatically
@@ -1652,7 +1715,7 @@ class Haiqu:
     """
 
     @errors.graceful_api_errors_message
-    @format_docstring(ARGS=_mps_loading_args)
+    @format_docstring(ARGS=_mps_loading_args, MPS_ORDER=_MPS_QUBIT_ORDER_NOTE)
     def mps_loading(
         self,
         mps: Sequence,
@@ -1685,7 +1748,7 @@ class Haiqu:
         The complexity and quality of the generated circuit can be controlled by the ``num_layers``, ``truncation_cutoff``, and
         ``fine_tuning_iterations`` parameters. Passing the MPS with high bond dimension may degrade the
         quality and synthesis time.
-
+        {MPS_ORDER}
         Args:{ARGS}
         Returns:
             DataLoadingJobModel: The Data Loading job that will generate the circuit from the MPS.
@@ -1812,7 +1875,7 @@ class Haiqu:
                             The data loading job will first always produce the initial result and then limit the fine-tuning
                             stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
                             current result will be returned. Defaults to {MAX_DATA_LOADING_TIME}
-                            ({MAX_DATA_LOADING_TIME//60} min). Max allowed job time is {MAX_DATA_LOADING_TIME//60} min.
+                            ({MAX_DATA_LOADING_TIME // 60} min). Max allowed job time is {MAX_DATA_LOADING_TIME // 60} min.
                             The job can take more wall clock time than user specified `max_time` due to latency,
                             initialization overheads or if the initial result already takes more time.
             name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be automatically
@@ -1820,7 +1883,11 @@ class Haiqu:
     """
 
     @errors.graceful_api_errors_message
-    @format_docstring(ARGS=_function_loading_args)
+    @format_docstring(
+        ARGS=_function_loading_args,
+        AMP_INDEXING=_AMPLITUDE_INDEXING_NOTE,
+        DISCRETIZATION=_DISCRETIZATION_INDEXING_NOTE,
+    )
     def function_loading(
         self,
         num_qubits: int,
@@ -1851,7 +1918,8 @@ class Haiqu:
 
         The complexity and quality of the generated circuit can be controlled by the ``num_layers``, ``truncation_cutoff``,
         and ``fine_tuning_iterations`` parameters.
-
+        {AMP_INDEXING}
+        {DISCRETIZATION}
         Args:{ARGS}
         Returns:
             DataLoadingJobModel: The Data Loading job that will generate the circuit for the function.
@@ -1962,6 +2030,22 @@ class Haiqu:
 
         Both the input and output circuits are assumed to be applied to the all-zero state (`|00⋯0⟩`). The action of the circuit
         on other input states is not preserved by the compression.
+
+        .. note::
+
+            * ``job.result()`` returns a ``CircuitModel``, not a plain ``QuantumCircuit`` or
+              :class:`~haiqu.sdk.gates.HaiquCircuitGate`. The model identifies a cloud-stored circuit by
+              its ID. Pass ``result`` directly to :meth:`transpile` or :meth:`run`, call ``result.to_gate()`` to embed
+              it in a larger Qiskit circuit, or persist ``result.id`` if you need to retrieve it later
+              with :meth:`get_circuit`. Metrics are on ``result.analytics`` (for example
+              ``analytics.depth``, ``analytics.gates_2q``) or ``result.core_metrics()``.
+            * ``job.quality`` is a noiseless compilation-quality metric, not a bound on observable accuracy —
+              validate the observables you care about rather than treating ``quality`` as an accuracy
+              surrogate.
+            * ``compression_level`` and ``approximation_level`` are independent knobs: the former selects the compression target
+              (the fraction of the input circuit that is compressed), and the latter affects the complexity of the output circuit.
+              Setting ``approximation_level`` explicitly replaces the automatic selection derived from ``noise_profile``; it does
+              not change what ``compression_level`` controls.
 
         Args:
             circuit (QuantumCircuit | CircuitModel): Deprecated. The quantum circuit to be compressed.
@@ -2590,6 +2674,9 @@ class Haiqu:
         terms may include the ``0``/``1`` projector symbols). A linear problem is treated internally as the
         trivial objective ``"x"`` over its single observable.
 
+        For nonlinear problems, Pauli and projector term strings follow Qiskit's reversed-order convention
+        (rightmost character = qubit 0). See :class:`~haiqu.sdk.qml.problem.NonlinearVariationalProblem`.
+
         Args:
             problem (VariationalProblem | NonlinearVariationalProblem): problem instance containing the
                 ansatz circuit and either a single observable (linear) or a loss expression with named
@@ -2682,6 +2769,9 @@ class Haiqu:
         objective over several named observables whose terms may include the ``0``/``1`` projector
         symbols). A linear problem is treated internally as the trivial objective ``"x"`` over its
         single observable.
+
+        For nonlinear problems, Pauli and projector term strings follow Qiskit's reversed-order convention
+        (rightmost character = qubit 0). See :class:`~haiqu.sdk.qml.problem.NonlinearVariationalProblem`.
 
         Args:
             problem (VariationalProblem | NonlinearVariationalProblem): problem instance containing the
@@ -2814,8 +2904,8 @@ class Haiqu:
         Returns:
             VariationalJobModel: Job handle to track optimization progress and retrieve results.
                 Call ``job.result()`` to retrieve a ``VariationalResult`` exposing ``optimal_parameters`` (``list[float]``),
-                ``min_loss`` (``float``), and ``loss_history`` (``list[float]``). ``job.info`` exposes auxiliary metadata
-                (``loss_history``, ``qpu_cost``, ``session_cost``).
+                ``min_loss`` (``float``), ``loss_history`` (``list[float]``), and ``weights_history`` (``list[list[float]]``).
+                ``job.info`` exposes auxiliary metadata (``loss_history``, ``qpu_cost``, ``session_cost``).
                 When ``dry_run=True``, ``result()`` is empty; use ``job.estimated_qpu_cost`` instead.
                 Use ``job.progress()`` for live status updates and ``help(job.result)`` for the full description of result
                 and ``info`` contents.
@@ -2846,7 +2936,11 @@ class Haiqu:
             Scipy COBYLA instead of NFT:
 
             >>> from haiqu.sdk.qml import ScipyOptimizerOptions
-            >>> optimizer = ScipyOptimizerOptions(method="cobyla", maxfev=200, options={"rhobeg": 0.5})
+            >>> optimizer = ScipyOptimizerOptions(
+            ...     method="cobyla",
+            ...     maxfev=2000,
+            ...     options={"rhobeg": 0.5, "tol": 1e-8, "maxiter": 2000},
+            ... )
             >>> job = haiqu.variational_optimization(problem, shots=1000, device_id="aer_simulator", optimizer_options=optimizer)
         """
         self._check_experiment()
@@ -2969,6 +3063,13 @@ class Haiqu:
             parameters: The parameters for the circuits. Can be a single set of parameters or nested lists of parameter sets. For
                         multiple circuits, must be a list where each element corresponds to parameters for that circuit. Defaults
                         to ``None``, in which case the circuits must not have any parameters.
+
+                        Each inner list must have length ``circuit.num_parameters``. Values are bound positionally in the
+                        order of Qiskit's ``QuantumCircuit.parameters``. When parameters are created one-by-one, that order
+                        is typically alphabetical by name (e.g. ``theta10`` before ``theta2``),
+                        independent of gate addition order; ``ParameterVector`` circuits use vector
+                        index order instead (e.g. ``theta[0]``, ``theta[1]``). Inspect
+                        ``list(circuit.parameters)`` for the exact order.
             observables: The observable(s) to measure. The order of Pauli terms in a single string follows the Qiskit
                          reversed-order convention (e.g., ``"IZ"`` measures qubit 0 in the Z basis). Defaults to ``None``,
                          in which case the circuits must include their own measurements.
@@ -2990,20 +3091,28 @@ class Haiqu:
             dry_run (bool): Whether to stop just prior to backend execution for QPU cost estimation. Defaults to ``False``.
                 When ``True``, the job result will be empty since execution on the device is skipped.
                 The estimated QPU cost is then available via ``job.estimated_qpu_cost``.
+                Wall-clock time to run hybrid program layers up to (but not including) the device
+                layer is available via ``job.pre_device_pipeline_time`` (also on full runs).
 
         Returns:
             HybridJobModel: The Hybrid job that will execute the hybrid program.
                 Call ``job.result()`` to retrieve the execution results as a nested list ordered by
                 *circuits → observables → parameters*:
 
-                * Without observables: list of measurement distributions (``dict[bitstring, quasi-probability]``), one per
+                * Without observables: list of measurement distributions (``dict[str, float]``), one per
                   circuit, in Qiskit bit-order.
                 * With observables, no parameter sweep: 2D list of expectation values, indexed ``[circuit][observable]``.
                 * With observables and a parameter sweep: 3D list of expectation values, indexed
                   ``[circuit][observable][parameter]``.
 
-                When ``dry_run=True``, ``result()`` is empty; use ``job.estimated_qpu_cost`` instead. ``job.info`` exposes
-                auxiliary metadata (``uncertainty`` when observables are supplied, ``qpu_cost``).
+                **Dry runs** (``dry_run=True``): ``result()`` is empty. Use ``job.estimated_qpu_cost`` for
+                the QPU cost estimate and ``job.pre_device_pipeline_time`` for classical hybrid time
+                before the device layer. ``job.time`` is ``0`` because the device phase does not run.
+
+                **Full runs** (``dry_run=False``): ``job.time`` is the device-phase wall clock (from when
+                device execution starts to job completion). ``job.pre_device_pipeline_time`` reports
+                classical hybrid time before the device layer. ``job.info`` also exposes auxiliary
+                metadata (``uncertainty`` when observables are supplied, ``qpu_cost`` on full runs).
                 Run ``help(job.result)`` for the full description of result and ``info`` contents.
 
         Examples:
@@ -3248,7 +3357,12 @@ class Haiqu:
             if "ibm" in device_id.lower():
                 self.update_ibm_credentials(device_credentials)
 
-        parameters, observables = validate_and_normalize_parameters_and_observables(parameters, observables, len(logged_circuits))
+        parameters, observables = validate_and_normalize_parameters_and_observables(
+            parameters,
+            observables,
+            len(logged_circuits),
+            num_parameters_per_circuit=get_num_parameters_per_circuit(circuits),
+        )
 
         job = self._client.flow(
             data=HybridSubmitModel(
@@ -3291,11 +3405,25 @@ class Haiqu:
         observables. When multiple values are provided for any of them, the results are returned as nested lists with up to 3
         layers, ordered by circuits, then observables, and finally parameters.
 
+        .. note::
+
+            Every ``device_id`` — including ``"aer_simulator"`` — dispatches to the Haiqu cloud; there is no
+            local execution path, and :meth:`login` must have succeeded first. Jobs submitted before
+            :meth:`init` is called are logged under a shared default experiment; call
+            ``haiqu.init("my experiment")`` first so runs stay organized on the dashboard.
+
         Args:
             circuits: The quantum circuit(s) to execute. Can be a single circuit or a list of circuits.
             parameters: The parameters for the circuits. Can be a single set of parameters or nested lists of parameter sets. For
                         multiple circuits, must be a list where each element corresponds to parameters for that circuit. Defaults
                         to ``None``, in which case the circuits must not have any parameters.
+
+                        Each inner list must have length ``circuit.num_parameters``. Values are bound positionally in the
+                        order of Qiskit's ``QuantumCircuit.parameters``. When parameters are created one-by-one, that order
+                        is typically alphabetical by name (e.g. ``theta10`` before ``theta2``),
+                        independent of gate addition order; ``ParameterVector`` circuits use vector
+                        index order instead (e.g. ``theta[0]``, ``theta[1]``). Inspect
+                        ``list(circuit.parameters)`` for the exact order.
             shots (int): The number of shots for each circuit execution. Defaults to 1000.
             observables: The observable(s) to measure. The order of Pauli terms in a single string follows the Qiskit
                          reversed-order convention (e.g., ``"IZ"`` measures qubit 0 in the Z basis). Defaults to ``None``,
@@ -3339,9 +3467,10 @@ class Haiqu:
                 **Simulator qubit limits** (enforced server-side):
 
                 - Statevector (``aer_simulator`` default): up to **24 qubits**.
-                - MPS (``aer_simulator`` with ``method="matrix_product_state"``): no strict qubit limit.
-                - Noisy simulation (fake devices such as ``fake_kyiv``, or ``aer_simulator`` with a
-                  ``noise_model``): up to **12 qubits**.
+                - MPS (``aer_simulator`` with ``method="matrix_product_state"``, including with fake
+                  devices): no strict qubit limit.
+                - Noisy simulation without MPS (fake devices such as ``fake_kyiv``, or
+                  ``aer_simulator`` with a ``noise_model``): up to **12 qubits**.
 
                 See `the run reference <https://docs.haiqu.ai/reference/run/run>`_ for full details.
 
@@ -3366,7 +3495,7 @@ class Haiqu:
                 Call ``job.result()`` to retrieve the execution results as a nested list ordered by
                 *circuits → observables → parameters*:
 
-                * Without observables: list of measurement distributions (``dict[bitstring, quasi-probability]``), one per
+                * Without observables: list of measurement distributions (``dict[str, float]``), one per
                   circuit, in Qiskit bit-order.
                 * With observables, no parameter sweep: 2D list of expectation values, indexed ``[circuit][observable]``.
                 * With observables and a parameter sweep: 3D list of expectation values, indexed
@@ -3611,7 +3740,12 @@ class Haiqu:
         if job_name is None:
             job_name = job_name_from_circuits(logged_circuits)
 
-        parameters, observables = validate_and_normalize_parameters_and_observables(parameters, observables, len(logged_circuits))
+        parameters, observables = validate_and_normalize_parameters_and_observables(
+            parameters,
+            observables,
+            len(logged_circuits),
+            num_parameters_per_circuit=get_num_parameters_per_circuit(circuits),
+        )
 
         # Validate and pass packing options
         self._validate_packing(use_packing, pack_size)
@@ -3678,7 +3812,12 @@ class Haiqu:
         if job_name is None:
             job_name = job_name_from_circuits(logged_circuits)
 
-        parameters, observables = validate_and_normalize_parameters_and_observables(parameters, observables, len(logged_circuits))
+        parameters, observables = validate_and_normalize_parameters_and_observables(
+            parameters,
+            observables,
+            len(logged_circuits),
+            num_parameters_per_circuit=get_num_parameters_per_circuit(circuits),
+        )
 
         insights = self._client.dry_run(
             data=RunSubmitModel(
@@ -3710,6 +3849,11 @@ class Haiqu:
         This execution type is restricted to non-parametrized circuits up to 20 qubits in size. Circuits may contain
         Haiqu gates, but no mid-circuit measurements or other logical operations. Final measurements in the circuit,
         if present, will be ignored. Statevector is measured over all qubits in their standard qiskit order.
+
+        The returned amplitude ordering matches the indexing convention used by amplitude-based data loaders
+        (:meth:`vector_loading`, :meth:`block_vector_loading`, :meth:`function_loading`,
+        :meth:`distribution_loading`, :meth:`mps_loading`): index ``i`` corresponds to the computational-basis
+        ket whose binary label has rightmost bit = qubit 0.
 
         Args:
             circuits: The quantum circuit(s) to execute. Can be a single circuit or a list of circuits.

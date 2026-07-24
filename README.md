@@ -124,7 +124,7 @@ Also see the [Core Features](https://docs.haiqu.ai/core_features/exp_tracking) s
 
 Haiqu exposes MCP (Model Context Protocol) servers so you can use AI assistants like Claude or Cursor to execute circuits, query results, and browse documentation directly from your editor.
 
-See [MCP.md](/MCP.md) for configuration instructions for VS Code + Claude Code and Cursor.
+See [MCP.md](https://github.com/haiqu-ai/haiqu-sdk/blob/main/MCP.md) for configuration instructions for VS Code + Claude Code and Cursor.
 
 ## Feedback and Support
 
