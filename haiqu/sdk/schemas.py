@@ -12,7 +12,6 @@ import json
 import numpy as np
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter, Field
-from qiskit import QuantumCircuit
 
 # from qiskit.transpiler import Target
 
@@ -353,9 +352,7 @@ class CircuitModel(ClientMixin, BaseCircuitModel):
     and enriched with analytics data. It wraps Qiskit QuantumCircuit (``qpy`` property, in the form of QPY dump)
     and provides additional methods for analytics and visualization.
 
-    Note: that generated circuits (e.g. from data loading or state compression) have the QPY dump available only
-    on the Haiqu cloud, but they can be still converted to regular Qiskit gates and used in other circuits or
-    for execution. Cloud-computed structure metrics live on ``analytics`` (for example ``analytics.depth``,
+    Cloud-computed structure metrics live on ``analytics`` (for example ``analytics.depth``,
     ``analytics.depth_2q``, ``analytics.gates_2q``); use :meth:`core_metrics` or :meth:`wait_for_analytics`
     if they are not yet populated.
     """
@@ -436,9 +433,6 @@ class CircuitModel(ClientMixin, BaseCircuitModel):
     def compute_analytics(self) -> None:
         """
         Explicitly fire the job to compute core analytics on the backend.
-
-        This is useful for the Haiqu-generated circuit (data loading, Compression)
-        when analytics metrics are not computed on the client side.
         """
         self._client.compute_analytics(circuit_id=self.id)
 
@@ -867,12 +861,8 @@ the metrics over the circuit) could take some time."""
 
         if self.qpy is not None:
             circuit = from_qpy(self.qpy)
-        elif self.generated:
-            gate = self.to_gate()
-            circuit = QuantumCircuit(gate.num_qubits)
-            circuit.append(gate, range(gate.num_qubits))
         else:
-            raise ValueError("This circuit cannot be drawn. It has no QPY and wasn't generated in the Haiqu cloud.")
+            raise ValueError("This circuit cannot be drawn, as it has no QPY.")
 
         draw_neon_circuit(circuit=circuit, style=style)
         return circuit.draw(output="mpl", fold=-1, style="bw")

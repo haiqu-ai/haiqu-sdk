@@ -30,9 +30,9 @@ haiqu.init("my experiment")    # otherwise jobs land in a shared default experim
 ## The `HaiquCircuitGate` — the #1 trap
 
 Data-loading job results return a `HaiquCircuitGate` (`haiqu/sdk/gates.py`),
-whose `definition` is `None`, as it is a client-side handle for a server-side
-circuit. State-compression job results return a `CircuitModel`; call
-`.to_gate()` if you need to embed that cloud circuit in a larger Qiskit circuit. A
+whose `definition` is `None`, as it is primarily intended as a client-side handle for a server-side
+circuit. State-compression job results return a `CircuitModel`, which does include a `qpy` attribute with the circuit contents;
+call `.to_gate()` if you need to embed that cloud circuit in a larger Qiskit circuit. A
 `HaiquCircuitGate` carries a `circuit_id`; a `CircuitModel` stores the same cloud circuit ID as
 `.id`.
 
