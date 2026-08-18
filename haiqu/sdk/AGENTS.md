@@ -20,8 +20,10 @@ haiqu.init("my experiment")    # otherwise jobs land in a shared default experim
 # 1. Build a LOGICAL circuit (plain Qiskit).
 # 2. Optional logical-level features (act BEFORE transpilation):
 #    state_compression, vector_loading, distribution_loading, mps_loading,
-#    function_loading, observable_backpropagation
+#    function_loading, fourier_loading, observable_backpropagation
 # 3. device = haiqu.get_device("fake_torino")
+#    # For real IBM QPUs with fractional gates (rx/rzz):
+#    # device = haiqu.get_device("ibm_boston", use_fractional_gates=True)
 #    tqc = haiqu.transpile(qc, device)          # optional cloud-side transpilation
 # 4. job = haiqu.run(tqc, shots=1000, device=device, use_mitigation=True)
 #    results = job.result()
@@ -71,6 +73,19 @@ call `.to_gate()` if you need to embed that cloud circuit in a larger Qiskit cir
   `distribution_loading` discretize `[interval_start, interval_end]` into bins, mapping increasing
   bin `i` to amplitude index `i`; `mps_loading` maps site tensor `A_i` to qubit `q_i`.
   `entangled_manifold_embedding` uses feature list order, not amplitude indexing.
+  `fourier_loading` takes Fourier coefficients ascending in frequency along every axis (not the
+  order `np.fft.fftn` returns — apply `fftshift`), where entry `[i0, i1, ...]` weighs frequency
+  `min_freqs[d] + i_d`; get them from
+  `compute_fourier_coefficients(data, freq_ranges)` (imported from `haiqu.sdk.utils`, not the
+  top-level package) rather than hand-rolling the FFT, and pass the
+  `min_freqs` it returns. Reshape the statevector by
+  `job.info["num_qubits_per_dimension"]` (first array dimension = highest-index qubits) to recover
+  the encoded array, up to a global phase.
+- `fourier_loading` is the one loader whose `job.quality` is NOT fidelity vs. your ideal target: it
+  measures synthesis of the coefficients you supplied and excludes the classical truncation error.
+  End-to-end fidelity is roughly `job.quality` times the fidelity returned by
+  `compute_fourier_coefficients(..., return_fidelity=True)`. Do not report `job.quality` alone as
+  the accuracy of the encoded data.
 - `run(parameters=...)` binds values in `circuit.parameters` order (usually alphabetical when parameters are created one-by-one, independent of gate order; `ParameterVector` uses vector index order — inspect `list(circuit.parameters)` to confirm).
 - `NonlinearVariationalProblem` term strings (Pauli and projector `0`/`1` symbols) use Qiskit's
   reversed-order convention: rightmost character = qubit 0. Projector terms must use

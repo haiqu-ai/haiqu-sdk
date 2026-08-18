@@ -12,7 +12,7 @@ import warnings
 from typing import Any, Optional, Union
 from collections.abc import Sequence
 from inspect import signature
-from numbers import Number, Real
+from numbers import Integral, Number, Real
 
 
 from .optimization import (
@@ -113,8 +113,24 @@ from .utils import (
     validate_and_normalize_parameters_and_observables,
     get_num_parameters_per_circuit,
     AWS_DEFAULT_REGION,
+    IQM_DEFAULT_SERVER_URL,
 )
-from .constants import MAX_DATA_LOADING_TIME, MAX_COMPRESSION_TIME
+from .constants import (
+    MAX_COMPRESSION_APPROXIMATION_LEVEL,
+    MAX_COMPRESSION_QUBITS,
+    MAX_COMPRESSION_TIME,
+    MAX_DATA_LOADING_TIME,
+    MAX_DL_EME_DENSITY,
+    MAX_DL_FINE_TUNING_ITERATIONS,
+    MAX_DL_LAYERS,
+    MAX_DL_MPS_BOND_DIMENSION,
+    MAX_DL_QUBITS,
+    MAX_DL_VECTOR_LENGTH,
+    MAX_DL_VECTOR_QUBITS,
+    MIN_COMPRESSION_APPROXIMATION_LEVEL,
+    MIN_DL_INTERVAL_WIDTH,
+    SUPPORTED_MULTIVARIATE_DIMENSIONS,
+)
 
 __all__ = ["haiqu", "Haiqu"]
 
@@ -506,21 +522,34 @@ class Haiqu:
         return CircuitModel.compare_metrics(logged_circuits, help=help, tiles_layout=tiles_layout)
 
     @errors.graceful_api_errors_message
-    def get_device(self, device_id: str) -> DeviceModel:
+    def get_device(self, device_id: str, use_fractional_gates: bool = False) -> DeviceModel:
         """Get a device by name.
 
         Args:
             device_id (str): The name of the device.
+            use_fractional_gates (bool): When this device is used for transpile/run, use IBM
+                fractional gates (continuous-angle ``rx`` / ``rzz``, etc.). Only real IBM
+                QPUs accept ``True``; fake/simulator/non-IBM raise. Defaults to ``False``.
 
         Returns:
-            DeviceModel: The requested device.
+            DeviceModel: The requested device. When ``use_fractional_gates=True``, the flag
+                is stored client-side for :meth:`transpile`, :meth:`run`, and
+                :meth:`variational_optimization`.
+
+        Raises:
+            ValueError: If the device is unknown, or ``use_fractional_gates=True`` is
+                requested for a simulator, ``fake_*``, or non-IBM device.
 
         Examples:
             >>> haiqu.get_device("fake_torino")
             DeviceModel(...)
+
+            >>> device = haiqu.get_device("ibm_boston", use_fractional_gates=True)
+            >>> haiqu.transpile(circuit, device)
+            >>> haiqu.run(circuit, device=device)
         """
         try:
-            return self._client.get_device(device_id=device_id)
+            device = self._client.get_device(device_id=device_id)
         except HTTPError as e:
             if e.response is not None and e.response.status_code == 404:
                 raise ValueError(
@@ -529,6 +558,18 @@ class Haiqu:
                     "or `haiqu.list_simulators()` to get available simulators."
                 ) from None
             raise e
+        if use_fractional_gates and (
+            device.simulator
+            or device.vendor != "IBM"
+            or not str(device.id).startswith("ibm_")
+            or str(device.id).startswith("fake_")
+        ):
+            raise ValueError(
+                "use_fractional_gates=True is only supported for real IBM Quantum devices. "
+                f"Got device_id={device.id!r} (vendor={device.vendor!r}, simulator={device.simulator})."
+            )
+        # Copy so the client-only flag does not mutate a shared/catalog instance.
+        return device.model_copy(update={"use_fractional_gates": use_fractional_gates})
 
     @errors.graceful_api_errors_message
     def transpile(
@@ -553,7 +594,8 @@ class Haiqu:
 
         Args:
             circuits (QuantumCircuit | list[QuantumCircuit] | CircuitModel | list[CircuitModel]): The circuit(s) to transpile.
-            device (DeviceModel): The target device for execution.
+            device (DeviceModel): The target device for execution. If obtained with
+                ``use_fractional_gates=True`` via :meth:`get_device`, fractional gates are used.
             job_name (str | None): The name for the job. If ``None`` (default), a name will be automatically generated.
             job_description (str | None): The description for the job.
             **transpilation_options: Additional arguments passed to the Qiskit transpiler. All parameters
@@ -587,6 +629,11 @@ class Haiqu:
             (fewest two-qubit gates) for each circuit:
 
             >>> transpiled_circuit = haiqu.transpile(circuit, device, seed_transpiler=[0, 1, 2, 3, 4])
+
+            Enable IBM fractional gates when targeting a real IBM QPU:
+
+            >>> device = haiqu.get_device("ibm_boston", use_fractional_gates=True)
+            >>> transpiled_circuit = haiqu.transpile(circuit, device)
         """
         self._check_experiment()
         logged_circuits = self._prepare_circuits(circuits)
@@ -599,6 +646,7 @@ class Haiqu:
             circuit_ids=[c.id for c in logged_circuits],
             device_id=device.id,
             transpilation_options=transpilation_options,
+            use_fractional_gates=bool(device.use_fractional_gates),
             name=job_name,
             description=job_description,
         )
@@ -1054,27 +1102,13 @@ class Haiqu:
         interval_end,
         loc,
         scale,
+        encoding,
         num_layers,
         truncation_cutoff,
         name,
         shape,
     ):
-        if not isinstance(num_qubits, int) or num_qubits < 1:
-            raise ValueError("Invalid number of qubits.")
-
-        if not isinstance(num_layers, int) or num_layers < 1:
-            raise ValueError("Invalid number of layers.")
-
-        if not isinstance(interval_start, (float, int)) or not isinstance(interval_end, (float, int)):
-            raise ValueError(f"Invalid interval start/end ({interval_start}, {interval_end}).")
-
-        if interval_end <= interval_start:
-            raise ValueError("Interval start must be smaller than interval end.")
-
-        if isinstance(truncation_cutoff, (float, int)):
-            if truncation_cutoff < 0 or truncation_cutoff > 1:
-                raise ValueError("Truncation cutoff must be a real value between 0 and 1")
-
+        # Numeric limits and the accepted encodings are enforced by DataLoadingSubmitModel validation.
         if name is None:
             name = f"{distribution_name}({loc},{scale})[{interval_start},{interval_end}]"
 
@@ -1083,6 +1117,7 @@ class Haiqu:
             "interval_end": interval_end,
             "loc": loc,
             "scale": scale,
+            "encoding": encoding,
             "num_layers": num_layers,
             "truncation_cutoff": truncation_cutoff,
         }
@@ -1135,24 +1170,78 @@ class Haiqu:
             convention as :meth:`vector_loading` and :meth:`statevector_run`.
     """
 
-    _distribution_loading_args = """
-            num_qubits (int): The number of qubits in the generated circuit (from 1 to 1000 qubits).
-            distribution_name (str): The name of the distribution. Can be any of the continuous distributions in ``scipy.stats``
-                or charachteristic function from docs.haiqu.ai/catalog/characteristic_functions.
+    _FOURIER_FREQUENCY_NOTE = """
+        .. note::
+
+            **Frequency layout.** ``fourier_coefficients[i0, i1, ...]`` is the weight of the harmonic
+            ``exp(2j*pi*((min_freqs[0] + i0)*x0 + (min_freqs[1] + i1)*x1 + ...))``, so coefficients ascend in
+            frequency along every axis — the layout :func:`~haiqu.sdk.utils.compute_fourier_coefficients` returns.
+
+            ``np.fft.fftn`` does not produce this order: it wraps the negative frequencies onto the end, returning a
+            length-4 axis as ``[0, 1, -2, -1]`` rather than ``[-2, -1, 0, 1]``. Pass a raw FFT result through
+            ``np.fft.fftshift`` first, after which index 0 carries ``-(n // 2)`` — the ``min_freqs`` default.
+
+            ``min_freqs`` is applied as a frequency-shift layer, not just as bookkeeping. A value that does not match
+            how the coefficients were obtained encodes the wrong complex exponential, whose amplitude magnitudes may
+            still look plausible. Slicing a narrower band out of a shifted spectrum moves the first frequency, so pass
+            the ``min_freqs`` that :func:`~haiqu.sdk.utils.compute_fourier_coefficients` returns.
+    """
+
+    _FOURIER_INDEXING_NOTE = """
+        .. note::
+
+            **Grid indexing.** The encoded array is recovered from the statevector by reshaping it onto the per-dimension grid,
+            ``Statevector(circuit).data.reshape([2**n for n in job.info["num_qubits_per_dimension"]])``, **up to a
+            global phase** left behind by the frequency-shift layer. The first array dimension occupies the
+            highest-index qubits, and grid point ``m`` along dimension ``d`` corresponds to
+            ``x_d = m / 2**num_qubits_per_dimension[d]``.
+
+            Unlike :meth:`vector_loading`, where qubits beyond the data size are dead zero padding, every output
+            qubit above the per-dimension minimum performs band-limited Fourier interpolation onto a finer grid, at
+            the cost of a Fourier layer rather than a wider state preparation. Resolution is therefore almost free:
+            the same 9x9 block of coefficients reaches the same fidelity on a 32x32 grid (10 qubits) as on a 256x256
+            grid (16 qubits). A dimension holding a single frequency needs no qubit to embed it,
+            so its entry in ``num_qubits_per_dimension`` may be ``0`` when ``num_qubits`` is ``None``; such a
+            dimension carries a constant, and giving it output qubits spreads that constant over its grid.
+    """
+
+    _MULTIVARIATE_DIMENSION_ORDER_NOTE = """
+        .. note::
+
+            **Dimension order (NumPy C ordering).** Dimensions occupy the statevector in C (row-major) order: the
+            first dimension is the slowest-varying and takes the high-order qubits, the last dimension is the
+            fastest-varying and takes the low-order qubits. With ``num_qubits=(n_0, n_1)`` the amplitudes reshape as
+            ``np.reshape(statevector, (2**n_0, 2**n_1))``, so the grid point ``(i_0, i_1)`` is amplitude index
+            ``i_0 * 2**n_1 + i_1``. Each dimension is discretized into ``2**n_k`` equal bins over its interval, with
+            bin 0 at the interval start, and the bits within the statevector index follow the same Qiskit
+            little-endian convention as :meth:`vector_loading`.
+    """
+
+    _distribution_loading_args = f"""
+            num_qubits (int): The number of qubits in the generated circuit (from 1 to {MAX_DL_QUBITS} qubits).
+            distribution_name (str): The name of the distribution. Can be any of the continuous distributions in
+                `scipy.stats <https://docs.scipy.org/doc/scipy/reference/stats.html#continuous-distributions>`__ or a
+                `characteristic function <https://docs.haiqu.ai/catalog/characteristic_functions>`__.
             interval_start (Real): The beginning of the interval.
-            interval_end (Real): The end of the interval.
+            interval_end (Real): The end of the interval. The interval width ``interval_end - interval_start`` must be at
+                                 least {MIN_DL_INTERVAL_WIDTH}.
             loc (Real): The location to which to shift the distribution. Defaults to 0.
-            scale (Real): The scaling factor by which to stretch the distribution. Defaults to 1.
-            num_layers (int): The number of layers in the generated circuit (from 1 to 100 layers).
+            scale (Real): The scaling factor by which to stretch the distribution (must be positive). Defaults to 1.
+            encoding (str): How function values map to amplitudes. ``"probability"`` (default): amplitudes are proportional to
+                            ``sqrt(f(x))``, so measurement probabilities are proportional to ``f(x)``. ``"amplitude"``:
+                            amplitudes are proportional to ``f(x)``.
+            num_layers (int): The number of layers in the generated circuit (from 1 to {MAX_DL_LAYERS} layers).
                               More layers can improve the quality of the output
                               distribution at the cost of a deeper circuit. Defaults to 1.
-            truncation_cutoff (Real): The entanglement cutoff for later layers. Increasing this threshold may result in a smaller
-                                      (but more approximate) circuit. Defaults to ``1e-6``.
+            truncation_cutoff (Real): The entanglement cutoff for later layers, from 0 to 1. Increasing this threshold may result
+                                      in a smaller (but more approximate) circuit. Defaults to ``1e-6``.
             name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be automatically
                                generated.
             job_description (str | None): The description for the job.
-            **shape: Additional distribution parameters, required by some distributions. Refer to the distribution documentation
-                     in ``scipy.stats`` or docs.haiqu.ai/catalog/characteristic_functions for more details.
+            **shape: Additional distribution parameters, required by some distributions. Refer to the distribution
+                     documentation in `scipy.stats <https://docs.scipy.org/doc/scipy/reference/stats.html>`__ or the
+                     `characteristic functions catalog <https://docs.haiqu.ai/catalog/characteristic_functions>`__
+                     for more details.
     """
 
     @errors.graceful_api_errors_message
@@ -1169,6 +1258,7 @@ class Haiqu:
         interval_end: Real,
         loc: Real = 0,
         scale: Real = 1,
+        encoding: str = "probability",
         num_layers: int = 1,
         truncation_cutoff: Real = 1e-6,
         name: str | None = None,
@@ -1220,7 +1310,17 @@ class Haiqu:
         """
         self._check_experiment()
         name, parameters = self._prepare_distribution_loading_params(
-            num_qubits, distribution_name, interval_start, interval_end, loc, scale, num_layers, truncation_cutoff, name, shape
+            num_qubits,
+            distribution_name,
+            interval_start,
+            interval_end,
+            loc,
+            scale,
+            encoding,
+            num_layers,
+            truncation_cutoff,
+            name,
+            shape,
         )
 
         # TODO: Add check for the required credits, use data_loading_estimates()
@@ -1239,6 +1339,260 @@ class Haiqu:
         )
 
     @staticmethod
+    def _prepare_multivariate_distribution_loading_params(
+        num_qubits,
+        distribution_name,
+        interval,
+        encoding,
+        num_layers,
+        truncation_cutoff,
+        fine_tuning_iterations,
+        distribution_params,
+        copula_params,
+        marginal_distribution_names,
+        marginal_distribution_params,
+        max_time,
+        name,
+    ):
+        if isinstance(num_qubits, Integral):
+            num_qubits = int(num_qubits)
+            if num_qubits < SUPPORTED_MULTIVARIATE_DIMENSIONS:
+                raise ValueError(
+                    f"num_qubits must be at least {SUPPORTED_MULTIVARIATE_DIMENSIONS} for multivariate distribution loading"
+                )
+        else:
+            num_qubits = list(num_qubits)
+            if len(num_qubits) < SUPPORTED_MULTIVARIATE_DIMENSIONS or not all(
+                isinstance(n, Integral) and n >= 1 for n in num_qubits
+            ):
+                raise ValueError("num_qubits must be an integer or a sequence of positive integers per dimension")
+            num_qubits = [int(n) for n in num_qubits]
+
+        if not isinstance(distribution_name, str) or not distribution_name:
+            raise ValueError("distribution_name must be a non-empty string")
+
+        interval = list(interval)
+        is_shared_interval = all(isinstance(bound, Real) for bound in interval)
+        intervals = [interval] if is_shared_interval else interval
+        for bounds in intervals:
+            if len(bounds) != 2:
+                raise ValueError("interval must be a pair (start, end) or a sequence of per-dimension interval pairs")
+            start, end = bounds
+            if not isinstance(start, Real) or not isinstance(end, Real):
+                raise ValueError(f"Invalid interval start/end ({start}, {end}).")
+            if end - start < MIN_DL_INTERVAL_WIDTH:
+                raise ValueError(f"Interval width must be at least {MIN_DL_INTERVAL_WIDTH}.")
+        intervals = [[float(start), float(end)] for start, end in intervals]
+        interval = intervals[0] if is_shared_interval else intervals
+
+        if distribution_params is not None and not isinstance(distribution_params, dict):
+            raise ValueError("distribution_params must be a dictionary")
+        if copula_params is not None and not isinstance(copula_params, dict):
+            raise ValueError("copula_params must be a dictionary")
+
+        is_copula = distribution_name.endswith("_copula")
+        if is_copula:
+            if distribution_params:
+                raise ValueError("distribution_params is only valid for direct multivariate distributions")
+            if copula_params is None:
+                raise ValueError("copula_params is required for copula loading")
+            if marginal_distribution_names is None or marginal_distribution_params is None:
+                raise ValueError("copula loading requires marginal_distribution_names and marginal_distribution_params")
+            if isinstance(marginal_distribution_names, str):
+                raise ValueError("marginal_distribution_names must be a sequence of distribution names")
+            if len(marginal_distribution_names) != len(marginal_distribution_params):
+                raise ValueError("copula loading requires matching marginal_distribution_names and marginal_distribution_params")
+            if not all(isinstance(marginal, str) for marginal in marginal_distribution_names):
+                raise ValueError("marginal_distribution_names must contain strings")
+            if not all(isinstance(params, dict) for params in marginal_distribution_params):
+                raise ValueError("marginal_distribution_params must contain dictionaries")
+        else:
+            if copula_params or marginal_distribution_names is not None or marginal_distribution_params is not None:
+                raise ValueError(
+                    "copula_params and marginal distributions are only valid when distribution_name is a copula, "
+                    "whose name ends with '_copula'"
+                )
+            if not distribution_params:
+                raise ValueError("distribution_params is required for a direct multivariate distribution")
+
+        declared_dims = {}
+        if not isinstance(num_qubits, int):
+            declared_dims["num_qubits"] = len(num_qubits)
+        if len(intervals) > 1:
+            declared_dims["interval"] = len(intervals)
+        if is_copula:
+            declared_dims["marginal_distribution_names"] = len(marginal_distribution_names)
+        if len(set(declared_dims.values())) > 1:
+            raise ValueError(f"inconsistent number of dimensions across arguments: {declared_dims}")
+
+        num_dimensions = next(iter(declared_dims.values()), SUPPORTED_MULTIVARIATE_DIMENSIONS)
+        if num_dimensions != SUPPORTED_MULTIVARIATE_DIMENSIONS:
+            raise ValueError(
+                f"only {SUPPORTED_MULTIVARIATE_DIMENSIONS}-dimensional distributions are currently supported, "
+                f"but the arguments describe {num_dimensions} dimensions: {declared_dims}"
+            )
+        if isinstance(num_qubits, int) and num_qubits % SUPPORTED_MULTIVARIATE_DIMENSIONS != 0:
+            raise ValueError(
+                f"a total num_qubits is split evenly across dimensions, so it must be a multiple of "
+                f"{SUPPORTED_MULTIVARIATE_DIMENSIONS}; pass a per-dimension sequence for an uneven split"
+            )
+
+        parameters = {
+            "num_qubits": num_qubits,
+            "interval": interval,
+            "encoding": encoding,
+            "num_layers": num_layers,
+            "truncation_cutoff": truncation_cutoff,
+            "fine_tuning_iterations": fine_tuning_iterations,
+            "max_time": max_time,
+        }
+        if distribution_params is not None:
+            parameters["distribution_params"] = distribution_params
+        if copula_params is not None:
+            parameters["copula_params"] = copula_params
+        if marginal_distribution_names is not None:
+            parameters["marginal_distribution_names"] = list(marginal_distribution_names)
+        if marginal_distribution_params is not None:
+            parameters["marginal_distribution_params"] = list(marginal_distribution_params)
+
+        if name is None:
+            name = f"{distribution_name}({num_qubits} qubits)"
+
+        total_num_qubits = num_qubits if isinstance(num_qubits, int) else sum(num_qubits)
+
+        return name, parameters, total_num_qubits
+
+    _multivariate_distribution_loading_args = f"""
+            num_qubits (int | Sequence[int]): Either the total number of qubits, split evenly across the dimensions, or a
+                                              sequence of per-dimension qubit counts such as ``(3, 1)`` for an uneven split.
+                                              A total must therefore be a multiple of the number of dimensions.
+            distribution_name (str): The name of a multivariate distribution (e.g. ``bivariate_gamma``, ``bivariate_student_t``,
+                                     ``bivariate_von_mises``, ``marshall_olkin_weibull``, ``bivariate_poisson_normal_approx``)
+                                     or a copula (``gaussian_copula``, ``clayton_copula``, ``gumbel_copula``,
+                                     ``frank_copula``). Names ending in ``_copula`` select copula loading and require
+                                     ``copula_params`` with marginal distributions instead of ``distribution_params``.
+                                     See the
+                                     `multivariate distributions catalog
+                                     <https://docs.haiqu.ai/catalog/multivariate_distributions>`__ for the full list.
+            interval (Sequence): The spatial domain. Either a single pair ``(a, b)`` shared by all dimensions, or a sequence
+                                 of per-dimension interval pairs. Each interval width ``b - a`` must be at least
+                                 {MIN_DL_INTERVAL_WIDTH}. Defaults to ``(0, 1)``.
+            encoding (str): How the pdf maps to amplitudes. ``"probability"`` (default): amplitudes are proportional to
+                            ``sqrt(pdf)``, so measurement probabilities are proportional to the pdf. ``"amplitude"``:
+                            amplitudes are proportional to the pdf.
+            num_layers (int): The number of layers in the generated circuit (from 1 to {MAX_DL_LAYERS} layers). More layers can
+                              improve the quality of the output distribution at the cost of a deeper circuit. Defaults to 1.
+            truncation_cutoff (Real): The entanglement cutoff for later layers, from 0 to 1. Increasing this threshold may result
+                                      in a smaller (but more approximate) circuit. Defaults to ``1e-6``.
+            fine_tuning_iterations (int): The number of the gradient-based fine-tuning iterations applied after analytical
+                                          compilation. Defaults to 20, maximal is {MAX_DL_FINE_TUNING_ITERATIONS}.
+            distribution_params (dict | None): Keyword arguments of a direct multivariate distribution (e.g.
+                                               ``{{"nu": 2.0, "rho": 0.5}}`` for ``bivariate_gamma``). Only valid for direct
+                                               multivariate distributions.
+            copula_params (dict | None): Keyword arguments of the named copula (e.g. ``{{"rho": 0.5}}`` for
+                                         ``gaussian_copula``). Only valid for copulas.
+            marginal_distribution_names (Sequence[str] | None):
+                `scipy.stats <https://docs.scipy.org/doc/scipy/reference/stats.html#continuous-distributions>`__ 1D
+                distribution names used as copula marginals, e.g. ``["norm", "gamma"]``. Only valid for copulas.
+            marginal_distribution_params (Sequence[dict] | None): Dictionaries of ``scipy.stats`` marginal parameters, in the
+                                                                  same order as ``marginal_distribution_names``.
+            max_time (int | float): Soft time limit for the job (in seconds). The job will first always produce the initial
+                                    result and then limit the fine-tuning stage by the remaining time left.
+                                    Defaults to {MAX_DATA_LOADING_TIME} ({MAX_DATA_LOADING_TIME//60} min).
+            name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be
+                               automatically generated.
+            job_description (str | None): The description for the job.
+    """
+
+    @errors.graceful_api_errors_message
+    @format_docstring(ARGS=_multivariate_distribution_loading_args, DIMENSION_ORDER=_MULTIVARIATE_DIMENSION_ORDER_NOTE)
+    def multivariate_distribution_loading(
+        self,
+        num_qubits: int | Sequence[int],
+        distribution_name: str,
+        interval: Sequence = (0, 1),
+        encoding: str = "probability",
+        num_layers: int = 1,
+        truncation_cutoff: Real = 1e-6,
+        fine_tuning_iterations: int = 20,
+        distribution_params: dict | None = None,
+        copula_params: dict | None = None,
+        marginal_distribution_names: Sequence[str] | None = None,
+        marginal_distribution_params: Sequence[dict] | None = None,
+        max_time: int | float = MAX_DATA_LOADING_TIME,
+        name: str | None = None,
+        job_description: str | None = None,
+    ) -> DataLoadingJobModel:
+        """Generate a quantum circuit that prepares a multivariate probability distribution or a copula-based joint PDF.
+
+        Given the description of a multivariate probability distribution function (PDF), this method creates a Data Loading job
+        that runs in the Haiqu cloud. The result of this job is a circuit which can be used to supply the joint PDF to a quantum
+        algorithm for processing. For one-dimensional
+        `scipy.stats <https://docs.scipy.org/doc/scipy/reference/stats.html#continuous-distributions>`__ distributions use
+        :meth:`distribution_loading`. See the
+        `multivariate distributions catalog <https://docs.haiqu.ai/catalog/multivariate_distributions>`__ for the full list
+        of supported distributions and copulas.
+
+        Note:
+            Joint distributions of two variables are supported at present, so ``num_qubits``, ``interval`` and the copula
+            marginals must describe two dimensions.
+        {DIMENSION_ORDER}
+        Args:{ARGS}
+        Returns:
+            DataLoadingJobModel: The Data Loading job that will generate the circuit for the joint PDF.
+                Call ``job.result()`` to retrieve a Qiskit-compatible gate (``HaiquCircuitGate``) that prepares the requested
+                distribution. ``job.quality`` is the circuit-to-MPS compilation fidelity.
+
+        Examples:
+            >>> job = haiqu.multivariate_distribution_loading(
+            ...     num_qubits=8,
+            ...     distribution_name="bivariate_gamma",
+            ...     interval=((0, 15), (0, 15)),
+            ...     distribution_params={{"nu": 2.0, "rho": 0.5}},
+            ... )
+            >>> dl_gate = job.result()  # dl_gate is a Qiskit-compatible gate
+
+            Copula with explicit marginals:
+
+            >>> job = haiqu.multivariate_distribution_loading(
+            ...     num_qubits=8,
+            ...     distribution_name="gaussian_copula",
+            ...     interval=((-3, 3), (0, 10)),
+            ...     copula_params={{"rho": 0.5}},
+            ...     marginal_distribution_names=["norm", "gamma"],
+            ...     marginal_distribution_params=[{{"loc": 0, "scale": 1}}, {{"a": 2.0}}],
+            ... )
+        """
+        self._check_experiment()
+        name, parameters, total_num_qubits = self._prepare_multivariate_distribution_loading_params(
+            num_qubits,
+            distribution_name,
+            interval,
+            encoding,
+            num_layers,
+            truncation_cutoff,
+            fine_tuning_iterations,
+            distribution_params,
+            copula_params,
+            marginal_distribution_names,
+            marginal_distribution_params,
+            max_time,
+            name,
+        )
+
+        return self._client.data_loading(
+            data=DataLoadingSubmitModel(
+                dl_type=DataLoadingType.MULTIVARIATE_DISTRIBUTION_LOADING.value,
+                name=name,
+                description=job_description,
+                experiment_id=self._experiment.id,
+                num_qubits=total_num_qubits,
+                distribution_name=distribution_name,
+                parameters=parameters,
+            )
+        )
+
+    @staticmethod
     def _prepare_vector_loading_params(
         data,
         num_layers,
@@ -1247,9 +1601,8 @@ class Haiqu:
         max_time,
         name,
     ):
-        if max_time < 0 or max_time > MAX_DATA_LOADING_TIME:
-            raise ValueError(f"max_time must be non-negative but no more than {MAX_DATA_LOADING_TIME} seconds")
-
+        # Scalar limits are enforced by DataLoadingSubmitModel schema validation. The vector length
+        # limit depends on the materialized array, so it is checked here on the client side.
         parameters = {
             "data": np.array(data),
             "num_layers": num_layers,
@@ -1258,25 +1611,28 @@ class Haiqu:
             "max_time": max_time,
         }
 
+        if not 1 <= len(parameters["data"]) <= MAX_DL_VECTOR_LENGTH:
+            raise ValueError(f"Vector length must be between 1 and {MAX_DL_VECTOR_LENGTH}.")
+
         if name is None:
             name = f"VectorLoading(size:{len(parameters['data'])})"
 
         return name, parameters
 
     _vector_loading_args = f"""
-            data (Sequence[Number]): The vector with data to encode (length of data is from 1 to ``2**20`` values).
-                                     ``data[i]`` is the amplitude for basis index ``i`` in Qiskit little-endian order
+            data (Sequence[Number]): The vector with data to encode (length of data is from 1 to ``2**{MAX_DL_VECTOR_QUBITS}``
+                                     values). ``data[i]`` is the amplitude for basis index ``i`` in Qiskit little-endian order
                                      (rightmost bit of ``i`` is qubit 0).
-            num_qubits: (int | None): The number of qubits in the generated circuit (from 1 to 20 qubits).
+            num_qubits: (int | None): The number of qubits in the generated circuit (from 1 to {MAX_DL_VECTOR_QUBITS} qubits).
                                       If ``None`` (default), it is set automatically from the size of the data.
-            num_layers (int): The number of layers in the generated circuit (from 1 to 100 layers).
+            num_layers (int): The number of layers in the generated circuit (from 1 to {MAX_DL_LAYERS} layers).
                               More layers can improve the quality of the output
                               vector at the cost of a deeper circuit. Defaults to 2.
-            truncation_cutoff (Real): The entanglement cutoff for later layers. Increasing this threshold may result in a smaller
-                                      (but more approximate) circuit. Defaults to ``1e-6``.
+            truncation_cutoff (Real): The entanglement cutoff for later layers, from 0 to 1. Increasing this threshold may result
+                                      in a smaller (but more approximate) circuit. Defaults to ``1e-6``.
             fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
                                           Increasing this limit may improve the quality of the circuit by using more classical
-                                          resources. Defaults to 20, maximal is 500.
+                                          resources. Defaults to 20, maximal is {MAX_DL_FINE_TUNING_ITERATIONS}.
             max_time (int | float): Soft time limit for the job (in seconds).
                             The data loading job will first always produce the initial result and then limit the fine-tuning
                             stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
@@ -1371,9 +1727,7 @@ class Haiqu:
         max_time,
         name,
     ):
-        if max_time < 0 or max_time > MAX_DATA_LOADING_TIME:
-            raise ValueError(f"max_time must be non-negative but no more than {MAX_DATA_LOADING_TIME} seconds")
-
+        # Numeric limits are enforced by DataLoadingSubmitModel schema validation.
         parameters = {
             "data": np.array(data),
             "num_blocks": num_blocks,
@@ -1397,7 +1751,8 @@ class Haiqu:
                                                      in one dimension and a pair of numbers (rows and columns) in two dimensions.
                                                      If ``None`` (default), the number of blocks is inferred from
                                                      ``target_num_qubits``, which must be specified.
-                                                     In result each block must be of size not larger than 20 qubits.
+                                                     In result each block must be of size not larger than {MAX_DL_VECTOR_QUBITS}
+                                                     qubits.
             target_num_qubits (int | None): The qubit budget to assume when automatically determining the number of blocks. If
                                             ``None`` (default), the number of qubits depends on ``num_blocks``, which must be
                                             specified.
@@ -1405,14 +1760,14 @@ class Haiqu:
                                           An integer indicates the exact number of overlapping indices between consecutive blocks.
                                           A float in [0, 1) indicates fractional overlap between consecutive blocks.
                                           If ``None`` (default), the blocks do not overlap.
-            num_layers (int): The number of layers in the generated circuit (from 1 to 100 layers).
+            num_layers (int): The number of layers in the generated circuit (from 1 to {MAX_DL_LAYERS} layers).
                               More layers can improve the quality of the circuit
                               blocks at the cost of a deeper circuit. Defaults to 2.
-            truncation_cutoff (Real): The entanglement cutoff for later layers. Increasing this threshold may result in a smaller
-                                      (but more approximate) circuit. Defaults to ``1e-6``.
+            truncation_cutoff (Real): The entanglement cutoff for later layers, from 0 to 1. Increasing this threshold may result
+                                      in a smaller (but more approximate) circuit. Defaults to ``1e-6``.
             fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
                                           Increasing this limit may improve the quality of the circuit by using more classical
-                                          resources. Defaults to 20, maximal is 500.
+                                          resources. Defaults to 20, maximal is {MAX_DL_FINE_TUNING_ITERATIONS}.
             max_time (int | float): Soft time limit for the job (in seconds).
                             The data loading job will first always produce the initial result and then limit the fine-tuning
                             stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
@@ -1513,9 +1868,7 @@ class Haiqu:
         max_time,
         name,
     ):
-        if max_time < 0 or max_time > MAX_DATA_LOADING_TIME:
-            raise ValueError(f"max_time must be non-negative but no more than {MAX_DATA_LOADING_TIME} seconds")
-
+        # Numeric limits are enforced by DataLoadingSubmitModel schema validation.
         parameters = {
             "data": np.array(data),
             "density": density,
@@ -1535,12 +1888,12 @@ class Haiqu:
     _entangled_manifold_embedding_args = f"""
                 data (Sequence[Real]): The real vector with data to encode. ``data[k]`` is the ``k``-th input feature in list
                                        order (not a computational-basis amplitude index).
-                density: (int | None): Feature density of the encoding (from 1 to 8). Larger values result in more features
-                                       encoded per qubit but resulting quantum states are more entangled. Ignored if
+                density: (int | None): Feature density of the encoding (from 1 to {MAX_DL_EME_DENSITY}). Larger values result in
+                                       more features encoded per qubit but resulting quantum states are more entangled. Ignored if
                                        ``num_qubits`` is set, in which case the minimal density that is compatible
                                        with the given number of qubits is chosen. Defaults to ``2``.
-                num_qubits: (int | None): number of qubits for the embedding (from 1 to 1000 qubits). If ``None``, then it is set
-                                          automatically from data size. Otherwise, it uses given number of qubits
+                num_qubits: (int | None): number of qubits for the embedding (from 1 to {MAX_DL_QUBITS} qubits). If ``None``,
+                                          then it is set automatically from data size. Otherwise, it uses given number of qubits
                                           and automatically sets the minimal possible density. Data vector is extended
                                           with zero padding if necessary. The general scaling of the data size,
                                           which can be encoded, is O(``num_qubits`` * ``density`` ^2), up to small
@@ -1550,14 +1903,14 @@ class Haiqu:
                 periodicity (bool): if True, then additional tangent transform is performed over data, adding periodicity
                                     properties to the encoding. With ``density==1`` it matches angular encoding.
                                     Defaults to ``False``.
-                num_layers (int): The number of layers in the generated circuit (from 1 to 100 layers).
+                num_layers (int): The number of layers in the generated circuit (from 1 to {MAX_DL_LAYERS} layers).
                                   More layers can improve the quality of the output
                                   vector at the cost of a deeper circuit. Defaults to 2.
-                truncation_cutoff (Real): The entanglement cutoff for later layers. Increasing this threshold may result in
-                                          a smaller (but more approximate) circuit. Defaults to ``1e-6``.
+                truncation_cutoff (Real): The entanglement cutoff for later layers, from 0 to 1. Increasing this threshold may
+                                          result in a smaller (but more approximate) circuit. Defaults to ``1e-6``.
                 fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
                                               Increasing this limit may improve the quality of the circuit by using more classical
-                                              resources. Defaults to 20, maximum is 500.
+                                              resources. Defaults to 20, maximum is {MAX_DL_FINE_TUNING_ITERATIONS}.
                 max_time (int | float): Soft time limit for the job (in seconds).
                                 The data loading job will first always produce the initial result and then limit the fine-tuning
                                 stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
@@ -1667,9 +2020,7 @@ class Haiqu:
         max_time,
         name,
     ):
-        if max_time < 0 or max_time > MAX_DATA_LOADING_TIME:
-            raise ValueError(f"max_time must be non-negative but no more than {MAX_DATA_LOADING_TIME} seconds")
-
+        # Numeric limits are enforced by DataLoadingSubmitModel schema validation.
         parameters = {
             "mps": mps,
             "shape": shape,
@@ -1689,18 +2040,18 @@ class Haiqu:
                              site tensors (one per each qubit). Vidal form is a tuple of site and bond tensors,
                              where bonds tensors are rank-1 or diagonal rank-2 tensors. The MPS type is determined automatically.
                              Standard form includes left- and right-canonical forms, while Vidal form includes
-                             central canonical form.
+                             central canonical form. The maximal bond dimension we accept is {MAX_DL_MPS_BOND_DIMENSION}.
             shape (str): shape of site tensors of the MPS. Site tensors are rank-3 tensors. Shape defines
                          the order of axes in it.
                          p - physical index, l - left index, r - right index.
                          Defaults to "plr", which is standard order in Qiskit.
-            num_layers (int): The number of layers in the generated circuit. More layers can improve the quality of the output
-                              vector at the cost of a deeper circuit. Defaults to 2.
-            truncation_cutoff (Real): The entanglement cutoff for later layers. Increasing this threshold may result in a smaller
-                                      (but more approximate) circuit. Defaults to ``1e-6``.
+            num_layers (int): The number of layers in the generated circuit (from 1 to {MAX_DL_LAYERS} layers). More layers can
+                              improve the quality of the output vector at the cost of a deeper circuit. Defaults to 2.
+            truncation_cutoff (Real): The entanglement cutoff for later layers, from 0 to 1. Increasing this threshold may result
+                                      in a smaller (but more approximate) circuit. Defaults to ``1e-6``.
             fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
                                           Increasing this limit may improve the quality of the circuit by using more classical
-                                          resources. Defaults to 20.
+                                          resources. Defaults to 20, maximal is {MAX_DL_FINE_TUNING_ITERATIONS}.
             max_time (int | float): Soft time limit for the job (in seconds).
                             The data loading job will first always produce the initial result and then limit the fine-tuning
                             stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
@@ -1807,25 +2158,7 @@ class Haiqu:
         max_time,
         name,
     ):
-        if not isinstance(num_qubits, int) or num_qubits < 1:
-            raise ValueError("Invalid number of qubits.")
-
-        if not isinstance(num_layers, int) or num_layers < 1:
-            raise ValueError("Invalid number of layers.")
-
-        if not isinstance(interval_start, (float, int)) or not isinstance(interval_end, (float, int)):
-            raise ValueError(f"Invalid interval start/end ({interval_start}, {interval_end}).")
-
-        if interval_end <= interval_start:
-            raise ValueError("Interval start must be smaller than interval end.")
-
-        if isinstance(truncation_cutoff, (float, int)):
-            if truncation_cutoff < 0 or truncation_cutoff > 1:
-                raise ValueError("Truncation cutoff must be a real value between 0 and 1")
-
-        if max_time < 0 or max_time > MAX_DATA_LOADING_TIME:
-            raise ValueError(f"max_time must be non-negative but no more than {MAX_DATA_LOADING_TIME} seconds")
-
+        # Numeric limits are enforced by DataLoadingSubmitModel schema validation.
         # `func` is accepted as a SymPy expression or a string and normalized to a string for transport.
         # Only the single real variable `x` is allowed. The imaginary unit `I` is a SymPy constant, not a
         # free symbol, so complex-valued functions such as `exp(I*x)` pass the single-variable check.
@@ -1856,19 +2189,20 @@ class Haiqu:
         return name, parameters
 
     _function_loading_args = f"""
-            num_qubits (int): The number of qubits in the generated circuit (from 1 to 1000 qubits).
+            num_qubits (int): The number of qubits in the generated circuit (from 1 to {MAX_DL_QUBITS} qubits).
             func (str | sympy.Expr): The function to encode, given as a SymPy expression or a string in the single
                                      variable ``x``.
             interval_start (Real): The beginning of the interval on which the function is sampled.
-            interval_end (Real): The end of the interval on which the function is sampled.
-            num_layers (int): The number of layers in the generated circuit (from 1 to 100 layers).
+            interval_end (Real): The end of the interval on which the function is sampled. The interval width
+                                 ``interval_end - interval_start`` must be at least {MIN_DL_INTERVAL_WIDTH}.
+            num_layers (int): The number of layers in the generated circuit (from 1 to {MAX_DL_LAYERS} layers).
                               More layers can improve the quality of the output
                               function at the cost of a deeper circuit. Defaults to 2.
-            truncation_cutoff (Real): The entanglement cutoff for later layers. Increasing this threshold may result in a smaller
-                                      (but more approximate) circuit. Defaults to ``1e-6``.
+            truncation_cutoff (Real): The entanglement cutoff for later layers, from 0 to 1. Increasing this threshold may result
+                                      in a smaller (but more approximate) circuit. Defaults to ``1e-6``.
             fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
                                           Increasing this limit may improve the quality of the circuit by using more classical
-                                          resources. Defaults to 20, maximal is 500.
+                                          resources. Defaults to 20, maximal is {MAX_DL_FINE_TUNING_ITERATIONS}.
             max_time (int | float): Soft time limit for the job (in seconds).
                             The data loading job will first always produce the initial result and then limit the fine-tuning
                             stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
@@ -1971,6 +2305,248 @@ class Haiqu:
             )
         )
 
+    @staticmethod
+    def _prepare_fourier_loading_params(
+        fourier_coefficients,
+        num_qubits,
+        min_freqs,
+        long_range,
+        num_layers,
+        truncation_cutoff,
+        fine_tuning_iterations,
+        max_time,
+        name,
+    ):
+        # Numeric limits (num_layers, truncation_cutoff, fine_tuning_iterations, max_time) are enforced
+        # by DataLoadingSubmitModel schema validation, which also coerces them to serializable types.
+        if not isinstance(long_range, bool):
+            raise ValueError("long_range must be a boolean")
+
+        try:
+            coefficients = np.asarray(fourier_coefficients, dtype=complex)
+        except (TypeError, ValueError):
+            raise ValueError("fourier_coefficients must form a rectangular array of numbers") from None
+        if coefficients.ndim < 1 or coefficients.size == 0:
+            raise ValueError("fourier_coefficients must be a rectangular array with at least one dimension and one entry")
+        if not np.isfinite(coefficients).all():
+            raise ValueError("fourier_coefficients must be finite (no nan or inf)")
+        if np.linalg.norm(coefficients) == 0:
+            raise ValueError("fourier_coefficients must have a non-zero norm")
+
+        num_dimensions = coefficients.ndim
+
+        def normalize_per_dimension(name: str, values: Any) -> list[int] | None:
+            """Normalize a per-dimension integer argument to one int per dimension, or None.
+
+            A scalar is broadcast to every dimension and a sequence is taken as one value per dimension.
+            """
+            if values is None:
+                return None
+            if isinstance(values, (int, np.integer)):
+                return [int(values)] * num_dimensions
+            if isinstance(values, str) or not isinstance(values, (Sequence, np.ndarray)):
+                raise ValueError(
+                    f"{name} must be an integer, a sequence of integers or None, but {type(values).__name__} was given"
+                )
+            if isinstance(values, np.ndarray) and values.ndim != 1:
+                raise ValueError(f"{name} must be an integer or a one-dimensional sequence of integers")
+            if len(values) != num_dimensions:
+                raise ValueError(
+                    f"{name} has {len(values)} entries, which does not match the number of dimensions {num_dimensions}"
+                )
+            if not all(isinstance(value, (int, np.integer)) for value in values):
+                raise ValueError(f"Each entry of {name} must be an integer")
+            return [int(value) for value in values]
+
+        min_freqs = normalize_per_dimension("min_freqs", min_freqs)
+        num_qubits = normalize_per_dimension("num_qubits", num_qubits)
+
+        minimum_qubits = [int(np.ceil(np.log2(size))) for size in coefficients.shape]
+        if num_qubits is not None:
+            # Every dimension needs enough qubits to hold its frequencies; the extra ones interpolate.
+            for dimension, (requested, minimum) in enumerate(zip(num_qubits, minimum_qubits)):
+                if requested < minimum:
+                    raise ValueError(
+                        f"num_qubits[{dimension}]={requested} is too small to hold the {coefficients.shape[dimension]} "
+                        f"frequencies of dimension {dimension}, which need at least {minimum} qubits"
+                    )
+
+        # A dimension holding a single frequency needs no qubits of its own, so an array that is length
+        # one along every axis resolves to an empty register unless interpolation qubits are requested.
+        if sum(num_qubits if num_qubits is not None else minimum_qubits) < 1:
+            raise ValueError(
+                "The circuit would have no qubits, because every dimension of fourier_coefficients holds a single "
+                "frequency; pass num_qubits summing to at least one qubit to interpolate onto a non-trivial grid"
+            )
+
+        parameters = {
+            "fourier_coefficients": coefficients,
+            "num_qubits": num_qubits,
+            "min_freqs": min_freqs,
+            "long_range": long_range,
+            "num_layers": num_layers,
+            "truncation_cutoff": truncation_cutoff,
+            "fine_tuning_iterations": fine_tuning_iterations,
+            "max_time": max_time,
+        }
+
+        if name is None:
+            name = f"FourierLoading(shape:{tuple(coefficients.shape)})"
+
+        return name, parameters
+
+    _fourier_loading_args = f"""
+            fourier_coefficients (Sequence[Number] | np.ndarray): The multidimensional array of Fourier coefficients,
+                                     ascending in frequency along every axis, which is not the order ``np.fft.fftn``
+                                     returns (see the frequency-layout note above). May be real or complex, and is
+                                     normalized in the process. This is the layout that
+                                     :func:`~haiqu.sdk.utils.compute_fourier_coefficients` returns, which is the recommended way
+                                     to obtain it; an analytically known spectrum can equally be written down directly.
+            num_qubits (int | Sequence[int] | None): The number of output qubits per dimension. An integer is shared by all
+                                     dimensions, a sequence sets them individually in the order of the coefficient array's
+                                     axes. Each entry must be at least ``ceil(log2(n))`` for a dimension holding ``n``
+                                     frequencies; every qubit above that minimum interpolates the state onto a finer grid.
+                                     If ``None`` (default), the minimum that fits the coefficients is used, which performs
+                                     no interpolation.
+            min_freqs (int | Sequence[int] | None): The integer frequency that the first coefficient of each dimension
+                                     carries. An integer is shared by all dimensions, a sequence sets them individually
+                                     in the order of the coefficient array's axes. If ``None`` (default), each dimension
+                                     is assumed to hold a band centred on zero and takes ``-(n // 2)`` for its length
+                                     ``n``. It is applied as a frequency-shift layer, so a value that disagrees with how
+                                     the coefficients were obtained silently encodes the wrong state — see the
+                                     frequency-layout note above.
+            long_range (bool): Whether to allow long-range gates in the Fourier part of the circuit. The prepared state is
+                               the same either way, while ``False`` (default) keeps the gates on a linear chain.
+            num_layers (int): The number of layers used to synthesize the coefficients (from 1 to {MAX_DL_LAYERS} layers).
+                              More layers can improve the quality of the output at the cost of a deeper circuit.
+                              Defaults to 2.
+            truncation_cutoff (Real): The entanglement cutoff for later layers. Increasing this threshold may result in a
+                                      smaller (but more approximate) circuit. Defaults to ``1e-6``.
+            fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
+                                          Increasing this limit may improve the quality of the circuit by using more
+                                          classical resources. Defaults to 20, maximal is {MAX_DL_FINE_TUNING_ITERATIONS}.
+            max_time (int | float): Soft time limit for the job (in seconds).
+                            The data loading job will first always produce the initial result and then limit the fine-tuning
+                            stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
+                            current result will be returned. Defaults to {MAX_DATA_LOADING_TIME}
+                            ({MAX_DATA_LOADING_TIME // 60} min). Max allowed job time is {MAX_DATA_LOADING_TIME // 60} min.
+                            The job can take more wall clock time than user specified `max_time` due to latency,
+                            initialization overheads or if the initial result already takes more time.
+            name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be
+                               automatically generated.
+            job_description (str | None): The description for the job.
+    """
+
+    @errors.graceful_api_errors_message
+    @format_docstring(
+        ARGS=_fourier_loading_args, FOURIER_FREQUENCY=_FOURIER_FREQUENCY_NOTE, FOURIER_INDEXING=_FOURIER_INDEXING_NOTE
+    )
+    def fourier_loading(
+        self,
+        fourier_coefficients: Sequence[Number] | np.ndarray,
+        num_qubits: int | Sequence[int] | None = None,
+        min_freqs: int | Sequence[int] | None = None,
+        long_range: bool = False,
+        num_layers: int = 2,
+        truncation_cutoff: Real = 1e-6,
+        fine_tuning_iterations: int = 20,
+        max_time: int | float = MAX_DATA_LOADING_TIME,
+        name: str | None = None,
+        job_description: str | None = None,
+    ) -> DataLoadingJobModel:
+        """Generate a quantum circuit that prepares a band-limited multidimensional state from its Fourier coefficients.
+
+        Given the Fourier coefficients of a state, this method creates a Data Loading job that runs in the Haiqu cloud. The
+        coefficients are synthesized on the smallest register that fits them, and an optimized quantum Fourier transform per
+        dimension expands them onto the output grid. The result of this job is a circuit which can be used to supply the
+        state to a quantum algorithm for processing. It pays off only for spectra concentrated in few frequencies, so the
+        state is assumed to represent a periodic function; symmetrizing a dimension can make a non-periodic target more
+        periodic.
+
+        The coefficients are normally obtained with :func:`~haiqu.sdk.utils.compute_fourier_coefficients`, which takes an array of
+        values on a uniform grid and returns ``fourier_coefficients`` and ``min_freqs`` in exactly the form this method expects.
+
+        The complexity and quality of the generated circuit can be controlled by the ``num_layers``,
+        ``truncation_cutoff``, and ``fine_tuning_iterations`` parameters.
+        {FOURIER_FREQUENCY}
+        {FOURIER_INDEXING}
+        .. note::
+
+            **``job.quality`` excludes the truncation error.** It is the fidelity of synthesizing the coefficients you
+            supplied, which are taken as the exact target, so how they were obtained does not enter it. Discarding
+            frequencies is a separate, purely classical approximation, measured by the fidelity that
+            :func:`~haiqu.sdk.utils.compute_fourier_coefficients` returns. The fidelity of the final state against your original
+            array is approximately the product of the two.
+
+        Args:{ARGS}
+        Returns:
+            DataLoadingJobModel: The Data Loading job that will generate the circuit for the band-limited state.
+                Call ``job.result()`` to retrieve a Qiskit-compatible gate (``HaiquCircuitGate``) that prepares the state.
+                ``job.quality`` is the achieved state fidelity vs. the supplied coefficients; ``job.info`` exposes loader
+                metadata (``fidelity``, ``num_qubits_per_dimension``).
+                Run ``help(job.result)`` for the full description of result and ``info`` contents.
+
+        Examples:
+            An exact finite Fourier series. ``cos(2*pi*3*x)`` has only the -3 and +3 harmonics, so retaining the band
+            ``(-3, 3)`` discards nothing and both fidelities are 1:
+
+            >>> import numpy as np
+            >>> from haiqu.sdk.utils import compute_fourier_coefficients
+            >>> grid = np.arange(64) / 64
+            >>> cosine = np.cos(2 * np.pi * 3 * grid)
+            >>> coefficients, min_freqs, truncation_fidelity = compute_fourier_coefficients(
+            ...     cosine, freq_ranges=[(-3, 3)], return_fidelity=True
+            ... )
+            >>> print(coefficients.shape, min_freqs, f"{{truncation_fidelity:.6f}}")
+            (7,) [-3] 1.000000
+            >>> job = haiqu.fourier_loading(coefficients, num_qubits=6, min_freqs=min_freqs)
+            >>> fl_gate = job.result()  # fl_gate is a Qiskit-compatible gate
+            >>> print(f"Cosine was loaded with fidelity {{job.quality:.6f}}")
+            Cosine was loaded with fidelity 1.000000
+
+            A 2D Gaussian sampled on a 32x32 grid, encoded onto a 256x256 grid. Only 81 coefficients are sent, and the
+            eight output qubits per dimension interpolate the rest:
+
+            >>> axis = np.arange(32) / 32
+            >>> x, y = np.meshgrid(axis, axis, indexing="ij")
+            >>> gaussian = np.exp(-((x - 0.4) ** 2 + (y - 0.5) ** 2) / (4 * 0.15 ** 2))
+            >>> coefficients, min_freqs, truncation_fidelity = compute_fourier_coefficients(
+            ...     gaussian, freq_ranges=[(-4, 4), (-4, 4)], return_fidelity=True
+            ... )
+            >>> print(coefficients.shape, min_freqs, f"{{truncation_fidelity:.6f}}")
+            (9, 9) [-4, -4] 0.999535
+            >>> job = haiqu.fourier_loading(coefficients, num_qubits=8, min_freqs=min_freqs)
+            >>> fl_gate = job.result()
+            >>> print(f"{{job.num_qubits}} qubits, synthesis fidelity {{job.quality:.6f}}")
+            16 qubits, synthesis fidelity 0.999998
+            >>> print(f"Fidelity against the original array is about {{truncation_fidelity * job.quality:.6f}}")
+            Fidelity against the original array is about 0.999533
+        """
+        self._check_experiment()
+        name, parameters = self._prepare_fourier_loading_params(
+            fourier_coefficients,
+            num_qubits,
+            min_freqs,
+            long_range,
+            num_layers,
+            truncation_cutoff,
+            fine_tuning_iterations,
+            max_time,
+            name,
+        )
+
+        # The resolved total width is left to the backend, as in `mps_loading`: `num_qubits` here is
+        # per dimension, while the top-level field is a single count.
+        return self._client.data_loading(
+            data=DataLoadingSubmitModel(
+                dl_type=DataLoadingType.FOURIER_LOADING.value,
+                name=name,
+                description=job_description,
+                experiment_id=self._experiment.id,
+                parameters=parameters,
+            )
+        )
+
     # TODO: accept CompressionOptions instead of raw string params (compression_level,
     # noise_profile, fine_tuning, approximation_level). Both state_compression and
     # state_compression_2d route through here, so a single change covers both.
@@ -1985,8 +2561,7 @@ class Haiqu:
         approximation_level: int | None = None,
         device_id: str | None = None,
     ):
-        if max_time < 0 or max_time > MAX_COMPRESSION_TIME:
-            raise ValueError(f"max_time must be non-negative but no more than {MAX_COMPRESSION_TIME} seconds")
+        # Numeric limits (including max_time) are enforced by StateCompressionParams schema validation.
         if circuit is not None and circuits is not None:
             raise ValueError("Only one of `circuit` and `circuits` can be specified.")
         if circuit is not None:
@@ -2008,7 +2583,13 @@ class Haiqu:
         return parameters, logged_circuits
 
     @errors.graceful_api_errors_message
-    @format_docstring(MAX_TIME=MAX_COMPRESSION_TIME, MAX_TIME_MIN=MAX_COMPRESSION_TIME // 60)
+    @format_docstring(
+        MAX_TIME=MAX_COMPRESSION_TIME,
+        MAX_TIME_MIN=MAX_COMPRESSION_TIME // 60,
+        MAX_QUBITS=MAX_COMPRESSION_QUBITS,
+        MIN_APPROX=MIN_COMPRESSION_APPROXIMATION_LEVEL,
+        MAX_APPROX=MAX_COMPRESSION_APPROXIMATION_LEVEL,
+    )
     def state_compression(
         self,
         circuit: QuantumCircuit | CircuitModel = None,
@@ -2047,7 +2628,7 @@ class Haiqu:
 
         Args:
             circuit (QuantumCircuit | CircuitModel): Deprecated. The quantum circuit to be compressed.
-                                                     Circuit must have no more than 1000 qubits.
+                                                     Circuit must have no more than {MAX_QUBITS} qubits.
             circuits (list[QuantumCircuit] | list[CircuitModel]): The quantum circuit(s) to be compressed.
             compression_level (str): The qualitative compression level. Increased compression level will lead to
                                      larger part of the input circuit being compressed.
@@ -2081,9 +2662,9 @@ class Haiqu:
             approximation_level (int | None): A small integer related to circuit complexity. Larger values improve the noiseless
                                               quality metric, but may degrade noisy performance. Defaults to ``None``, which
                                               corresponds to auto-selection using the chosen ``noise_profile``. Can be set from
-                                              1 (very weak approximation) to 100 (very high approximation). Larger approximation
-                                              level values lead to slower fine-tuning. For majority of applications recommended
-                                              values are generally ranged from 1 to 5.
+                                              {MIN_APPROX} (very weak approximation) to {MAX_APPROX} (very high approximation).
+                                              Larger approximation level values lead to slower fine-tuning. For majority of
+                                              applications recommended values are generally ranged from 1 to 5.
 
         Returns:
             StateCompressionJobModel | list[StateCompressionJobModel]: The State Compression job(s) that will generate the
@@ -2153,7 +2734,12 @@ class Haiqu:
         return jobs
 
     @errors.graceful_api_errors_message
-    @format_docstring(MAX_TIME=MAX_COMPRESSION_TIME, MAX_TIME_MIN=MAX_COMPRESSION_TIME // 60)
+    @format_docstring(
+        MAX_TIME=MAX_COMPRESSION_TIME,
+        MAX_TIME_MIN=MAX_COMPRESSION_TIME // 60,
+        MIN_APPROX=MIN_COMPRESSION_APPROXIMATION_LEVEL,
+        MAX_APPROX=MAX_COMPRESSION_APPROXIMATION_LEVEL,
+    )
     def state_compression_2d(
         self,
         circuit: QuantumCircuit | CircuitModel = None,
@@ -2219,9 +2805,9 @@ class Haiqu:
             approximation_level (int | None): A small integer related to circuit complexity. Larger values improve the noiseless
                                               quality metric, but may degrade noisy performance. Defaults to ``None``, which
                                               corresponds to auto-selection using the chosen ``noise_profile``. Can be set from
-                                              1 (very weak approximation) to 100 (very high approximation). Larger approximation
-                                              level values lead to slower fine-tuning. For majority of applications recommended
-                                              values are generally ranged from 1 to 5.
+                                              {MIN_APPROX} (very weak approximation) to {MAX_APPROX} (very high approximation).
+                                              Larger approximation level values lead to slower fine-tuning. For majority of
+                                              applications recommended values are generally ranged from 1 to 5.
 
         Returns:
             StateCompressionJobModel | list[StateCompressionJobModel]: The State Compression job(s) that will generate the
@@ -2414,6 +3000,7 @@ class Haiqu:
         interval_end: Real,
         loc: Real = 0,
         scale: Real = 1,
+        encoding: str = "probability",
         num_layers: int = 1,
         truncation_cutoff: Real = 1e-6,
         name: str | None = None,
@@ -2435,7 +3022,7 @@ class Haiqu:
             ...     distribution_name="norm",
             ...     interval_start=-3,
             ...     interval_end=3
-            >>> )
+            ... )
             >>> est
             DataLoadingEstimatesModel(estimated_time=0.22770169152050562, estimated_cost=0.010079648405964921)
             >>> est.draw()  # in Jupyter notebook
@@ -2447,6 +3034,7 @@ class Haiqu:
             interval_end,
             loc,
             scale,
+            encoding,
             num_layers,
             truncation_cutoff,
             name,
@@ -2864,9 +3452,11 @@ class Haiqu:
         Args:
             problem (VariationalProblem): problem instance containing the ansatz circuit and observable.
             shots: Number of shots per circuit evaluation. Defaults to 1000.
-            device: Device to execute on. If specified, device_id is ignored.
+            device: Device to execute on. If specified, device_id is ignored. Devices from
+                :meth:`get_device` with ``use_fractional_gates=True`` use fractional gates.
             device_id: ID of the device to execute on. Defaults to None.
-            options: Additional device options.
+            options: Additional device options. Hybrid programs can pass
+                ``DeviceLayer(options={"use_fractional_gates": True})``.
             initial_parameters: Initial parameter values. Cannot be used together with seed.
                 If neither is provided, random parameters in [-0.1π, 0.1π] are generated.
             seed: Random seed for reproducible generation of initial parameters from a uniform
@@ -3004,6 +3594,9 @@ class Haiqu:
 
         if use_session:
             options["use_session"] = True
+
+        if device is not None and device.use_fractional_gates:
+            options["use_fractional_gates"] = True
 
         if dry_run:
             options["dry_run"] = True
@@ -3350,10 +3943,7 @@ class Haiqu:
         device_credentials = copy.deepcopy(device_credentials) if device_credentials is not None else {}
 
         if not dry_run:
-            if "aws" in device_id.lower():
-                self.update_aws_credentials(device_credentials)
-            if "ibm" in device_id.lower():
-                self.update_ibm_credentials(device_credentials)
+            self._inject_device_credentials(device_id, device_credentials)
 
         parameters, observables = validate_and_normalize_parameters_and_observables(
             parameters,
@@ -3439,6 +4029,7 @@ class Haiqu:
                          The fully-nested form is the unambiguous canonical shape and is recommended when the same code
                          path handles both single and multi-circuit submissions.
             device (DeviceModel | None): The device to run the circuits on. If specified, ``device_id`` is ignored.
+                Devices from :meth:`get_device` with ``use_fractional_gates=True`` use fractional gates.
             device_id (str | None): The ID of the device to run the circuits on. Defaults to ``None``.
             options (dict | None): Options to pass to the device. Supports an optional
                 ``"error_mitigation_options"`` key with a dictionary of boolean flags to control
@@ -3728,10 +4319,7 @@ class Haiqu:
         self._normalize_noise_model_option(device_id=device_id, options=options)
 
         if not dry_run:
-            if "aws" in device_id.lower():
-                self.update_aws_credentials(options)
-            if "ibm" in device_id.lower():
-                self.update_ibm_credentials(options)
+            self._inject_device_credentials(device_id, options)
 
         logged_circuits = self._prepare_circuits(circuits)
 
@@ -3750,6 +4338,9 @@ class Haiqu:
         options["use_packing"] = use_packing
         if pack_size is not None:
             options["pack_size"] = pack_size
+
+        if device is not None and device.use_fractional_gates:
+            options["use_fractional_gates"] = True
 
         # Submit the job
         job = self._client.run(
@@ -4698,6 +5289,20 @@ class Haiqu:
         if aws_session_token is not None:
             os.environ["AWS_SESSION_TOKEN"] = aws_session_token
 
+    def _inject_device_credentials(self, device_id: str, credentials: dict) -> None:
+        """Inject provider credentials into ``credentials`` based on the device id.
+
+        IQM Resonance devices are matched with ``startswith("iqm")`` — NOT ``"iqm" in ...`` — so
+        AWS-hosted IQM devices such as ``aws_iqm_garnet`` route to AWS credentials, not IQM.
+        Shared by ``run`` and ``flow`` so the dispatch logic lives in one place.
+        """
+        if device_id.lower().startswith("aws"):
+            self.update_aws_credentials(credentials)
+        if device_id.lower().startswith("ibm"):
+            self.update_ibm_credentials(credentials)
+        if device_id.lower().startswith("iqm"):
+            self.update_iqm_credentials(credentials)
+
     @staticmethod
     def update_aws_credentials(options):
         """
@@ -4810,6 +5415,52 @@ class Haiqu:
 
         options["ibm_quantum_token"] = ibm_token
         options["ibm_quantum_instance"] = ibm_instance
+
+    @staticmethod
+    def save_iqm_credentials(iqm_token: str, iqm_server_url: str = IQM_DEFAULT_SERVER_URL):
+        """
+        Save IQM Resonance credentials in the environment variables:
+
+        - "IQM_TOKEN"
+        - "IQM_SERVER_URL"
+
+        NOTE: overwrites existing environment variables with the same names.
+
+        Args:
+            iqm_token (str): IQM Resonance API token.
+            iqm_server_url (str): IQM Resonance server URL. Defaults to the Resonance production URL.
+        """
+        os.environ["IQM_TOKEN"] = iqm_token
+        os.environ["IQM_SERVER_URL"] = iqm_server_url
+
+    @staticmethod
+    def update_iqm_credentials(options):
+        """
+        Inline update options dictionary with IQM Resonance credential values:
+
+        - "iqm_token"
+        - "iqm_server_url"
+
+        Priorities:
+
+        1) Implicit values in "options" dictionary.
+        2) Environment variables ("IQM_TOKEN", "IQM_SERVER_URL").
+
+        Args:
+            options (dict): Backend options dictionary.
+        """
+        iqm_token = options.get("iqm_token", os.getenv("IQM_TOKEN", None))
+        iqm_server_url = options.get("iqm_server_url", os.getenv("IQM_SERVER_URL", IQM_DEFAULT_SERVER_URL))
+
+        if iqm_token is None:
+            raise ValueError(
+                "An IQM Resonance API token is required to run on IQM devices. "
+                "Please provide it in the `options` as `iqm_token`, or save it using "
+                "`haiqu.save_iqm_credentials()`."
+            )
+
+        options["iqm_token"] = iqm_token
+        options["iqm_server_url"] = iqm_server_url
 
 
 haiqu = Haiqu()

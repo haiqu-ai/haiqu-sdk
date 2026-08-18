@@ -24,6 +24,7 @@ except ImportError:
 from haiqu.sdk import schemas
 from haiqu.sdk.wiz.job_graph import draw_run_job  # noqa: F401
 
+
 DATE_TIME_FORMAT = "%B %d, %Y %I:%M:%S %p"
 DATE_TIME_FORMAT_JOBS = "%b %d, %I:%M %p"
 
@@ -218,6 +219,7 @@ def metrics_as_table(
     tiles_layout: bool = False,
     core_only: bool = False,
     advanced_only: bool = False,
+    qml_only: bool = False,
     widget_id: str = "",
 ) -> str:
     """
@@ -283,11 +285,44 @@ def metrics_as_table(
             the final state distribution of a circuit approximates a uniform distribution.""",
         ],
     ]
+    qml_data = [
+        [
+            "EXPRESSIBILITY",
+            safe_format_float(metrics.expressibility),
+            """A measure inversely proportional to a parameterized quantum circuit's ability to generate
+            a diverse set of quantum states. Non-negative with lower values indicate higher expressibility.""",
+        ],
+        [
+            "ENTANGLEMENT CAPABILITY",
+            safe_format_float(metrics.entanglement_capability),
+            """The capacity of a parameterized quantum circuit to generate entangled states. A larger value
+            indicates a larger capacity to produce entangled states.""",
+        ],
+        [
+            "QUANTUM FISHER INFORMATION MATRIX",
+            safe_format_qfi(metrics.quantum_fisher_information_matrix),
+            """A matrix measuring how sensitive the output state of a parameterized quantum circuit is
+            to changes in the parameters. Larger values indicate increased sensitivity to the corresponding
+            parameters.""",
+        ],
+        [
+            "QUANTUM FISHER INFORMATION MATRIX: TRACE",
+            safe_format_qfi(metrics.quantum_fisher_information_matrix, post_process="TRACE"),
+            """The trace of the quantum Fisher information matrix.""",
+        ],
+        [
+            "QUANTUM FISHER INFORMATION MATRIX: DETERMINANT",
+            safe_format_qfi(metrics.quantum_fisher_information_matrix, post_process="DET"),
+            """The determinant of the quantum Fisher information matrix.""",
+        ],
+    ]
 
     if core_only:
         data = core_data
     elif advanced_only:
         data = advanced_data
+    elif qml_only:
+        data = qml_data
     else:
         data = core_data + advanced_data
 
@@ -1091,6 +1126,20 @@ def safe_format_float(val, format="%.6f"):
     if isinstance(val, float):
         return format % val
     return val
+
+
+def safe_format_qfi(val, format="%.6f", post_process=None):
+    """Format QFI matrix metric."""
+    import numpy as np
+
+    if val is None or isinstance(val, str):
+        return val if val is not None else "N/A"
+    elif post_process == "TRACE":
+        return format % np.trace(val)
+    elif post_process == "DET":
+        return format % np.linalg.det(val)
+    else:
+        return "See output dictionary"
 
 
 def generate_widget_id():

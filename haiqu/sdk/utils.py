@@ -5,6 +5,7 @@ Haiqu SDK: Utilities functions.
 import base64
 import hashlib
 from collections import Counter
+from collections.abc import Sequence
 from datetime import datetime
 import functools
 import io
@@ -121,6 +122,7 @@ AWS_DEVICES = [
     "ankaa_3",
 ]
 AWS_DEFAULT_REGION = "us-east-1"
+IQM_DEFAULT_SERVER_URL = "https://resonance.iqm.tech"
 HAIQU_OPERATIONS = ["HaiquCircuit", "HaiquCircuitdg"]
 
 
@@ -301,6 +303,100 @@ def from_npy(encoded: str) -> np.ndarray:
     """
     buf = io.BytesIO(base64.b64decode(encoded))
     return np.load(buf)
+
+
+@typecheck
+def compute_fourier_coefficients(
+    state: np.ndarray | Sequence,
+    freq_ranges: Sequence[Sequence[int]],
+    return_fidelity: bool = False,
+) -> tuple[np.ndarray, list[int]] | tuple[np.ndarray, list[int], float]:
+    """Compute truncated, normalized Fourier coefficients of an n-dimensional array.
+
+    The returned values are the input that
+    :meth:`haiqu.sdk.quantum_haiqu.Haiqu.fourier_loading` expects: the coefficients ascend in
+    frequency along every axis, which is not the order ``np.fft.fftn`` returns, and ``min_freqs``
+    records which frequency the first coefficient of each axis carries.
+
+    Keeping only a few frequencies per axis is what makes Fourier loading cheap, and it is also
+    the only lossy step performed here. The optional fidelity quantifies exactly that loss. It is
+    a purely classical quantity computed locally and for free, and it is *not* part of the loading
+    job's ``quality``, which measures how well the cloud reproduces whatever coefficients it is
+    given. The fidelity of the final state against the original ``state`` is approximately the
+    product of the two.
+
+    Args:
+        state (np.ndarray | Sequence): Values of the target on a (possibly coarse) uniform grid.
+            The array is treated as periodic on that grid, so a non-periodic target may need many
+            frequencies; symmetrizing it along a dimension can help.
+        freq_ranges (Sequence[Sequence[int]]): One ``(min_freq, max_freq)`` pair per dimension,
+            giving the inclusive frequency band to retain. Each band must lie inside the range the
+            grid resolves, ``[-(n // 2), n - n // 2 - 1]`` for an axis of length ``n``.
+        return_fidelity (bool): Whether to also return the retained fraction of the spectral
+            energy. Defaults to ``False``.
+
+    Returns:
+        tuple[np.ndarray, list[int]] | tuple[np.ndarray, list[int], float]: The complex
+        coefficient array of shape ``max_freq - min_freq + 1`` per dimension, normalized to unit
+        norm, and the per-dimension ``min_freq`` values. With ``return_fidelity`` a third value is
+        appended: the squared overlap between the reconstruction from the retained frequencies and
+        ``state``. It is ``1.0`` when the bands cover the whole resolved spectrum, and also when
+        they cover the entire support of a finite Fourier series, however few frequencies that is.
+
+    Raises:
+        ValueError: If the number of bands does not match the number of dimensions, a band is not
+            a pair, ``min_freq`` exceeds ``max_freq``, or a band falls outside the resolved range.
+
+    Examples:
+        >>> import numpy as np
+        >>> from haiqu.sdk.utils import compute_fourier_coefficients
+        >>> grid = np.arange(64) / 64
+        >>> cosine = np.cos(2 * np.pi * 3 * grid)  # only the -3 and +3 harmonics are non-zero
+        >>> coefficients, min_freqs, fidelity = compute_fourier_coefficients(
+        ...     cosine, freq_ranges=[(-3, 3)], return_fidelity=True
+        ... )
+        >>> print(coefficients.shape, min_freqs, f"{fidelity:.6f}")
+        (7,) [-3] 1.000000
+    """
+    values = np.asarray(state)
+    sizes = values.shape
+    if len(freq_ranges) != len(sizes):
+        raise ValueError(f"freq_ranges must have one (min_freq, max_freq) pair per dimension, got {len(freq_ranges)}")
+
+    # Frequencies index into the spectrum, so they are validated here rather than relying on the
+    # type hint: beartype's O1 strategy samples one entry of a container instead of checking all.
+    bands = []
+    for dimension, band in enumerate(freq_ranges):
+        if len(band) != 2:
+            raise ValueError(f"freq_ranges[{dimension}] must be a (min_freq, max_freq) pair, got {len(band)} values")
+        if not all(isinstance(freq, (int, np.integer)) and not isinstance(freq, (bool, np.bool_)) for freq in band):
+            raise ValueError(f"freq_ranges[{dimension}] must hold two integer frequencies, got {tuple(band)}")
+        min_freq, max_freq = int(band[0]), int(band[1])
+        if min_freq > max_freq:
+            raise ValueError(f"Dimension {dimension}: min_freq={min_freq} exceeds max_freq={max_freq}")
+        size = sizes[dimension]
+        lowest, highest = -(size // 2), size - size // 2 - 1
+        if min_freq < lowest or max_freq > highest:
+            raise ValueError(
+                f"Dimension {dimension} has size {size}, so the frequency range [{min_freq}, {max_freq}] is "
+                f"outside the range it resolves, [{lowest}, {highest}]"
+            )
+        bands.append((min_freq, max_freq))
+
+    spectrum = np.fft.fftshift(np.fft.fftn(values))
+    retained = spectrum[tuple(slice(sizes[d] // 2 + low, sizes[d] // 2 + high + 1) for d, (low, high) in enumerate(bands))]
+
+    norm = np.linalg.norm(retained)
+    if norm <= 1e-8:
+        raise ValueError("The retained frequency bands hold no spectral energy, so there is nothing to encode")
+    coefficients = retained / norm
+    min_freqs = [min_freq for min_freq, _ in bands]
+
+    if return_fidelity:
+        # The FFT is unitary up to a constant factor, so the retained fraction of the spectral
+        # energy is exactly the squared overlap with the band-limited reconstruction.
+        return coefficients, min_freqs, float((norm / np.linalg.norm(spectrum)) ** 2)
+    return coefficients, min_freqs
 
 
 @typecheck

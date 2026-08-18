@@ -24,7 +24,10 @@ class DeviceLayer(BaseModel):
     """Runs the circuits on a backend; every program ends with one.
 
     ``device_id`` selects the backend; ``options`` carries backend-specific
-    settings (e.g. credentials).
+    settings (e.g. credentials). For real IBM QPUs, pass
+    ``options={"use_fractional_gates": True}`` to use fractional gates
+    (continuous-angle ``rx`` / ``rzz``, etc.). Outside hybrid programs, set the
+    same flag on :meth:`~haiqu.sdk.quantum_haiqu.Haiqu.get_device` instead.
     """
 
     type: Literal["device"] = "device"

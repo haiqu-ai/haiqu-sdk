@@ -7,20 +7,33 @@ import enum
 from datetime import datetime
 from functools import cached_property
 import time
-from typing import Annotated, Any, Dict, Iterable, Optional, Union, List, Tuple, cast
+from typing import Annotated, Any, Dict, Iterable, Literal, Optional, Union, List, Tuple, cast
 import json
 import numpy as np
 
-from pydantic import BaseModel, ConfigDict, TypeAdapter, Field
+from pydantic import BaseModel, ConfigDict, TypeAdapter, Field, field_validator, model_validator
 
 # from qiskit.transpiler import Target
 
 from . import gates
 from . import errors
 from . import exceptions
+from .constants import (
+    MAX_COMPRESSION_QUBITS,
+    MAX_COMPRESSION_TIME,
+    MAX_DATA_LOADING_TIME,
+    MAX_DL_EME_DENSITY,
+    MAX_DL_FINE_TUNING_ITERATIONS,
+    MAX_DL_LAYERS,
+    MAX_DL_QUBITS,
+    MAX_DL_VECTOR_QUBITS,
+    MAX_ORBITALS,
+    MIN_DL_INTERVAL_WIDTH,
+)
 from .errors import JUPYTER_LAB  # TODO: find better place for this constant
 from .hybrid import HybridProgram
 from .utils import from_qpy, setup_logger
+from .qml.compression_options import CompressionOptions
 from .qml.optimizer import NFTOptimizerOptions, OptimizerOptionsUnion
 
 JOB_POLL_DELAY = 5
@@ -46,6 +59,11 @@ ADVANCED_METRICS = (
     "parallelism",
     "liveness",
     "kl_divergence",
+)
+QML_METRICS = (
+    "entanglement_capability",
+    "expressibility",
+    "quantum_fisher_information_matrix",
 )
 
 logger = setup_logger(__name__)
@@ -185,6 +203,7 @@ class CircuitStatus(enum.Enum):
     RUNNING = "Running analytics computation"
     CORE_METRICS = "Core metrics computation is done"
     ADVANCED_METRICS = "Advanced metrics computation is done"
+    QML_METRICS = "Parameterized QML metrics computation is done"
     EVOLUTION = "Evolution computation is done"
     DONE = "Done"
     ERROR = "Error"
@@ -198,6 +217,7 @@ CIRCUIT_DONE_STATUSES = (
 CORE_METRICS_READY_STATUSES = (
     CircuitStatus.CORE_METRICS,
     CircuitStatus.ADVANCED_METRICS,
+    CircuitStatus.QML_METRICS,
     CircuitStatus.EVOLUTION,
     CircuitStatus.DONE,
     CircuitStatus.ERROR,
@@ -205,6 +225,14 @@ CORE_METRICS_READY_STATUSES = (
 
 ADVANCED_METRICS_READY_STATUSES = (
     CircuitStatus.ADVANCED_METRICS,
+    CircuitStatus.QML_METRICS,
+    CircuitStatus.EVOLUTION,
+    CircuitStatus.DONE,
+    CircuitStatus.ERROR,
+)
+
+QML_METRICS_READY_STATUSES = (
+    CircuitStatus.QML_METRICS,
     CircuitStatus.EVOLUTION,
     CircuitStatus.DONE,
     CircuitStatus.ERROR,
@@ -222,6 +250,7 @@ class AnalyticsType(enum.Enum):
 
     CORE_METRICS = "core"
     ADVANCED_METRICS = "advanced"
+    QML_METRICS = "qml"
     EVOLUTION = "evolution"
 
 
@@ -245,7 +274,7 @@ class CircuitAnalyticsModel(BaseModel):
     """Data model for circuit metrics."""
 
     # Core metrics
-    qubits: int  # TODO: Rename to num_qubits_total
+    qubits: int = Field(ge=1, description="Number of qubits (must be >= 1)")
     num_qubits_active: Optional[int] = None
     num_parameters: Optional[int] = None
     depth: int
@@ -273,6 +302,11 @@ class CircuitAnalyticsModel(BaseModel):
 
     # KL divergence between given circuit output distribution and uniform distribution
     kl_divergence: Optional[Union[float, str]] = "N/A"
+
+    # QML metrics (parameterized circuits only)
+    entanglement_capability: Optional[Union[float, str]] = "N/A"
+    expressibility: Optional[Union[float, str]] = "N/A"
+    quantum_fisher_information_matrix: Optional[Union[list, str]] = "N/A"
 
     # Circuit representation in basis gates (e.g.: "RX", "RY", "RZ", "CX")
     circuit_normalized: Optional[str] = None
@@ -451,6 +485,20 @@ class CircuitModel(ClientMixin, BaseCircuitModel):
         )
 
     @errors.graceful_api_errors_message
+    def compute_qml_metrics(self) -> None:
+        """
+        Fire the job to compute QML metrics on the backend. By default, the QML metrics are not computed
+        when the circuit is logged or generated, but it can be triggered with this method.
+        """
+        if self.status in QML_METRICS_READY_STATUSES:
+            return
+
+        self._client.compute_analytics(
+            circuit_id=self.id,
+            analytics_type=AnalyticsType.QML_METRICS,
+        )
+
+    @errors.graceful_api_errors_message
     def compute_evolution(self) -> None:
         """
         Fire the job to compute evolution on the backend. By default, the evolution metrics are not computed
@@ -535,6 +583,24 @@ the metrics over the circuit) could take some time."""
         """
         self.wait_for_analytics(
             target_status=ADVANCED_METRICS_READY_STATUSES,
+            widget=widget,
+            widget_title=widget_title,
+        )
+
+    def wait_for_qml_metrics(
+        self,
+        widget: bool = True,
+        widget_title: str = "QML ANALYTICS STATUS",
+    ):
+        """
+        Poll the QML analytics job. Block and wait for the job to complete.
+
+        Args:
+            widget (bool): If ``True`` (default), render the list as a Jupyter widget and return ``None``.
+            widget_title (str): The title to display in the widget.
+        """
+        self.wait_for_analytics(
+            target_status=QML_METRICS_READY_STATUSES,
             widget=widget,
             widget_title=widget_title,
         )
@@ -678,6 +744,57 @@ the metrics over the circuit) could take some time."""
                 help=help,
                 tiles_layout=tiles_layout,
                 advanced_only=True,
+                widget_id=widget_id,
+            ),
+            widget_id=widget_id,
+        )
+
+    @errors.graceful_api_errors_message
+    def qml_metrics(
+        self,
+        help: bool = False,
+        tiles_layout: bool = False,
+        widget: bool = None,
+    ):
+        """
+        Render the widget displaying the table with QML metrics for parameterized quantum
+        circuits or return the dict with QML metrics.
+
+        The QML analysis reveals insights into a parameterized circuit's ability to generate entangled states,
+        output state diversity, and sensitivity to parameters.
+
+        The default behavior is to auto-detect the environment and render the widget in Jupyter and return the dict
+        in scripts, but it can be overridden with ``widget=True/False`` switch.
+
+        NOTE: The quantum Fisher information matrix is not displayed in the widget, but is returned in the dict.
+
+        Args:
+            help (bool): Wherever possible, display a column providing assistance for each metric.
+            tiles_layout (bool): The tiles layout render widget with "float" CSS style.
+            widget (bool): The switch to force rendering the widget in Jupyter or return a dict.
+
+        Returns:
+            dict | None: The dict with QML metrics or ``None`` if ``widget=True`` or Jupyter environment.
+        """
+        from haiqu.sdk.wiz.jupyter import generate_widget_id, loggable_widget, metrics_as_table
+
+        widget = JUPYTER_LAB if widget is None else widget
+
+        self.compute_qml_metrics()
+        self.wait_for_qml_metrics(widget=widget)
+        if not widget:
+            return self.analytics.model_dump(include=QML_METRICS)
+
+        widget_id = generate_widget_id()
+
+        return loggable_widget(
+            self,
+            artifact_type="QML Metrics",
+            html_str=metrics_as_table(
+                self,
+                help=help,
+                tiles_layout=tiles_layout,
+                qml_only=True,
                 widget_id=widget_id,
             ),
             widget_id=widget_id,
@@ -955,11 +1072,13 @@ class DataLoadingType(enum.Enum):
     """Class for `dl_type`."""
 
     DISTRIBUTION_LOADING = "DistributionLoading"
+    MULTIVARIATE_DISTRIBUTION_LOADING = "MultivariateDistributionLoading"
     VECTOR_LOADING = "VectorLoading"
     BLOCK_VECTOR_LOADING = "BlockVectorLoading"
     ENTANGLED_MANIFOLD_EMBEDDING = "EntangledManifoldEmbedding"
     MPS_LOADING = "MpsLoading"
     FUNCTION_LOADING = "FunctionLoading"
+    FOURIER_LOADING = "FourierLoading"
 
 
 class RunJobType(enum.Enum):
@@ -1158,6 +1277,128 @@ class LocalJobModel(BaseJobModel):
     metrics: Optional[dict] = {}
 
 
+class _DataLoadingParams(BaseModel):
+    """Shared user-facing limits present in every data-loading circuit.
+
+    Fields are optional: these models bound values, not presence, so a missing key is left to the
+    backend.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    num_layers: Optional[int] = Field(default=None, ge=1, le=MAX_DL_LAYERS)
+    truncation_cutoff: Optional[float] = Field(default=None, ge=0, le=1)
+
+
+class _FineTunedLoadingParams(_DataLoadingParams):
+    """Loaders that run a post-layer fine-tuning stage under a time budget."""
+
+    fine_tuning_iterations: Optional[int] = Field(default=None, ge=0, le=MAX_DL_FINE_TUNING_ITERATIONS)
+    max_time: Optional[float] = Field(default=None, ge=0, le=MAX_DATA_LOADING_TIME)
+
+
+class _IntervalLoadingParams(_DataLoadingParams):
+    """Loaders parametrized by a sampling interval.
+
+    Both bounds are required: the loader signatures make them mandatory, so a missing one is a caller
+    error rather than a value left to the backend.
+    """
+
+    interval_start: float
+    interval_end: float
+
+    @model_validator(mode="after")
+    def _check_interval_width(self):
+        if self.interval_end - self.interval_start < MIN_DL_INTERVAL_WIDTH:
+            raise ValueError(f"Interval width must be at least {MIN_DL_INTERVAL_WIDTH}.")
+        return self
+
+
+class DistributionLoadingParams(_IntervalLoadingParams):
+    """User-facing limits for distribution loading."""
+
+    loc: Optional[float] = None
+    scale: Optional[float] = Field(default=None, gt=0)
+    # Always populated by the loader signature, so an explicit None is a caller error.
+    encoding: Literal["probability", "amplitude"] = "probability"
+
+
+class MultivariateDistributionLoadingParams(_FineTunedLoadingParams):
+    """User-facing limits for multivariate distribution loading.
+
+    Only the scalar limits shared with the other loaders are enforced here. The dimension count,
+    interval structure and copula argument rules are validated where the payload is built, because
+    they depend on how the arguments relate to each other rather than on any single value's range.
+
+    ``num_qubits`` in these parameters is a per-dimension count rather than the circuit size, and is
+    left undeclared for the same reason as ``interval``.
+    """
+
+    encoding: Literal["probability", "amplitude"] = "probability"
+
+
+class FunctionLoadingParams(_IntervalLoadingParams, _FineTunedLoadingParams):
+    """User-facing limits for function loading."""
+
+
+class VectorLoadingParams(_FineTunedLoadingParams):
+    """User-facing limits for vector loading (length is checked client-side)."""
+
+
+class BlockVectorLoadingParams(_FineTunedLoadingParams):
+    """User-facing limits for block vector loading (block splitting is validated on the backend)."""
+
+    # An int is an exact count of overlapping indices; a float is a fraction of a block, so its range is [0, 1).
+    overlap: Optional[Union[int, float]] = Field(default=None, ge=0)
+
+    @field_validator("overlap")
+    @classmethod
+    def _check_fractional_overlap(cls, value):
+        if isinstance(value, float) and value >= 1:
+            raise ValueError("Fractional overlap must be a float in [0, 1).")
+        return value
+
+
+class EntangledManifoldEmbeddingParams(_FineTunedLoadingParams):
+    """User-facing limits for entangled manifold embedding."""
+
+    density: Optional[int] = Field(default=None, ge=1, le=MAX_DL_EME_DENSITY)
+
+
+class MpsLoadingParams(_FineTunedLoadingParams):
+    """User-facing limits for MPS loading (the MPS itself is validated on the backend)."""
+
+    # Every permutation of the left/physical/right tensor axes.
+    shape: Optional[Literal["lpr", "lrp", "plr", "prl", "rlp", "rpl"]] = None
+
+
+class FourierLoadingParams(_FineTunedLoadingParams):
+    """User-facing limits for fourier loading.
+
+    num_qubits and min_freqs are per-dimension and long_range is a plain flag; all three are validated
+    where the payload is built, because their rules depend on the coefficient array rather than on any
+    single value's range. They are therefore left undeclared here, as in the multivariate loader.
+    """
+
+
+# Cap on the size of the generated circuit; MAX_DL_QUBITS applies to the types absent from here.
+_DL_MAX_CIRCUIT_QUBITS: Dict[DataLoadingType, int] = {
+    DataLoadingType.VECTOR_LOADING: MAX_DL_VECTOR_QUBITS,
+}
+
+
+_DATA_LOADING_PARAM_MODELS: Dict[DataLoadingType, type[BaseModel]] = {
+    DataLoadingType.DISTRIBUTION_LOADING: DistributionLoadingParams,
+    DataLoadingType.MULTIVARIATE_DISTRIBUTION_LOADING: MultivariateDistributionLoadingParams,
+    DataLoadingType.VECTOR_LOADING: VectorLoadingParams,
+    DataLoadingType.BLOCK_VECTOR_LOADING: BlockVectorLoadingParams,
+    DataLoadingType.ENTANGLED_MANIFOLD_EMBEDDING: EntangledManifoldEmbeddingParams,
+    DataLoadingType.MPS_LOADING: MpsLoadingParams,
+    DataLoadingType.FUNCTION_LOADING: FunctionLoadingParams,
+    DataLoadingType.FOURIER_LOADING: FourierLoadingParams,
+}
+
+
 class DataLoadingSubmitModel(BaseModel):
     """Data Loading payload data model."""
 
@@ -1165,9 +1406,42 @@ class DataLoadingSubmitModel(BaseModel):
     name: Optional[str] = ""  # not used in data_loading_estimates()
     description: Optional[str] = ""
     parameters: dict
-    num_qubits: Optional[int] = None  # not used in vector/samples loading
-    distribution_name: Optional[str] = None  # used only in distribution loading
+    num_qubits: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=MAX_DL_QUBITS,
+        description=(
+            "Size of the circuit to generate. Requested value only: the API replaces it with the real circuit size once "
+            "the circuit exists. Left unset by the loaders that derive the size from their input (block vector, MPS)."
+        ),
+    )
+    distribution_name: Optional[str] = None  # used in distribution loading and multivariate distribution loading
     dl_type: str = ""  # loading request
+
+    @model_validator(mode="after")
+    def _validate_job_limits(self):
+        try:
+            dl_type = DataLoadingType(self.dl_type)
+        except ValueError:
+            return self
+
+        max_qubits = _DL_MAX_CIRCUIT_QUBITS.get(dl_type, MAX_DL_QUBITS)
+        if self.num_qubits is not None and self.num_qubits > max_qubits:
+            raise ValueError(f"{dl_type.value} supports at most {max_qubits} qubits, but got {self.num_qubits}.")
+
+        params_model = _DATA_LOADING_PARAM_MODELS.get(dl_type)
+        if params_model is None:
+            return self
+        validated = params_model.model_validate(self.parameters)
+
+        # Write validated values back so the payload carries the declared types (an int `num_layers`,
+        # a float rather than a numpy scalar). Only supplied keys are touched: an omitted parameter
+        # must not pick up a model default.
+        coerced = validated.model_dump()
+        for key in self.parameters:
+            if key in coerced:
+                self.parameters[key] = coerced[key]
+        return self
 
 
 class DataLoadingJobModel(BaseJobModel):
@@ -1220,6 +1494,8 @@ class DataLoadingJobModel(BaseJobModel):
             * fidelity_per_block - quantum state fidelity of the each block's data loading in the `block_vector_loading`
             * mean_fidelity - average quantum state fidelity over all block's data loading in the `block_vector_loading`
             * global_fidelity - global quantum state fidelity of the `block_vector_loading`
+            * num_qubits_per_dimension - number of output qubits each dimension takes in the `fourier_loading`.
+                                         Reshaping the statevector by these sizes recovers the encoded array
         """
         super().result()
 
@@ -1247,7 +1523,7 @@ class StateCompressionEstimatesSubmitModel(BaseModel):
     Data models to use in the Compression estimates request.
     """
 
-    num_qubits: int
+    num_qubits: int = Field(ge=1, le=MAX_COMPRESSION_QUBITS, description="Number of qubits (must be >= 1)")
     parameters: dict
 
 
@@ -1616,6 +1892,21 @@ class LocalJobSubmitModel(BaseModel):
     metrics: Optional[dict] = {}
 
 
+class StateCompressionParams(CompressionOptions):
+    """User-facing limits for state compression (shared by StateCompression and StateCompression2D).
+
+    Extends :class:`CompressionOptions` with the submission-only fields, so a compression job and
+    compression in training enforce the same bounds on what they share.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    # 2D compression leaves noise_profile unset, so None must be accepted here.
+    noise_profile: Optional[str] = "default"
+    max_time: float = Field(ge=0, le=MAX_COMPRESSION_TIME)
+    device_id: Optional[str] = None
+
+
 class StateCompressionSubmitModel(BaseModel):
     """Compression submit model."""
 
@@ -1623,6 +1914,16 @@ class StateCompressionSubmitModel(BaseModel):
     circuit_ids: Optional[list] = []  # id for circuit(s)
     compression_type: str = CompressionJobType.STATE_COMPRESSION.value
     parameters: dict
+
+    @model_validator(mode="after")
+    def _validate_parameters(self):
+        # su2 equivariant compilation reuses this submit model with an unrelated set of parameters.
+        if self.compression_type in (
+            CompressionJobType.STATE_COMPRESSION.value,
+            CompressionJobType.STATE_COMPRESSION_2D.value,
+        ):
+            StateCompressionParams.model_validate(self.parameters)
+        return self
 
 
 class StateCompressionJobModel(BaseJobModel):
@@ -1722,6 +2023,7 @@ class TranspilationJobModel(BaseJobModel):
     circuit_ids: list
     device_id: str
     transpilation_options: dict
+    use_fractional_gates: bool = False
 
     # Populated after job finishes, list of circuit IDs
     transpiled_circuit_ids: Optional[list] = None
@@ -1758,6 +2060,7 @@ class SubmitTranspilationModel(BaseModel):
     circuit_ids: list = []
     device_id: str
     transpilation_options: Optional[dict] = {}
+    use_fractional_gates: bool = False
     name: Optional[str] = ""
     description: Optional[str] = ""
 
@@ -1767,9 +2070,15 @@ class SubmitObservableBackpropagationModel(BaseModel):
 
     circuit_id: str
     observables: List[List[Tuple[str, float, float]]]
-    max_qwc_groups: Optional[int] = None
-    max_error_total: Optional[float] = None
-    max_error_per_slice: Optional[float] = None
+    max_qwc_groups: Optional[int] = Field(
+        default=None, ge=1, le=100_000, description="Maximum number of QWC groups (must be >= 1)"
+    )
+    max_error_total: Optional[float] = Field(
+        default=None, ge=0.0, description="Maximum total truncation error allowed (must be >= 0)"
+    )
+    max_error_per_slice: Optional[float] = Field(
+        default=None, ge=0.0, description="Maximum truncation error allowed per slice (must be >= 0)"
+    )
 
 
 class ObservableBackpropagationModel(BaseModel):
@@ -1792,11 +2101,22 @@ class DeviceModel(BaseModel, ParseIterableMixin):
     pending_jobs: Optional[int] = None
     operation_names: Optional[List[str]] = None
     coupling_map: Optional[List[List[int]]] = None
+    # Client-only: set by Haiqu.get_device(...); not part of the device catalog API.
+    use_fractional_gates: bool = Field(default=False, exclude=True)
 
 
 class PostprocessParams(BaseModel):
-    """Parameters for postprocessing optimization."""
+    """Parameters for postprocessing optimization.
 
+    Only the parameters below are accepted; unknown keys are rejected so that
+    arbitrary values never reach the postprocessing implementation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["none", "bitflip_incremental", "bitflip_steepest_descent"] = Field(
+        default="bitflip_incremental", description="Post-processing method"
+    )
     postprocess_iterations: int = Field(default=5, ge=1, description="Number of optimization passes (must be >= 1)")
     use_fast_eval: bool = Field(default=True, description="Enable fast evaluation")
     seed: Optional[int] = Field(default=None, ge=0, description="Random seed (must be >= 0 if provided)")
@@ -1805,9 +2125,20 @@ class PostprocessParams(BaseModel):
 class PostprocessRequest(BaseModel):
     """Request model for postprocessing endpoint."""
 
-    lp_problem: str  # QUBO serialized as LP file content
-    counts: dict[str, Union[int, float]]
-    params: Optional[dict] = None  # Parameters as dict for API compatibility
+    lp_problem: str = Field(min_length=1, description="QUBO serialized as LP file content")
+    counts: dict[str, Union[int, float]] = Field(description="Mapping of bitstring -> measurement count/probability")
+    params: Optional[PostprocessParams] = None
+
+    @field_validator("counts")
+    @classmethod
+    def _validate_counts(cls, counts: dict[str, Union[int, float]]) -> dict[str, Union[int, float]]:
+        """Reject malformed bitstring keys and negative counts."""
+        for bitstring, value in counts.items():
+            if not bitstring or any(char not in "01" for char in bitstring):
+                raise ValueError("Count keys must be non-empty bitstrings containing only '0' and '1'.")
+            if value < 0:
+                raise ValueError("Count values must be non-negative.")
+        return counts
 
 
 class PostprocessResponse(BaseModel):
@@ -1818,7 +2149,13 @@ class PostprocessResponse(BaseModel):
 
 
 class PostprocessSKQDParams(BaseModel):
-    """Parameters for SKQD postprocessing (SQD diagonalization)."""
+    """Parameters for SKQD postprocessing (SQD diagonalization).
+
+    Only the parameters below are accepted; unknown keys are rejected so that
+    arbitrary values never reach the SQD implementation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     samples_per_batch: int = Field(default=100, ge=1, description="Samples per SQD batch")
     num_batches: int = Field(default=5, ge=1, description="Number of subsampling batches")
@@ -1834,10 +2171,16 @@ class PostprocessSKQDRequest(BaseModel):
     h1e: list[list[float]]
     h2e: list[list[list[list[float]]]]
     results: list[dict[str, float]]
-    num_shots: int
-    norb: int
-    nelec: Tuple[int, int]
-    params: Optional[dict] = None
+    num_shots: int = Field(ge=1, description="Number of measurement shots (must be >= 1)")
+    norb: int = Field(ge=1, le=MAX_ORBITALS, description="Number of spatial orbitals (must be >= 1)")
+    nelec: Tuple[Annotated[int, Field(ge=0)], Annotated[int, Field(ge=0)]]
+    params: Optional[PostprocessSKQDParams] = None
+
+    def model_post_init(self, __context):
+        """Each spin channel cannot hold more electrons than there are orbitals."""
+        super().model_post_init(__context)
+        if self.nelec[0] > self.norb or self.nelec[1] > self.norb:
+            raise ValueError("Each entry of nelec must not exceed norb.")
 
 
 class PostprocessSKQDResponse(BaseModel):
@@ -2016,10 +2359,16 @@ class SKQDSubmitModel(BaseModel):
     h1e: list[list[float]]
     h2e: list[list[list[list[float]]]]
     results: list[dict[str, float]]
-    num_shots: int
-    norb: int
-    nelec: Tuple[int, int]
-    params: Optional[dict] = None
+    num_shots: int = Field(ge=1, description="Number of measurement shots (must be >= 1)")
+    norb: int = Field(ge=1, le=MAX_ORBITALS, description="Number of spatial orbitals (must be >= 1)")
+    nelec: Tuple[Annotated[int, Field(ge=0)], Annotated[int, Field(ge=0)]]
+    params: Optional[PostprocessSKQDParams] = None
+
+    def model_post_init(self, __context):
+        """Each spin channel cannot hold more electrons than there are orbitals."""
+        super().model_post_init(__context)
+        if self.nelec[0] > self.norb or self.nelec[1] > self.norb:
+            raise ValueError("Each entry of nelec must not exceed norb.")
 
 
 class SKQDJobModel(BaseJobModel):
@@ -2089,7 +2438,7 @@ class LRQAOACircuitSubmitModel(BaseModel):
     """Submit model for LR-QAOA circuit generation."""
 
     experiment_id: str
-    lp_problem: str  # QUBO serialized as LP file content
+    lp_problem: str = Field(min_length=1, description="QUBO serialized as LP file content")
     p: int = Field(ge=1, description="Number of QAOA layers (must be >= 1)")
     initial_state_qpy: Optional[str] = None  # QPY dump of initial state circuit
     alphas: Optional[list[float]] = Field(default=None, description="Cost operator parameters (length must match p)")
@@ -2112,7 +2461,7 @@ class VariationalProblemSubmitModel(BaseModel):
     experiment_id: str
     circuit_id: str  # The logged ansatz circuit ID
     observable: Tuple[List[str], List[float]]  # ([pauli_strings], [coefficients])
-    shots: int = 1000
+    shots: int = Field(default=1000, ge=1, description="Number of measurement shots (must be >= 1)")
     device_id: str
     options: Optional[dict] = None
     initial_parameters: Optional[List[float]] = None
