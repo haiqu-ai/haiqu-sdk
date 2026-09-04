@@ -20,12 +20,24 @@ from .optimization import (
     SolverResult,
     cvar_expectation,
 )
+from .optimization.problem import (
+    OptimizationProblem,
+    _as_qubo,
+    _best_bitstring,
+    _objective_sense,
+    evaluate_problem_cost,
+    serialize_optimization_problem,
+    uses_polynomial_wire,
+    validate_optimization_problem,
+)
+from .optimization.qubo import _USE_OPTIMIZATION_PROBLEM
 import numpy as np
 import pandas as pd
 import sympy
 
 from qiskit import QuantumCircuit
 from qiskit.circuit import Gate
+from qiskit.utils.deprecation import deprecate_func
 from qiskit.circuit.library import UnitaryGate
 from qiskit.quantum_info import SparsePauliOp
 from qiskit_ibm_runtime import QiskitRuntimeService
@@ -40,7 +52,7 @@ from .hybrid import HybridProgram, layers
 from .qml.compression_options import CompressionOptions
 from .qml.problem import NonlinearVariationalProblem, VariationalProblem
 from .utils import find_shared_parameters
-from .qml.optimizer import NFTOptimizerOptions, OptimizerOptions
+from .qml.optimizer import NFTOptimizerOptions, OptimizerOptions, ScipyOptimizerOptions
 from .exceptions import (
     APIKeyRequiredError,
     CircuitNotRegisteredInExperimentError,
@@ -54,6 +66,7 @@ from .version import get_version
 from .schemas import (
     JOB_MODELS,
     ArtifactModel,
+    validate_observables_map,
     PretrainingJobModel,
     PretrainingSubmitModel,
     StateCompressionJobModel,
@@ -88,9 +101,11 @@ from .schemas import (
     UserModel,
     VariationalProblemSubmitModel,
     VariationalJobModel,
+    PostprocessParams,
     PostprocessSKQDParams,
     SKQDSubmitModel,
     SKQDJobModel,
+    TranspilationOptions,
 )
 from .skqd import SKQDOptions
 from .utils import (
@@ -111,6 +126,8 @@ from .utils import (
     to_qpy,
     from_qpy,
     validate_and_normalize_parameters_and_observables,
+    validate_readout_bases,
+    validate_error_mitigation_options,
     get_num_parameters_per_circuit,
     AWS_DEFAULT_REGION,
     IQM_DEFAULT_SERVER_URL,
@@ -169,11 +186,15 @@ def check_parameters_match(f_other):
 def _prepare_nonlinear_problem(
     problem: Union[VariationalProblem, NonlinearVariationalProblem],
 ) -> tuple[QuantumCircuit, str, dict[str, tuple[list[str], list[float]]]]:
-    """Normalize a pretraining/gradient problem to the nonlinear wire form.
+    """Normalize a variational, pretraining, or gradient problem to the nonlinear wire form.
 
     A linear ``VariationalProblem`` is wrapped into the trivial nonlinear objective ``"x"`` over a
-    single observable, so both methods share one serialization path. Returns the ansatz, the loss
-    expression string, and the observables map ``{symbol_name: ([term_strings], [coefficients])}``.
+    single observable, so :meth:`Haiqu.variational_optimization`, :meth:`Haiqu.pretrain` and
+    :meth:`Haiqu.gradient` share one serialization path. Returns the ansatz, the loss expression
+    string, and the observables map ``{symbol_name: ([term_strings], [coefficients])}``.
+
+    The observables map is validated here as well as on the submit models, so an unusable one (an
+    empty map from a constant loss, say) is rejected before the ansatz is logged to the server.
     """
     if isinstance(problem, VariationalProblem):
         problem = NonlinearVariationalProblem(problem.ansatz, "x", {"x": problem.observable})
@@ -182,7 +203,56 @@ def _prepare_nonlinear_problem(
 
     loss_expression = str(problem.loss)
     observables = {name: ([t for t, _ in pairs], [c for _, c in pairs]) for name, pairs in problem.observables.items()}
+    validate_observables_map(observables)
     return problem.ansatz, loss_expression, observables
+
+
+# Computational-basis projector symbols accepted by NonlinearVariationalProblem: |0><0| and |1><1|.
+_PROJECTOR_TERM_CHARS = frozenset("01")
+
+
+def _reject_projector_terms(observables: dict[str, tuple[list[str], list[float]]]) -> None:
+    """Raise if any observable term uses a ``0``/``1`` projector symbol.
+
+    Device execution estimates Pauli terms only, so the projector symbols that
+    ``NonlinearVariationalProblem`` accepts for :meth:`Haiqu.pretrain` and :meth:`Haiqu.gradient`
+    cannot be evaluated when the loss is optimized on a device.
+    """
+    offenders = {}
+    for name, (terms, _) in observables.items():
+        projector_terms = [term for term in terms if _PROJECTOR_TERM_CHARS & set(term)]
+        if projector_terms:
+            offenders[name] = projector_terms
+
+    if offenders:
+        detail = "; ".join(f"{name!r}: {terms}" for name, terms in sorted(offenders.items()))
+        raise ValueError(
+            "variational_optimization observable terms must be Pauli-only (I, X, Y, Z); the '0'/'1' "
+            f"computational-basis projector symbols are not supported on the device execution path. Found {detail}. "
+            "Rewrite the projectors in the Pauli basis (|0><0| = (I + Z)/2, |1><1| = (I - Z)/2), or use pretrain() "
+            "or gradient(), which do support them."
+        )
+
+
+def _loss_is_nft_compatible(problem: Union[VariationalProblem, NonlinearVariationalProblem]) -> bool:
+    """Whether NFT's per-parameter sinusoid assumption survives ``problem``'s objective.
+
+    NFT models the loss as ``A + B * cos(theta + C)`` in each parameter. A single expectation value
+    has that form, and so does any affine combination of expectation values (a sum of same-frequency
+    sinusoids is one), but a genuinely nonlinear objective such as ``x*y``, ``x/y`` or ``(x - y)**2``
+    does not.
+    """
+    if isinstance(problem, VariationalProblem):
+        return True
+
+    symbols = sorted(problem.loss.free_symbols, key=str)
+    if not symbols:
+        return True
+    try:
+        return sympy.Poly(problem.loss, *symbols).total_degree() <= 1
+    except sympy.PolynomialError:
+        # Not a polynomial in the observables at all (e.g. x/y, sqrt(x)), so not affine.
+        return False
 
 
 class Haiqu:
@@ -324,15 +394,46 @@ class Haiqu:
 
     @errors.graceful_api_errors_message
     def update_experiment(self, name: str | None = None, description: str | None = None) -> str:
-        """Update the current experiment metadata.
-        Set the current experiment if wasn't set.
+        """Rename the current experiment and/or set its description.
+
+        The description is the experiment's report on the Dashboard: it is rendered as HTML
+        next to the experiment's circuits, jobs and metrics, so use it to record what the
+        experiment does, how it is set up and what the results mean. Markup such as
+        ``<h2>``, ``<p>``, ``<ul>`` or ``<a>`` can be used to structure the report; plain
+        text is displayed as-is, without line breaks, unless it is wrapped in tags.
+        Each call replaces the previous description, so pass the full text you want shown.
+
+        Requires an active experiment - call ``haiqu.init()`` first. At least one of ``name`` or
+        ``description`` must be given; the field left as None keeps its current value.
 
         Args:
-            name (str | None): Updated experiment name. Defaults to the current name.
-            description (str | None): Updated experiment description. Defaults to the current description.
+            name (str | None): New experiment name. If None, the current name is kept.
+            description (str | None): New experiment description, rendered as HTML in the
+                experiment report on the Dashboard. If None, the current description is kept.
 
         Returns:
             str: Status message.
+
+        Raises:
+            ValueError: If no experiment is set, or if both ``name`` and ``description`` are None.
+
+        Examples:
+            >>> haiqu.init("Example Experiment")
+            >>> haiqu.update_experiment(
+            ...     description=(
+            ...         "<h2>LR-QAOA on 12-qubit Max-Cut</h2>"
+            ...         "<p>Depth sweep over p = 1..5 on <code>ibm_torino</code>.</p>"
+            ...         "<ul><li>Best approximation ratio: 0.93 at p = 3</li></ul>"
+            ...     )
+            ... )
+            'Updated current experiment: Example Experiment'
+
+            Rename and re-describe in one call:
+
+            >>> haiqu.update_experiment(
+            ...     name="Max-Cut sweep v2",
+            ...     description="<p>Depth sweep 1-5, 4096 shots per point.</p>",
+            ... )
         """
         if self._experiment is None:
             raise ValueError("No active experiment set. use haiqu.init() first.")
@@ -463,7 +564,7 @@ class Haiqu:
             return circuit_meta
 
         circuit = check_circuit_context(parent_ctx)
-        if circuit:
+        if circuit is not None:
             # Circuit or QASM string is the parent context
             # Log the circuit and possibly metrics to it
             kwargs = {}
@@ -578,6 +679,8 @@ class Haiqu:
         device: DeviceModel,
         job_name: str | None = None,
         job_description: str | None = None,
+        *,
+        seed_transpiler: int | list[int] | None = None,
         **transpilation_options: Any,
     ) -> CircuitModel | list[CircuitModel]:
         """Transpile a quantum circuit for a specific device.
@@ -598,11 +701,11 @@ class Haiqu:
                 ``use_fractional_gates=True`` via :meth:`get_device`, fractional gates are used.
             job_name (str | None): The name for the job. If ``None`` (default), a name will be automatically generated.
             job_description (str | None): The description for the job.
-            **transpilation_options: Additional arguments passed to the Qiskit transpiler. All parameters
-                follow the Qiskit ``transpile()`` interface. A notable extension is ``seed_transpiler``:
-                it accepts either a single integer (standard Qiskit behaviour) or a list of integers.
-                When a list is provided, transpilation is run once per seed in parallel and the result
+            seed_transpiler (int | list[int] | None): Accepts either a single integer (standard Qiskit behaviour) or a list of
+                integers. When a list is provided, transpilation is run once per seed in parallel and the result
                 with the lowest multi-qubit gate count is selected for each circuit.
+            **transpilation_options: Additional arguments passed to the Qiskit transpiler. Most parameters
+                follow the Qiskit ``transpile()`` interface, but the default ``optimization_level`` is 3.
 
         Returns:
             CircuitModel | list[CircuitModel]: The transpiled quantum circuit, logged to the current experiment.
@@ -635,6 +738,8 @@ class Haiqu:
             >>> device = haiqu.get_device("ibm_boston", use_fractional_gates=True)
             >>> transpiled_circuit = haiqu.transpile(circuit, device)
         """
+        transpilation_options = TranspilationOptions.model_validate(transpilation_options)
+
         self._check_experiment()
         logged_circuits = self._prepare_circuits(circuits)
 
@@ -646,6 +751,7 @@ class Haiqu:
             circuit_ids=[c.id for c in logged_circuits],
             device_id=device.id,
             transpilation_options=transpilation_options,
+            seed_transpiler=seed_transpiler,
             use_fractional_gates=bool(device.use_fractional_gates),
             name=job_name,
             description=job_description,
@@ -1498,7 +1604,7 @@ class Haiqu:
                                                                   same order as ``marginal_distribution_names``.
             max_time (int | float): Soft time limit for the job (in seconds). The job will first always produce the initial
                                     result and then limit the fine-tuning stage by the remaining time left.
-                                    Defaults to {MAX_DATA_LOADING_TIME} ({MAX_DATA_LOADING_TIME//60} min).
+                                    Defaults to {MAX_DATA_LOADING_TIME} ({MAX_DATA_LOADING_TIME // 60} min).
             name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be
                                automatically generated.
             job_description (str | None): The description for the job.
@@ -2726,7 +2832,7 @@ class Haiqu:
                 experiment_id=self._experiment.id,
                 circuit_ids=[c.id for c in logged_circuits],
                 parameters=parameters,
-                compression_type=CompressionJobType.STATE_COMPRESSION.value,
+                compression_type=CompressionJobType.STATE_COMPRESSION,
             )
         )
         if circuit is not None:
@@ -2882,7 +2988,7 @@ class Haiqu:
                 experiment_id=self._experiment.id,
                 circuit_ids=[c.id for c in logged_circuits],
                 parameters=parameters,
-                compression_type=CompressionJobType.STATE_COMPRESSION_2D.value,
+                compression_type=CompressionJobType.STATE_COMPRESSION_2D,
             )
         )
         if circuit is not None:
@@ -2984,7 +3090,7 @@ class Haiqu:
                     "num_restarts": num_restarts,
                     "seed": seed,
                 },
-                compression_type=CompressionJobType.SU2_EQUIVARIANT_COMPILATION.value,
+                compression_type=CompressionJobType.SU2_EQUIVARIANT_COMPILATION,
             )
         )
         return jobs[0]
@@ -3423,7 +3529,7 @@ class Haiqu:
     @errors.graceful_api_errors_message
     def variational_optimization(
         self,
-        problem: VariationalProblem,
+        problem: Union[VariationalProblem, NonlinearVariationalProblem],
         shots: int = 1000,
         device: DeviceModel | None = None,
         device_id: str | None = None,
@@ -3441,29 +3547,66 @@ class Haiqu:
         job_description: str | None = None,
         dry_run: bool = False,
     ) -> VariationalJobModel:
-        """Optimize a variational quantum circuit to minimize the expectation value of input observable.
+        """Optimize a variational quantum circuit to minimize a loss over the input observable(s).
 
-        Defaults to the NFT (Nakanishi-Fujii-Todo) optimizer, a gradient-free optimizer
-        designed for variational quantum algorithms (https://arxiv.org/abs/1903.12166).
-        Pass a ``ScipyOptimizerOptions`` instance as ``optimizer_options`` to dispatch
-        to any derivative-free ``scipy.optimize.minimize`` method instead (``cobyla``,
-        ``nelder-mead``, ``powell``, ``cobyqa``).
+        Accepts either a linear ``VariationalProblem`` (minimize a single observable's expectation) or a
+        ``NonlinearVariationalProblem`` (minimize a sympy objective over several named observables). A
+        linear problem is treated internally as the trivial objective ``"x"`` over its single observable.
+
+        Unlike :meth:`pretrain` and :meth:`gradient`, observable terms must be Pauli-only here: the
+        ``0``/``1`` computational-basis projector symbols accepted by ``NonlinearVariationalProblem`` are
+        not supported on the device execution path, and raise ``ValueError``. Rewrite them in the Pauli
+        basis (``|0><0| = (I + Z)/2``, ``|1><1| = (I - Z)/2``) to optimize such an objective here.
+
+        For nonlinear problems, term strings follow Qiskit's reversed-order convention (rightmost
+        character = qubit 0). See :class:`~haiqu.sdk.qml.problem.NonlinearVariationalProblem`.
+
+        Defaults to COBYLA (``ScipyOptimizerOptions(method="cobyla")``), a derivative-free
+        trust-region method that assumes no structure in the loss and is therefore valid for every
+        objective. Pass ``optimizer_options`` to select another derivative-free
+        ``scipy.optimize.minimize`` method (``nelder-mead``, ``powell``, ``cobyqa``), or the NFT
+        (Nakanishi-Fujii-Todo) optimizer (https://arxiv.org/abs/1903.12166), which converges in
+        fewer evaluations by modelling the loss as a sinusoid in each parameter. The NFT model holds
+        for any affine objective (``"x"``, ``"2*x - y"``) but not for a nonlinear one (``"x*y"``,
+        ``"(x - y)**2"``), so passing ``NFTOptimizerOptions`` with a nonlinear objective raises
+        ``ValueError``: such a run would report a converged-looking but wrong result. The single
+        exception to the COBYLA default is ``dry_run=True``, where cost estimation is NFT-only — and
+        for the same reason a nonlinear objective cannot be cost-estimated at all, so ``dry_run=True``
+        raises ``NotImplementedError`` for one.
 
         Args:
-            problem (VariationalProblem): problem instance containing the ansatz circuit and observable.
+            problem (VariationalProblem | NonlinearVariationalProblem): problem instance containing the
+                ansatz circuit and either a single observable (linear) or a loss expression with named
+                observables (nonlinear).
             shots: Number of shots per circuit evaluation. Defaults to 1000.
             device: Device to execute on. If specified, device_id is ignored. Devices from
                 :meth:`get_device` with ``use_fractional_gates=True`` use fractional gates.
             device_id: ID of the device to execute on. Defaults to None.
             options: Additional device options. Hybrid programs can pass
-                ``DeviceLayer(options={"use_fractional_gates": True})``.
+                ``DeviceLayer(options={"use_fractional_gates": True})``. Supports an optional
+                ``"error_mitigation_options"`` key with a dictionary of boolean flags to control
+                individual error mitigation components when ``use_mitigation=True``. Supported keys:
+
+                - ``"dynamical_decoupling"`` (bool): Toggle dynamical decoupling. Defaults to ``True``.
+                - ``"readout_mitigation"`` (bool): Toggle readout error mitigation. Defaults to ``True``.
+                - ``"noise_tailoring"`` (bool): Toggle noise tailoring via Pauli twirling. Defaults to ``False``.
+                - ``"advanced_mitigation"`` (bool): Toggle advanced mitigation (ODR). Defaults to ``False``.
+
+                With ``use_mitigation=True`` and no overrides, dynamical decoupling and readout
+                mitigation are enabled by default; advanced mitigation (ODR) and noise tailoring are
+                off by default.
             initial_parameters: Initial parameter values. Cannot be used together with seed.
                 If neither is provided, random parameters in [-0.1π, 0.1π] are generated.
             seed: Random seed for reproducible generation of initial parameters from a uniform
                 distribution in [-0.1π, 0.1π]. Cannot be used together with initial_parameters.
             optimizer_options: Configuration for the optimizer. If None, defaults to
-                NFTOptimizerOptions(). Pass a ScipyOptimizerOptions instance to use any
-                derivative-free scipy method (cobyla, nelder-mead, powell, cobyqa) instead.
+                ScipyOptimizerOptions(method="cobyla"), except under dry_run=True with an affine loss,
+                where cost estimation is NFT-only and NFTOptimizerOptions() is used instead (with a
+                warning that the estimate prices an optimizer the run itself would not use). Pass a
+                ScipyOptimizerOptions instance to select another derivative-free scipy method
+                (nelder-mead, powell, cobyqa), or NFTOptimizerOptions to use NFT, which needs fewer
+                evaluations on an affine loss. Passing NFTOptimizerOptions with a nonlinear loss
+                raises ValueError, since NFT's sinusoid model cannot represent it.
             use_mitigation: Whether to use error mitigation techniques. Defaults to False.
             use_packing: Whether to use circuit packing for efficient device utilization. Defaults to False.
                 **Warning:** Experimental — packing replicates circuits on unused device qubits
@@ -3487,7 +3630,13 @@ class Haiqu:
                 The estimated QPU cost is then available via ``job.estimated_qpu_cost``. When ``use_session=True``,
                 the estimate excludes classical optimization and parameter-update time, which session mode also bills;
                 ``job.estimated_qpu_cost["warning"]`` carries this notice. Only supported for the NFT optimizer;
-                passing a ``ScipyOptimizerOptions`` with ``dry_run=True`` raises ``NotImplementedError``.
+                passing a ``ScipyOptimizerOptions`` with ``dry_run=True`` raises ``NotImplementedError``. A dry run
+                with no explicit ``optimizer_options`` therefore uses NFT rather than the usual COBYLA default, and
+                warns that the estimate prices an NFT run whose cost may differ from the COBYLA optimization it
+                precedes. A nonlinear loss cannot be estimated at all — NFT is the only optimizer cost estimation
+                supports and it cannot optimize such a loss — so ``dry_run=True`` raises ``NotImplementedError``
+                there whatever ``optimizer_options`` says. The result is an estimate only, and stops before
+                execution.
 
         Returns:
             VariationalJobModel: Job handle to track optimization progress and retrieve results.
@@ -3515,13 +3664,13 @@ class Haiqu:
             >>> result = job.result()
             >>> print(result.min_loss)
 
-            Custom optimizer settings:
+            NFT instead of the COBYLA default (valid only for an affine loss, as above):
 
             >>> from haiqu.sdk.qml import NFTOptimizerOptions
             >>> optimizer = NFTOptimizerOptions(maxfev=2048, maxiter=100)
             >>> job = haiqu.variational_optimization(problem, shots=1000, device_id="aer_simulator", optimizer_options=optimizer)
 
-            Scipy COBYLA instead of NFT:
+            COBYLA with custom settings:
 
             >>> from haiqu.sdk.qml import ScipyOptimizerOptions
             >>> optimizer = ScipyOptimizerOptions(
@@ -3530,11 +3679,31 @@ class Haiqu:
             ...     options={"rhobeg": 0.5, "tol": 1e-8, "maxiter": 2000},
             ... )
             >>> job = haiqu.variational_optimization(problem, shots=1000, device_id="aer_simulator", optimizer_options=optimizer)
+
+            Nonlinear objective over several observables (Pauli terms only — no ``0``/``1`` projectors).
+            The default COBYLA assumes no structure in the loss, so it handles such an objective as is
+            (NFT cannot: its sinusoid model cannot represent it, and passing it raises ``ValueError``):
+
+            >>> from haiqu.sdk.qml import NonlinearVariationalProblem
+            >>> problem = NonlinearVariationalProblem(
+            ...     ansatz, "(x - y)**2", {"x": [("ZI", 1.0)], "y": [("IZ", 1.0)]}
+            ... )
+            >>> job = haiqu.variational_optimization(problem, shots=1000, device_id="aer_simulator")
+
+            Pass ``optimizer_options`` to pick a different derivative-free method for such an objective:
+
+            >>> from haiqu.sdk.qml import ScipyOptimizerOptions
+            >>> job = haiqu.variational_optimization(
+            ...     problem,
+            ...     shots=1000,
+            ...     device_id="aer_simulator",
+            ...     optimizer_options=ScipyOptimizerOptions(method="cobyqa"),
+            ... )
         """
         self._check_experiment()
 
-        if not isinstance(problem, VariationalProblem):
-            raise TypeError("problem must be a VariationalProblem instance.")
+        ansatz, loss_expression, observables = _prepare_nonlinear_problem(problem)
+        _reject_projector_terms(observables)
 
         # Validate that only one of seed or initial_parameters is provided
         if seed is not None and initial_parameters is not None:
@@ -3555,19 +3724,68 @@ class Haiqu:
 
         options = {} if options is None else copy.deepcopy(options)
 
-        if optimizer_options is None:
-            optimizer_options = NFTOptimizerOptions()
+        # Validate error_mitigation_options if provided (same controls as Haiqu.run)
+        validate_error_mitigation_options(options, use_mitigation)
+
+        loss_is_nft_compatible = _loss_is_nft_compatible(problem)
+        optimizer_is_explicit = optimizer_options is not None
+
+        # Cost estimation is NFT-only, and NFT cannot optimize a nonlinear loss at all, so there is no
+        # optimizer a nonlinear dry run could honestly price: the estimate would quote a run that can
+        # never happen. Checked before the optimizer is resolved, so every nonlinear dry run — defaulted,
+        # explicitly NFT, or explicitly scipy — gets this reason rather than an optimizer-shaped one.
+        if dry_run and not loss_is_nft_compatible:
+            raise NotImplementedError(
+                f"dry_run QPU cost estimation is only supported for the NFT optimizer, and the loss "
+                f"{loss_expression!r} is not an affine function of the observables, so the NFT optimizer's "
+                "per-parameter sinusoid model cannot represent it and the optimization cannot use NFT at all. "
+                "There is therefore no optimizer this loss can be priced with. Drop dry_run to optimize it with "
+                "a ScipyOptimizerOptions (COBYLA by default), which runs without a cost estimate."
+            )
+
+        if not optimizer_is_explicit:
+            # COBYLA is the default: it assumes no structure in the loss, so it is valid for every
+            # objective, where NFT's sinusoid model is only valid for an affine one. A dry run is the
+            # exception, since cost estimation is NFT-only; the warning below explains the mismatch.
+            if dry_run:
+                optimizer_options = NFTOptimizerOptions()
+            else:
+                optimizer_options = ScipyOptimizerOptions(method="cobyla")
         elif not isinstance(optimizer_options, OptimizerOptions):
             raise TypeError("optimizer_options must be an OptimizerOptions subclass (e.g., NFTOptimizerOptions).")
+
+        # An explicitly requested NFT on a nonlinear loss is a contradiction, not a preference: NFT would
+        # fit a sinusoid the loss does not follow and report a converged-looking but wrong result. A
+        # defaulted NFT only happens on the dry-run path, which a nonlinear loss can no longer reach.
+        if optimizer_is_explicit and isinstance(optimizer_options, NFTOptimizerOptions) and not loss_is_nft_compatible:
+            raise ValueError(
+                f"The loss {loss_expression!r} is not an affine function of the observables, so the NFT optimizer's "
+                "per-parameter sinusoid model cannot represent it and the optimization would converge to a wrong "
+                "result. Pass a ScipyOptimizerOptions (e.g. method='cobyla') as optimizer_options, or leave "
+                "optimizer_options unset to have COBYLA selected automatically."
+            )
 
         if dry_run and not isinstance(optimizer_options, NFTOptimizerOptions):
             raise NotImplementedError(
                 "dry_run QPU cost estimation is only supported for the NFT optimizer (NFTOptimizerOptions)."
             )
 
-        # Warn if parameters are shared across multiple gates (violates NFT precondition 1)
         if isinstance(optimizer_options, NFTOptimizerOptions):
-            shared_params = find_shared_parameters(problem.ansatz)
+            # Only a dry run defaults to NFT, and it prices an optimizer the run itself would not use.
+            # The loss is affine here (a nonlinear one raised above), so NFT can run the optimization too.
+            if not optimizer_is_explicit:
+                warnings.warn(
+                    "dry_run QPU cost estimation is only supported for the NFT optimizer, so this estimate "
+                    "prices an NFT run, while an optimization with no explicit optimizer_options defaults to "
+                    "ScipyOptimizerOptions(method='cobyla'), whose cost may differ. Pass "
+                    "optimizer_options=NFTOptimizerOptions() to the actual optimization so that it matches "
+                    "this estimate.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+            # Warn if parameters are shared across multiple gates (violates NFT precondition 1)
+            shared_params = find_shared_parameters(ansatz)
             if shared_params:
                 warnings.warn(
                     f"Parameters {shared_params} appear to be used in multiple gates. "
@@ -3582,15 +3800,10 @@ class Haiqu:
                 )
 
         # Log the ansatz circuit
-        circuit = self._get_or_create_circuit(problem.ansatz)
+        circuit = self._get_or_create_circuit(ansatz)
 
         if job_name is None:
             job_name = "variational-optim-job-" + circuit.name
-
-        # Extract observable as tuple of (pauli_strings, coefficients) - same format as run()
-        pauli_strings = [str(pauli) for pauli in problem.observable.paulis]
-        coefficients = [float(coeff.real) for coeff in problem.observable.coeffs]
-        observable = (pauli_strings, coefficients)
 
         if use_session:
             options["use_session"] = True
@@ -3614,7 +3827,8 @@ class Haiqu:
         submit_data = VariationalProblemSubmitModel(
             experiment_id=self._experiment.id,
             circuit_id=circuit.id,
-            observable=observable,
+            loss_expression=loss_expression,
+            observables=observables,
             shots=shots,
             device_id=device_id,
             options=options,
@@ -3635,6 +3849,7 @@ class Haiqu:
         shots: int = 1000,
         parameters: list | None = None,
         observables: SparsePauliOp | list[SparsePauliOp] | list[list[SparsePauliOp]] | None = None,
+        readout_bases: list[str] | None = None,
         job_name: str | None = None,
         job_description: str | None = None,
         device_credentials: dict | None = None,
@@ -3664,6 +3879,11 @@ class Haiqu:
             observables: The observable(s) to measure. The order of Pauli terms in a single string follows the Qiskit
                          reversed-order convention (e.g., ``"IZ"`` measures qubit 0 in the Z basis). Defaults to ``None``,
                          in which case the circuits must include their own measurements.
+            readout_bases: Per-qubit Pauli bases to read the circuits out in, e.g. ``["XXXX", "ZZZZ"]``, Qiskit
+                           little-endian (the last character applies to qubit 0). Requires a ``ReadoutBasisLayer``
+                           in ``program``, and is mutually exclusive with ``observables``. Each basis is a separate
+                           execution, so the cost is ``len(readout_bases) * shots``. Defaults to ``None``, which
+                           reads out in the computational basis.
 
                          Accepted shapes:
 
@@ -3908,6 +4128,21 @@ class Haiqu:
               [-0.02400000000000002, 0.008000000000000007]]]
         """
         self._check_experiment()
+
+        # Validated before uploading anything, so a malformed basis never creates circuits.
+        readout_bases = validate_readout_bases(readout_bases, observables, circuits)
+        has_basis_layer = any(isinstance(layer, layers.ReadoutBasisLayer) for layer in program.layers)
+        if readout_bases is not None and not has_basis_layer:
+            raise ValueError(
+                "`readout_bases` was supplied but the program has no ReadoutBasisLayer, so the bases would "
+                "never be applied. Add a ReadoutBasisLayer to the program."
+            )
+        if has_basis_layer and readout_bases is None:
+            raise ValueError(
+                "The program has a ReadoutBasisLayer but no `readout_bases` were supplied, so every circuit "
+                "would be read out in the computational basis. Pass `readout_bases=[...]`."
+            )
+
         logged_circuits = self._prepare_circuits(circuits)
 
         if job_name is None:
@@ -3962,10 +4197,20 @@ class Haiqu:
                 shots=shots,
                 parameters=parameters,
                 observables=observables,
+                readout_bases=readout_bases,
                 device_credentials=device_credentials,
                 dry_run=dry_run,
             )
         )
+
+        if readout_bases is not None and job.readout_bases is None:
+            # The submit model tolerates unknown fields, so an older deployment would silently
+            # drop the bases and return computational-basis counts instead.
+            raise RuntimeError(
+                "This Haiqu API deployment does not support `readout_bases` (the server did not echo "
+                "them back), so the returned counts would be in the computational basis. "
+                "Please contact support."
+            )
 
         return job
 
@@ -3977,6 +4222,7 @@ class Haiqu:
         parameters: list | None = None,
         shots: int = 1000,
         observables: SparsePauliOp | list[SparsePauliOp] | list[list[SparsePauliOp]] | None = None,
+        readout_bases: list[str] | None = None,
         device: DeviceModel | None = None,
         device_id: str | None = None,
         options: dict | None = None,
@@ -4028,6 +4274,21 @@ class Haiqu:
 
                          The fully-nested form is the unambiguous canonical shape and is recommended when the same code
                          path handles both single and multi-circuit submissions.
+            readout_bases (list[str] | None): Per-qubit Pauli bases to read the circuits out in, e.g.
+                ``["XXXX", "ZZZZ", "XZYZ"]``. Each string follows the same Qiskit reversed-order convention as
+                ``observables`` (``basis[-1]`` applies to qubit 0) and needs one character per qubit, drawn from
+                ``X``, ``Y`` and ``Z`` (use ``Z`` for a qubit that should not be rotated). The circuits keep their
+                own measurements; this rotates the readout before them.
+
+                One distribution is returned per basis per circuit, so ``result()`` gains a basis axis in the
+                same position observables occupy: ``[circuit][basis]``, or ``[circuit][basis][parameter]`` with a
+                parameter sweep. Use :meth:`RunJobModel.result_by_basis` to get them keyed by basis string.
+
+                Mutually exclusive with ``observables``. Combines with ``use_packing``: each packed copy of
+                the circuit is read out in the same basis, so a basis string still has one character per
+                circuit qubit. Note that each basis is a separate execution, so the cost is
+                ``len(readout_bases) * shots``. Defaults to ``None``, which reads out in the computational
+                basis as before.
             device (DeviceModel | None): The device to run the circuits on. If specified, ``device_id`` is ignored.
                 Devices from :meth:`get_device` with ``use_fractional_gates=True`` use fractional gates.
             device_id (str | None): The ID of the device to run the circuits on. Defaults to ``None``.
@@ -4265,44 +4526,7 @@ class Haiqu:
         options = {} if options is None else copy.deepcopy(options)
 
         # Validate error_mitigation_options if provided
-        if "error_mitigation_options" in options:
-            emo = options["error_mitigation_options"]
-            if not isinstance(emo, dict):
-                raise ValueError("`error_mitigation_options` in `options` must be a dictionary.")
-            dict_type_keys = {"readout_mitigation_options"}
-            bool_type_keys = {
-                "dynamical_decoupling",
-                "readout_mitigation",
-                "noise_tailoring",
-                "advanced_mitigation",
-            }
-            valid_emo_keys = dict_type_keys | bool_type_keys
-            unknown_keys = set(emo.keys()) - valid_emo_keys
-            if unknown_keys:
-                raise ValueError(
-                    f"Unknown key(s) in `error_mitigation_options`: {unknown_keys}. " f"Valid keys are: {valid_emo_keys}."
-                )
-            for key, val in emo.items():
-                if key in dict_type_keys:
-                    if not isinstance(val, dict):
-                        raise ValueError(f"{key} must be a `dict`." f"Got {type(val).__name__!r} for key '{key}'.")
-                elif key in bool_type_keys:
-                    if not isinstance(val, bool):
-                        raise ValueError(f"{key} must be a `bool`." f"Got {type(val).__name__!r} for key '{key}'.")
-            if not use_mitigation:
-                warnings.warn(
-                    "`error_mitigation_options` provided but `use_mitigation=False`. "
-                    "Mitigation options will have no effect unless `use_mitigation=True`.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-            if not emo.get("readout_mitigation", False) and emo.get("readout_mitigation_options", None):
-                warnings.warn(
-                    "`readout_mitigation_options` provided but `readout_mitigation=False`. "
-                    "Readout mitigation options will have no effect unless `readout_mitigation=True`.",
-                    UserWarning,
-                    stacklevel=2,
-                )
+        validate_error_mitigation_options(options, use_mitigation)
 
         # Validate device ID
         if device is None:
@@ -4320,6 +4544,9 @@ class Haiqu:
 
         if not dry_run:
             self._inject_device_credentials(device_id, options)
+
+        # Validated before uploading anything, so a malformed basis never creates circuits.
+        readout_bases = validate_readout_bases(readout_bases, observables, circuits)
 
         logged_circuits = self._prepare_circuits(circuits)
 
@@ -4350,6 +4577,7 @@ class Haiqu:
                 parameters=parameters,
                 shots=shots,
                 observables=observables,
+                readout_bases=readout_bases,
                 device_id=device_id,
                 options=options,
                 use_mitigation=use_mitigation,
@@ -4359,6 +4587,14 @@ class Haiqu:
                 run_type=RunJobType.DEVICE_RUN.value,
             )
         )
+        if readout_bases is not None and job.readout_bases is None:
+            # The submit model tolerates unknown fields, so an older deployment would silently
+            # drop the bases and return computational-basis counts instead.
+            raise RuntimeError(
+                "This Haiqu API deployment does not support `readout_bases` (the server did not echo "
+                "them back), so the returned counts would be in the computational basis. "
+                "Please contact support."
+            )
         return job
 
     @errors.graceful_api_errors_message
@@ -4368,6 +4604,7 @@ class Haiqu:
         parameters: list | None = None,
         shots: int = 1000,
         observables: SparsePauliOp | list[SparsePauliOp] | list[list[SparsePauliOp]] | None = None,
+        readout_bases: list[str] | None = None,
         device: DeviceModel | None = None,
         device_id: str | None = None,
         options: dict | None = None,
@@ -4396,6 +4633,8 @@ class Haiqu:
         if device is not None:
             device_id = device.id
 
+        readout_bases = validate_readout_bases(readout_bases, observables, circuits)
+
         logged_circuits = self._prepare_circuits(circuits)
 
         if job_name is None:
@@ -4415,6 +4654,7 @@ class Haiqu:
                 parameters=parameters,
                 shots=shots,
                 observables=observables,
+                readout_bases=readout_bases,
                 device_id=device_id,
                 options=options,
                 use_mitigation=use_mitigation,
@@ -4503,7 +4743,7 @@ class Haiqu:
 
     def build_lr_qaoa_circuit(
         self,
-        problem: QUBO,
+        problem: Union[OptimizationProblem, QUBO],
         p: int = 10,
         initial_state: Optional[QuantumCircuit] = None,
         alphas: Optional[list[float]] = None,
@@ -4511,14 +4751,19 @@ class Haiqu:
         delta: float = 0.5,
         name: Optional[str] = None,
     ) -> CircuitModel:
-        """Build an LR-QAOA circuit for a QUBO problem.
+        """Build an LR-QAOA circuit for an unconstrained binary optimization problem.
 
         See https://arxiv.org/abs/2405.09169 for more details on LR-QAOA.
 
         Generates the LR-QAOA circuit on the Haiqu API server and returns it immediately.
+        The public problem type is ``qiskit_addon_opt_mapper.problems.OptimizationProblem``.
+        Constrained models must be penalty-folded with ``to_unconstrained_problem``
+        first. Every ``OptimizationProblem``, quadratic or higher-order, uses
+        ``polynomial_problem`` payload. The deprecated Haiqu ``QUBO`` class is still accepted
+        through the legacy LP wire.
 
         Args:
-            problem (QUBO): The QUBO optimization problem.
+            problem: Unconstrained binary ``OptimizationProblem`` (or deprecated ``QUBO``).
             p (int): Number of QAOA layers. Defaults to 10.
             initial_state (Optional[QuantumCircuit]): Custom initial state circuit.
                 Defaults to None (uniform superposition).
@@ -4544,6 +4789,12 @@ class Haiqu:
         from . import schemas
 
         self._check_experiment()
+        if uses_polynomial_wire(problem):
+            validate_optimization_problem(problem)
+            problem_wire = {"polynomial_problem": serialize_optimization_problem(problem)}
+        else:
+            qubo = _as_qubo(problem)
+            problem_wire = {"lp_problem": qubo.to_lp_string()}
 
         # Serialize initial state to QPY if provided
         initial_state_qpy = None
@@ -4557,22 +4808,28 @@ class Haiqu:
         # Create submit model
         submit_data = schemas.LRQAOACircuitSubmitModel(
             experiment_id=self._experiment.id,
-            lp_problem=problem.to_lp_string(),
             p=p,
             initial_state_qpy=initial_state_qpy,
             alphas=alphas,
             betas=betas,
             delta=delta,
             name=name,
+            **problem_wire,
         )
 
         # Call API and get circuit immediately (synchronous)
         return self._client.build_lr_qaoa_circuit(data=submit_data)
 
+    @deprecate_func(
+        since="1.6.0",
+        package_name="haiqu-sdk",
+        additional_msg=_USE_OPTIMIZATION_PROBLEM,
+        removal_timeline="no sooner than 3 months after the release date",
+    )
     @errors.graceful_api_errors_message
     def solve_qubo(
         self,
-        problem: "QUBO",
+        problem: Union[OptimizationProblem, QUBO],
         # Circuit parameters
         p: int = 10,
         initial_state: Optional[QuantumCircuit] = None,
@@ -4597,7 +4854,13 @@ class Haiqu:
         cvar_alpha: Optional[float] = 0.1,
     ) -> "SolverResult":
         """
-        Solve a QUBO optimization problem using Linear Ramp QAOA (LR-QAOA).
+        Solve an unconstrained binary optimization problem using Linear Ramp QAOA (LR-QAOA).
+
+        The public problem type is ``qiskit_addon_opt_mapper.problems.OptimizationProblem``.
+        Constrained models must be penalty-folded with ``to_unconstrained_problem`` first.
+        Every ``OptimizationProblem``, quadratic or higher-order, uses the
+        ``polynomial_problem`` payload. The deprecated Haiqu ``QUBO`` class is still accepted through the
+        legacy LP wire.
 
         This high-level method orchestrates the complete LR-QAOA workflow:
         1. Builds LR-QAOA circuit with custom parameter schedules
@@ -4607,7 +4870,7 @@ class Haiqu:
         5. Calculates CVaR expectation
 
         Args:
-            problem (QUBO): The QUBO optimization problem to solve.
+            problem: Unconstrained binary ``OptimizationProblem`` (or deprecated ``QUBO``).
             p (int): Number of QAOA layers. Defaults to 10.
             initial_state (Optional[QuantumCircuit]): Custom initial state. Defaults to None (uniform superposition).
             alphas (Optional[list[float]]): Cost operator parameters. Defaults to None (linear ramp).
@@ -4671,7 +4934,6 @@ class Haiqu:
         """
 
         self._check_experiment()
-
         # Validate cvar_alpha (not sent to API, used locally)
         # Other parameters validated by Pydantic models (LRQAOACircuitSubmitModel, RunSubmitModel, PostprocessParams)
         if cvar_alpha is not None and not 0 < cvar_alpha <= 1:
@@ -4728,7 +4990,7 @@ class Haiqu:
         # 5. Compute raw costs
         raw_costs = {}
         for bitstring in raw_counts.keys():
-            raw_costs[bitstring] = problem.cost(bitstring)
+            raw_costs[bitstring] = evaluate_problem_cost(problem, bitstring)
 
         # 6. Post-process
         processed_costs, processed_counts = self.postprocess(
@@ -4739,7 +5001,7 @@ class Haiqu:
         )
 
         # 7. Find best solutions
-        best_processed = min(processed_costs, key=processed_costs.get)
+        best_processed, _best_cost = _best_bitstring(processed_costs, _objective_sense(problem))
 
         # 8. Calculate expectations
         expectation = sum(raw_costs[bs] * prob for bs, prob in raw_counts.items()) / sum(raw_counts.values())
@@ -4767,10 +5029,11 @@ class Haiqu:
             compression_info=compression_info,
         )
 
+    @errors.graceful_api_errors_message
     def postprocess(
         self,
         counts: dict[str, Union[int, float]],
-        problem: QUBO,
+        problem: Union[OptimizationProblem, QUBO],
         postprocess_iterations: int = 5,
         seed: Optional[int] = None,
     ) -> tuple[dict[str, float], dict[str, Union[int, float]]]:
@@ -4779,11 +5042,15 @@ class Haiqu:
 
         This method uses the Haiqu API's optimized postprocessing algorithms to improve
         quantum optimization results. Requires authentication via login().
+        Constrained ``OptimizationProblem`` instances must be folded with
+        ``to_unconstrained_problem`` first. Every ``OptimizationProblem``,
+        quadratic or higher-order, uses the ``polynomial_problem`` payload. The deprecated Haiqu
+        ``QUBO`` class uses the legacy LP wire.
 
         Args:
             counts: Dictionary mapping bitstrings to their measurement counts or probabilities.
                 Bitstrings must be in Qiskit's little-endian convention (rightmost bit = qubit 0).
-            problem: The QUBO problem instance.
+            problem: Unconstrained binary ``OptimizationProblem`` (or deprecated ``QUBO``).
             postprocess_iterations: Maximum number of optimization passes. Defaults to 5.
             seed: Random seed for reproducible results. Defaults to None.
 
@@ -4802,39 +5069,32 @@ class Haiqu:
             >>> counts = {"0101": 100, "1010": 50}
             >>> costs, opt_counts = haiqu.postprocess(
             ...     counts=counts,
-            ...     problem=my_qubo
+            ...     problem=problem
             ... )
 
             With custom parameters:
 
             >>> costs, opt_counts = haiqu.postprocess(
             ...     counts=counts,
-            ...     problem=my_qubo,
+            ...     problem=problem,
             ...     postprocess_iterations=10,
             ...     seed=42
             ... )
 
         Raises:
-            ValueError: If no API client is available (not logged in).
             ValidationError: If parameters have incorrect types.
         """
         # Validate parameters early by constructing PostprocessParams
         # This ensures type checking happens before any other operations
-        from .schemas import PostprocessParams
-
         params = PostprocessParams(
             postprocess_iterations=postprocess_iterations,
             seed=seed,
         )
 
-        if self._client is None:
-            raise ValueError(
-                "Postprocessing requires API authentication. Please login first:\n\n"
-                "  haiqu = Haiqu()\n"
-                "  haiqu.login(api_access_key='your-key')\n"
-                "  costs, counts = haiqu.postprocess(counts=..., problem=...)"
-            )
-
+        if uses_polynomial_wire(problem):
+            validate_optimization_problem(problem)
+        else:
+            problem = _as_qubo(problem)
         return self._client.api_postprocess(
             counts=counts,
             problem=problem,
@@ -4842,6 +5102,7 @@ class Haiqu:
             seed=params.seed,
         )
 
+    @errors.graceful_api_errors_message
     def postprocess_skqd(
         self,
         results: list[dict[str, float]],
@@ -4902,11 +5163,7 @@ class Haiqu:
             >>> result = skqd_job.result()
             >>> print(result.energy)
         """
-        if self._client is None:
-            raise ValueError(
-                "SKQD postprocessing requires API authentication. Please login first:\n\n"
-                "  haiqu.login(api_access_key='your-key')"
-            )
+        self._check_experiment()
 
         if not results:
             raise ValueError("results must not be empty")

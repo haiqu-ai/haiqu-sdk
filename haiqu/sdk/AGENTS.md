@@ -92,3 +92,11 @@ call `.to_gate()` if you need to embed that cloud circuit in a larger Qiskit cir
   `(term_string, coefficient)` pairs; `SparsePauliOp` cannot represent `0`/`1`.
 - Job/circuit model classes are not re-exported at package level; import them from the schemas
   module for type annotations: `from haiqu.sdk.schemas import RunJobModel, CircuitModel`.
+- Combinatorial optimization: the public problem type is
+  `qiskit_addon_opt_mapper.problems.OptimizationProblem`. Pass it to
+  `haiqu.build_lr_qaoa_circuit`, optionally `haiqu.state_compression`, then
+  `haiqu.run` and `haiqu.postprocess`. Constrained problems need
+  `to_unconstrained_problem` first. Quadratic and higher-order
+  `OptimizationProblem` inputs use polynomial JSON. The deprecated
+  `haiqu.sdk.optimization.QUBO` input alone uses the legacy LP wire;
+  `haiqu.solve_qubo` is also deprecated.

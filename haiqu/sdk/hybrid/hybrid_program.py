@@ -6,6 +6,7 @@ from .layers import (
     EstimatorLayer,
     InputLayer,
     Layer,
+    ReadoutBasisLayer,
 )
 
 # Grouped mitigation variants are mutually exclusive: a program is either an
@@ -45,6 +46,15 @@ class HybridProgram(BaseModel):
             raise ValueError(
                 "At most one grouped mitigation layer (estimator / "
                 "distribution_mitigation) is allowed; they are mutually exclusive"
+            )
+
+        readout_basis = [layer for layer in layers if isinstance(layer, ReadoutBasisLayer)]
+        if len(readout_basis) > 1:
+            raise ValueError("At most one ReadoutBasisLayer is allowed")
+        if readout_basis and any(isinstance(layer, EstimatorLayer) for layer in layers):
+            raise ValueError(
+                "ReadoutBasisLayer cannot be combined with an EstimatorLayer: readout bases return "
+                "distributions while the estimator returns expectation values"
             )
 
         return layers

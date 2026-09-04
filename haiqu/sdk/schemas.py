@@ -27,12 +27,14 @@ from .constants import (
     MAX_DL_LAYERS,
     MAX_DL_QUBITS,
     MAX_DL_VECTOR_QUBITS,
+    MAX_MATH_EXPRESSION_LENGTH,
+    MAX_OBSERVABLE_QUBITS,
     MAX_ORBITALS,
     MIN_DL_INTERVAL_WIDTH,
 )
 from .errors import JUPYTER_LAB  # TODO: find better place for this constant
 from .hybrid import HybridProgram
-from .utils import from_qpy, setup_logger
+from .utils import from_qpy, setup_logger, tuple_to_sparse_op
 from .qml.compression_options import CompressionOptions
 from .qml.optimizer import NFTOptimizerOptions, OptimizerOptionsUnion
 
@@ -103,16 +105,16 @@ class ArtifactModel(BaseModel, ParseIterableMixin):
 class ExperimentSubmitModel(BaseModel):
     """Experiment submit payload data model."""
 
-    name: str
+    name: Annotated[str, Field(max_length=200)]
     description: Optional[str] = ""
-    tags: Optional[str] = ""
+    tags: Optional[Annotated[str, Field(max_length=1024)]] = ""
     metrics: Optional[dict] = {}
 
 
 class ExperimentUpdateModel(BaseModel):
     """Experiment update payload data model."""
 
-    name: Optional[str] = None
+    name: Optional[Annotated[str, Field(max_length=200)]] = None
     description: Optional[str] = None
 
 
@@ -182,11 +184,11 @@ class CircuitSubmitModel(BaseModel):
     """Circuit submit payload data model."""
 
     experiment_id: str
-    name: Optional[str] = ""
-    description: Optional[str] = ""
+    name: Annotated[str, Field(max_length=200)] = ""
+    description: Optional[Annotated[str, Field(max_length=1024)]] = ""
     qpy_dump: str
     hash: str
-    tags: Optional[str] = ""
+    tags: Optional[Annotated[str, Field(max_length=1024)]] = ""
     metrics: Optional[dict] = {}
 
 
@@ -1088,7 +1090,7 @@ class RunJobType(enum.Enum):
     STATEVECTOR_RUN = "StatevectorRun"
 
 
-class CompressionJobType(enum.Enum):
+class CompressionJobType(str, enum.Enum):
     """Class for `compression_type`."""
 
     STATE_COMPRESSION = "StateCompression"
@@ -1403,8 +1405,8 @@ class DataLoadingSubmitModel(BaseModel):
     """Data Loading payload data model."""
 
     experiment_id: Optional[str] = ""  # not used in data_loading_estimates()
-    name: Optional[str] = ""  # not used in data_loading_estimates()
-    description: Optional[str] = ""
+    name: Annotated[str, Field(max_length=200)] = ""  # not used in data_loading_estimates()
+    description: Optional[Annotated[str, Field(max_length=1024)]] = ""
     parameters: dict
     num_qubits: Optional[int] = Field(
         default=None,
@@ -1544,13 +1546,29 @@ class StateCompressionEstimatesModel(DataLoadingEstimatesModel):
         return compression_estimates(data=self, help=help)
 
 
+PauliBasisStr = Annotated[
+    str,
+    Field(
+        min_length=1,
+        pattern=r"^[XYZ]+$",
+        description="Per-qubit Pauli readout basis, Qiskit little-endian (use 'Z' for an unrotated qubit).",
+    ),
+]
+
+READOUT_BASES_DESCRIPTION = (
+    "Per-qubit Pauli readout bases, Qiskit little-endian, e.g. ['XXXX', 'ZZZZ', 'XZYZ'] "
+    "(basis[-1] applies to qubit 0). One distribution is returned per basis per circuit, nested "
+    "[circuit][basis][parameter]. Mutually exclusive with `observables`."
+)
+
+
 class HybridSubmitModel(BaseModel):
     """Hybrid submit payload data model."""
 
     experiment_id: str
 
-    name: Optional[str] = ""
-    description: Optional[str] = ""
+    name: Optional[Annotated[str, Field(max_length=200)]] = ""
+    description: Optional[Annotated[str, Field(max_length=1024)]] = ""
 
     program: HybridProgram
 
@@ -1558,8 +1576,9 @@ class HybridSubmitModel(BaseModel):
     shots: Annotated[int, Field(ge=1)] = 1000
     parameters: Optional[list] = None
     observables: Optional[List[List[Tuple[List[str], List[float]]]]] = None
+    readout_bases: Optional[List[PauliBasisStr]] = Field(default=None, description=READOUT_BASES_DESCRIPTION)
 
-    device_credentials: dict = {}
+    device_credentials: dict[str, Optional[str]] = {}
     dry_run: bool = False
 
 
@@ -1574,6 +1593,7 @@ class HybridJobModel(BaseJobModel):
     shots: int
     parameters: Optional[list] = None
     observables: Optional[List[List[Tuple[List[str], List[float]]]]] = None
+    readout_bases: Optional[List[str]] = None
 
     # device_credentials omitted
     dry_run: bool
@@ -1684,11 +1704,12 @@ class RunSubmitModel(BaseModel):
     parameters: Optional[list] = None
     shots: int = Field(ge=1, description="Number of measurement shots (must be >= 1)", default=1024)
     observables: Optional[List[List[Tuple[List[str], List[float]]]]] = None
-    device_id: Optional[str] = ""
+    readout_bases: Optional[List[PauliBasisStr]] = Field(default=None, description=READOUT_BASES_DESCRIPTION)
+    device_id: Optional[Annotated[str, Field(max_length=200)]] = ""
     options: Optional[dict] = {}
     use_mitigation: Optional[bool] = False
-    name: Optional[str] = ""
-    description: Optional[str] = ""
+    name: Optional[Annotated[str, Field(max_length=200)]] = ""
+    description: Optional[Annotated[str, Field(max_length=1024)]] = ""
     dry_run: Optional[bool] = False
     run_type: Optional[str] = RunJobType.DEVICE_RUN.value
 
@@ -1703,6 +1724,7 @@ class RunJobModel(BaseJobModel):
     parameters: Optional[list] = None
     shots: int
     observables: Optional[List[List[Tuple[List[str], List[float]]]]] = None
+    readout_bases: Optional[List[str]] = None
     device_id: str
     options: dict
     use_mitigation: Optional[bool]
@@ -1743,7 +1765,13 @@ class RunJobModel(BaseJobModel):
             - With observables:
                 * With parameters: 3D list [circuit][observable][parameter]
                 * Without parameters: 2D list [circuit][observable]
+            - With readout bases (readout bases occupy the same axis as observables):
+                * With parameters: 3D list [circuit][basis][parameter] of quasi-probabilities
+                * Without parameters: 2D list [circuit][basis] of quasi-probabilities
             - Exact statevectors for `statevector_run` execution
+
+        Use :meth:`result_by_observable` or :meth:`result_by_basis` to get results already paired
+        with the observable or readout basis that produced them, instead of indexing by position.
 
         Job's `info` field contains additional information (not every field may be present):
             * uncertainty - list of uncertainties for execution with observables
@@ -1797,6 +1825,93 @@ class RunJobModel(BaseJobModel):
         if self.info is None:
             return None
         return self.info.get("qpu_cost")
+
+    @property
+    def uncertainty(self) -> Optional[list]:
+        """
+        Shot-noise uncertainties for an execution with observables.
+
+        Nested exactly like :meth:`result`, so ``uncertainty[i][j]`` is the uncertainty of
+        ``result()[i][j]``. Returns None for runs without observables, which return
+        distributions rather than estimated values.
+
+        Returns:
+            list or None: Uncertainties, nested as ``result()``, or None if unavailable.
+
+        Warning:
+            This property blocks the current CPU thread until the job reaches a
+            terminal state (Done/Error), similarly to ``result()``. Use ``retrieve_status()``
+            to first check the state of the job to omit the prolonged thread blockade.
+        """
+        self.result()
+
+        if self.info is None:
+            return None
+        return self.info.get("uncertainty")
+
+    def result_by_observable(self) -> Optional[list]:
+        """
+        Return results paired with the observable that produced them.
+
+        Saves indexing ``result()`` by position and decoding ``observables`` by hand. Each
+        observable is returned as a :class:`~qiskit.quantum_info.SparsePauliOp`, since an
+        observable is generally a multi-term operator rather than a single Pauli string.
+
+        Returns:
+            list or None: One list per circuit of ``(observable, value, uncertainty)`` tuples,
+            where ``value`` is a float without a parameter sweep and a list of floats with one.
+            ``uncertainty`` is None when the job carries none. None if the job has no observables.
+
+        Warning:
+            This method blocks the current CPU thread until the job reaches a
+            terminal state (Done/Error), similarly to ``result()``. Use ``retrieve_status()``
+            to first check the state of the job to omit the prolonged thread blockade.
+        """
+        results = self.result()
+
+        if not self.observables:
+            return None
+
+        uncertainties = self.uncertainty
+        paired = []
+        for circuit_index, circuit_observables in enumerate(self.observables):
+            circuit_results = results[circuit_index]
+            circuit_uncertainties = uncertainties[circuit_index] if uncertainties is not None else None
+            paired.append(
+                [
+                    (
+                        tuple_to_sparse_op(observable),
+                        circuit_results[observable_index],
+                        circuit_uncertainties[observable_index] if circuit_uncertainties is not None else None,
+                    )
+                    for observable_index, observable in enumerate(circuit_observables)
+                ]
+            )
+        return paired
+
+    def result_by_basis(self) -> Optional[list]:
+        """
+        Return results keyed by the readout basis that produced them.
+
+        Saves indexing ``result()`` by position. Keys are safe because duplicate readout bases
+        are rejected at submission.
+
+        Returns:
+            list or None: One dict per circuit mapping a basis string to its distribution
+            (or to the list of distributions of the parameter sweep, if there is one).
+            None if the job has no readout bases.
+
+        Warning:
+            This method blocks the current CPU thread until the job reaches a
+            terminal state (Done/Error), similarly to ``result()``. Use ``retrieve_status()``
+            to first check the state of the job to omit the prolonged thread blockade.
+        """
+        results = self.result()
+
+        if not self.readout_bases:
+            return None
+
+        return [dict(zip(self.readout_bases, circuit_results)) for circuit_results in results]
 
     def draw(self, help: bool = False):
         """
@@ -1884,10 +1999,10 @@ class LocalJobSubmitModel(BaseModel):
     hash: Optional[str] = ""
     circuit_hash: Optional[str] = ""
     results: Optional[str] = ""
-    device_id: Optional[str] = ""
+    device_id: Optional[Annotated[str, Field(max_length=200)]] = ""
     shots: Optional[str] = ""
-    name: Optional[str] = ""
-    status: str = ""
+    name: Annotated[str, Field(max_length=200)] = ""
+    status: str
     job_type: str = ""
     metrics: Optional[dict] = {}
 
@@ -1912,15 +2027,15 @@ class StateCompressionSubmitModel(BaseModel):
 
     experiment_id: str
     circuit_ids: Optional[list] = []  # id for circuit(s)
-    compression_type: str = CompressionJobType.STATE_COMPRESSION.value
+    compression_type: CompressionJobType = CompressionJobType.STATE_COMPRESSION
     parameters: dict
 
     @model_validator(mode="after")
     def _validate_parameters(self):
         # su2 equivariant compilation reuses this submit model with an unrelated set of parameters.
         if self.compression_type in (
-            CompressionJobType.STATE_COMPRESSION.value,
-            CompressionJobType.STATE_COMPRESSION_2D.value,
+            CompressionJobType.STATE_COMPRESSION,
+            CompressionJobType.STATE_COMPRESSION_2D,
         ):
             StateCompressionParams.model_validate(self.parameters)
         return self
@@ -1967,7 +2082,7 @@ class StateCompressionJobModel(BaseJobModel):
         Display the progress widget, stream logs from the job.
         """
         title = "STATE COMPRESSION"
-        if self.compression_type.value == CompressionJobType.STATE_COMPRESSION_2D.value:
+        if self.compression_type is CompressionJobType.STATE_COMPRESSION_2D:
             title = "STATE COMPRESSION 2D"
         self._progress(f"{title} JOB PROGRESS")
 
@@ -2017,6 +2132,49 @@ class Su2EquivariantCompilationJobModel(BaseJobModel):
         self._progress("EQUIVARIANT COMPRESSION JOB PROGRESS")
 
 
+class TranspilationOptions(BaseModel):
+    """Options to customize transpilation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # These options are passed to qiskit.transpiler.generate_preset_pass_manager or qiskit.compiler.transpile
+    optimization_level: Literal[0, 1, 2, 3] | None = None  # Qiskit default is 2, but Haiqu maps None to 3
+    # Not supported: backend
+    # Not supported: target
+    basis_gates: list[str] | None = None
+    coupling_map: list[list[int]] | None = None
+    initial_layout: list[int] | None = None
+    layout_method: Literal["trivial", "dense", "sabre"] | None = None
+    routing_method: Literal["basic", "lookahead", "sabre", "none"] | None = None
+    translation_method: Literal["translator", "synthesis"] | None = None
+    scheduling_method: Literal["alap", "asap"] | None = None
+    approximation_degree: float = Field(default=1.0, ge=0.0, le=1.0)
+    seed_transpiler: int | None = None
+    # Not supported: unitary_synthesis_method
+    # Not supported: unitary_synthesis_plugin_config
+    # Not supported: hls_config
+    # Not supported: init_method
+    # Not supported: optimization_method
+    dt: float | None = None
+    qubits_initially_zero: bool = True
+
+    @field_validator("coupling_map", mode="after")
+    @classmethod
+    def _validate_coupling_map(cls, coupling_map):
+        if coupling_map is None:
+            return None
+
+        for pair in coupling_map:
+            if len(pair) != 2:
+                raise ValueError("Coupling map interactions must be between qubit pairs")
+
+            for q in pair:
+                if q < 0:
+                    raise ValueError("Qubit indices must be nonnegative")
+
+        return coupling_map
+
+
 class TranspilationJobModel(BaseJobModel):
     """Job model for transpilation jobs."""
 
@@ -2058,11 +2216,12 @@ class SubmitTranspilationModel(BaseModel):
 
     experiment_id: str
     circuit_ids: list = []
-    device_id: str
-    transpilation_options: Optional[dict] = {}
+    device_id: Annotated[str, Field(max_length=200)]
+    transpilation_options: TranspilationOptions = TranspilationOptions()
+    seed_transpiler: int | list[int] | None = None
     use_fractional_gates: bool = False
-    name: Optional[str] = ""
-    description: Optional[str] = ""
+    name: Optional[Annotated[str, Field(max_length=200)]] = ""
+    description: Optional[Annotated[str, Field(max_length=1024)]] = ""
 
 
 class SubmitObservableBackpropagationModel(BaseModel):
@@ -2125,7 +2284,15 @@ class PostprocessParams(BaseModel):
 class PostprocessRequest(BaseModel):
     """Request model for postprocessing endpoint."""
 
-    lp_problem: str = Field(min_length=1, description="QUBO serialized as LP file content")
+    lp_problem: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description="Deprecated QUBO serialized as LP file content",
+    )
+    polynomial_problem: Optional[dict] = Field(
+        default=None,
+        description="OptimizationProblem serialized as polynomial JSON",
+    )
     counts: dict[str, Union[int, float]] = Field(description="Mapping of bitstring -> measurement count/probability")
     params: Optional[PostprocessParams] = None
 
@@ -2139,6 +2306,12 @@ class PostprocessRequest(BaseModel):
             if value < 0:
                 raise ValueError("Count values must be non-negative.")
         return counts
+
+    @model_validator(mode="after")
+    def _validate_problem_wire(self):
+        if (self.lp_problem is None) == (self.polynomial_problem is None):
+            raise ValueError("Provide exactly one of lp_problem or polynomial_problem.")
+        return self
 
 
 class PostprocessResponse(BaseModel):
@@ -2355,7 +2528,7 @@ class SKQDSubmitModel(BaseModel):
     """Data model for SKQD postprocessing job submission."""
 
     experiment_id: str
-    name: str = "SKQD Postprocessing"
+    name: Annotated[str, Field(max_length=200)] = "SKQD Postprocessing"
     h1e: list[list[float]]
     h2e: list[list[list[list[float]]]]
     results: list[dict[str, float]]
@@ -2438,21 +2611,80 @@ class LRQAOACircuitSubmitModel(BaseModel):
     """Submit model for LR-QAOA circuit generation."""
 
     experiment_id: str
-    lp_problem: str = Field(min_length=1, description="QUBO serialized as LP file content")
+    lp_problem: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description="Deprecated QUBO serialized as LP file content",
+    )
+    polynomial_problem: Optional[dict] = Field(
+        default=None,
+        description="OptimizationProblem serialized as polynomial JSON",
+    )
     p: int = Field(ge=1, description="Number of QAOA layers (must be >= 1)")
     initial_state_qpy: Optional[str] = None  # QPY dump of initial state circuit
     alphas: Optional[list[float]] = Field(default=None, description="Cost operator parameters (length must match p)")
     betas: Optional[list[float]] = Field(default=None, description="Mixer operator parameters (length must match p)")
     delta: float = Field(default=0.5, description="Ramp parameter (typical values are between 0 and 1)")
-    name: str
+    name: Annotated[str, Field(max_length=200)]
 
     def model_post_init(self, __context):
         """Validate alphas and betas lengths match p, and warn if delta is unusual."""
         super().model_post_init(__context)
+        if (self.lp_problem is None) == (self.polynomial_problem is None):
+            raise ValueError("Provide exactly one of lp_problem or polynomial_problem.")
         if self.alphas is not None and len(self.alphas) != self.p:
             raise ValueError(f"alphas length ({len(self.alphas)}) must match p ({self.p})")
         if self.betas is not None and len(self.betas) != self.p:
             raise ValueError(f"betas length ({len(self.betas)}) must match p ({self.p})")
+
+
+# Characters allowed in an observable term string: the Paulis plus the single-qubit
+# computational-basis projectors |0><0| ("0") and |1><1| ("1").
+_ALLOWED_OBSERVABLE_TERM_CHARS = frozenset("IXYZ01")
+
+
+def validate_observables_map(
+    observables: Dict[str, Tuple[List[str], List[float]]],
+) -> Dict[str, Tuple[List[str], List[float]]]:
+    """Reject observable maps no worker can evaluate, before a job is persisted.
+
+    Shared by the variational and pretraining submit models, so an unusable map raises where the
+    user called the SDK rather than surfacing as a failed job. Checks that the map is non-empty,
+    that every observable has at least one term with exactly one coefficient per term, and that
+    term strings are same-length and over the alphabet ``{I, X, Y, Z, 0, 1}``.
+    """
+    if not observables:
+        raise ValueError("observables must not be empty: map each free symbol of the loss expression to its observable.")
+
+    for name, (terms, coefficients) in observables.items():
+        if not terms:
+            raise ValueError(f"observable {name!r} must have at least one term.")
+        if len(terms) != len(coefficients):
+            raise ValueError(
+                f"observable {name!r} has {len(terms)} term(s) but {len(coefficients)} coefficient(s); "
+                "each term needs exactly one coefficient."
+            )
+        for term in terms:
+            if not term:
+                raise ValueError(f"observable {name!r} must not contain an empty term string.")
+            if len(term) > MAX_OBSERVABLE_QUBITS:
+                raise ValueError(
+                    f"observable {name!r} term of length {len(term)} exceeds the {MAX_OBSERVABLE_QUBITS}-qubit maximum."
+                )
+            invalid = sorted(set(term) - _ALLOWED_OBSERVABLE_TERM_CHARS)
+            if invalid:
+                raise ValueError(
+                    f"observable {name!r} term {term!r} contains invalid characters {invalid}; allowed: I, X, Y, Z, 0, 1."
+                )
+
+    # Every term acts on the same register, so a length mismatch means a malformed term string.
+    widths = {len(term) for terms, _ in observables.values() for term in terms}
+    if len(widths) > 1:
+        raise ValueError(
+            f"observable term strings must all have the same length (one character per qubit); found {sorted(widths)}."
+        )
+
+    return observables
 
 
 class VariationalProblemSubmitModel(BaseModel):
@@ -2460,17 +2692,27 @@ class VariationalProblemSubmitModel(BaseModel):
 
     experiment_id: str
     circuit_id: str  # The logged ansatz circuit ID
-    observable: Tuple[List[str], List[float]]  # ([pauli_strings], [coefficients])
+    loss_expression: str = Field(
+        min_length=1,
+        max_length=MAX_MATH_EXPRESSION_LENGTH,
+        description='Loss expression in terms of observables, e.g. "x / y"',
+    )
+    observables: Dict[str, Tuple[List[str], List[float]]]  # {symbol_name: ([term_strings], [coefficients])}
     shots: int = Field(default=1000, ge=1, description="Number of measurement shots (must be >= 1)")
-    device_id: str
+    device_id: Annotated[str, Field(max_length=200)]
     options: Optional[dict] = None
     initial_parameters: Optional[List[float]] = None
     optimizer_options: OptimizerOptionsUnion = Field(default_factory=NFTOptimizerOptions)
     use_mitigation: bool = False
     use_compression: bool = False
-    compression_options: Optional[dict] = None
-    name: Optional[str] = ""
-    description: Optional[str] = ""
+    compression_options: Optional[CompressionOptions] = None
+    name: Optional[Annotated[str, Field(max_length=200)]] = ""
+    description: Optional[Annotated[str, Field(max_length=1024)]] = ""
+
+    @field_validator("observables")
+    @classmethod
+    def _check_observables(cls, observables):
+        return validate_observables_map(observables)
 
 
 class VariationalCompressionStats:
@@ -2568,7 +2810,8 @@ class VariationalJobModel(BaseJobModel):
     """Job returned for variational problem execution."""
 
     circuit_id: str
-    observable: Tuple[List[str], List[float]]  # ([pauli_strings], [coefficients])
+    loss_expression: str  # sympy objective as a string; "x" for a linear single-observable problem
+    observables: Dict[str, Tuple[List[str], List[float]]]  # {symbol_name: ([term_strings], [coefficients])}
     shots: int
     device_id: str
     options: Optional[dict] = None
@@ -2717,15 +2960,24 @@ class PretrainingSubmitModel(BaseModel):
 
     experiment_id: str
     circuit_id: str  # The logged ansatz circuit ID
-    loss_expression: str  # sympy objective as a string; "x" for a linear single-observable problem
+    loss_expression: str = Field(
+        min_length=1,
+        max_length=MAX_MATH_EXPRESSION_LENGTH,
+        description='sympy objective as a string; "x" for a linear single-observable problem',
+    )
     observables: Dict[str, Tuple[List[str], List[float]]]  # {symbol_name: ([term_strings], [coefficients])}
-    name: Optional[str] = ""
-    description: Optional[str] = ""
+    name: Optional[Annotated[str, Field(max_length=200)]] = ""
+    description: Optional[Annotated[str, Field(max_length=1024)]] = ""
     max_time: Optional[float] = None
     seed: Optional[int] = None
     initial_parameters: Optional[List[float]] = None
     options: Optional[dict] = None
     pretrain_type: str = PretrainingJobType.PRETRAIN.value
+
+    @field_validator("observables")
+    @classmethod
+    def _check_observables(cls, observables):
+        return validate_observables_map(observables)
 
 
 class PretrainingJobModel(BaseJobModel):

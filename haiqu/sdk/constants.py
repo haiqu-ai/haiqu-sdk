@@ -49,6 +49,13 @@ MIN_DL_INTERVAL_WIDTH = 1e-8
 MIN_COMPRESSION_APPROXIMATION_LEVEL = 1
 MAX_COMPRESSION_APPROXIMATION_LEVEL = 100
 
+# Maximum length (characters) of a user-supplied math expression string, e.g. a
+# variational loss expression or a function-loading formula.
+MAX_MATH_EXPRESSION_LENGTH = 1024
+
+# Maximum length of an observable term string (one character per qubit).
+MAX_OBSERVABLE_QUBITS = 1000
+
 
 class CompressionLevel(str, enum.Enum):
     """Qualitative amount of a circuit that state compression targets."""

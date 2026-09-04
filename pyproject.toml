@@ -47,8 +47,9 @@ dependencies = [
     "qiskit_algorithms==0.4.0",
     "qiskit-addon-obp==0.3.0",
     "qiskit-addon-utils==0.3.0",
+    "qiskit-addon-opt-mapper==0.1.0",
     "qiskit-qasm3-import==0.6.0",
-    "qiskit-optimization[cplex]==0.7.0",
+    "qiskit-optimization[cplex]==0.7.0",  # LP serialization for the quadratic kernel adapter
     "sympy>=1.13",
 
     "cplex",  # qiskit-optimization==0.7.0 ignores [cplex] for python>=3.13

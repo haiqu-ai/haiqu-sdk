@@ -32,7 +32,7 @@ class DeviceLayer(BaseModel):
 
     type: Literal["device"] = "device"
 
-    device_id: str
+    device_id: Annotated[str, Field(max_length=200)]
     options: dict = {}
 
 
@@ -153,6 +153,25 @@ class QWCComputeLayer(BaseModel):
     type: Literal["qwc_compute"] = "qwc_compute"
 
 
+class ReadoutBasisLayer(BaseModel):
+    """Read the circuits out in the per-qubit Pauli bases carried by the job submission.
+
+    The bases are a job-level field (``readout_bases``), not a layer field. This layer marks where the rotation is applied during
+    execution of the hybrid program, and the result depends on the placement relative to the :class:`TranspilationLayer`:
+
+    - After the :class:`TranspilationLayer`: all bases of a circuit share one transpilation and one layout.
+    - Before the :class:`TranspilationLayer`: each basis is transpiled separately.
+    - No :class:`TranspilationLayer`: the rotation applies to the pre-transpiled circuit's active qubits.
+
+    To ensure that each basis is twirled independently rather than sharing one sample, place the rotation prior to
+    :class:`NoiseTailoringLayer`.
+
+    Cannot be combined with an :class:`EstimatorLayer`.
+    """
+
+    type: Literal["readout_basis"] = "readout_basis"
+
+
 Layer = Annotated[
     Union[
         InputLayer,
@@ -168,6 +187,7 @@ Layer = Annotated[
         AdvancedDistMitigationLayer,
         AdvancedReadoutMitigationLayer,
         QWCComputeLayer,
+        ReadoutBasisLayer,
     ],
     Field(discriminator="type"),
 ]

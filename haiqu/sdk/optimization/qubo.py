@@ -1,33 +1,69 @@
 from __future__ import annotations
 from copy import deepcopy
-from typing import Tuple
+from typing import TYPE_CHECKING, Tuple
 import numpy as np
 
 from qiskit.quantum_info import SparsePauliOp
+from qiskit.utils.deprecation import deprecate_func
 from qiskit_optimization import QuadraticProgram
 from qiskit_optimization.converters import QuadraticProgramToQubo
 from qiskit_optimization.problems import QuadraticObjective
 from qiskit_optimization.translators import from_docplex_mp, from_ising
 
+from qiskit_addon_opt_mapper.converters import MaximizeToMinimize
+
+from .problem import _assert_2local_diagonal_ising, _objective_sense, _validate_qubo_solver_problem
+
+if TYPE_CHECKING:
+    from qiskit_addon_opt_mapper.problems import OptimizationProblem
+
+_DEPRECATE_SINCE = "1.6.0"
+_DEPRECATE_PACKAGE = "haiqu-sdk"
+_DEPRECATE_REMOVAL = "no sooner than 3 months after the release date"
+_USE_OPTIMIZATION_PROBLEM = (
+    "Instead, use an unconstrained quadratic ``qiskit_addon_opt_mapper.problems.OptimizationProblem`` "
+    "with ``haiqu.build_lr_qaoa_circuit``, optional ``haiqu.state_compression``, "
+    "``haiqu.run``, and ``haiqu.postprocess``."
+)
+QUBO_CLASS_DEPRECATION_MSG = (
+    f"The class ``haiqu.sdk.optimization.qubo.QUBO`` is deprecated as of {_DEPRECATE_PACKAGE} {_DEPRECATE_SINCE}. "
+    f"It will be removed {_DEPRECATE_REMOVAL}. {_USE_OPTIMIZATION_PROBLEM}"
+)
+
+
+def _deprecate_qubo_api(*, additional_msg: str = _USE_OPTIMIZATION_PROBLEM):
+    return deprecate_func(
+        since=_DEPRECATE_SINCE,
+        package_name=_DEPRECATE_PACKAGE,
+        additional_msg=additional_msg,
+        removal_timeline=_DEPRECATE_REMOVAL,
+    )
+
 
 class QUBO:
-    """A class representing a Quadratic Unconstrained Binary Optimization (QUBO) problem.
+    """Deprecated adapter for quadratic unconstrained binary optimization (QUBO) problems.
 
-    This class provides a unified interface for QUBO problems, supporting construction
-    from multiple formats and conversion to Qiskit-compatible representations.
+    The public problem type is ``qiskit_addon_opt_mapper.problems.OptimizationProblem``.
+    Pass that object to ``haiqu.build_lr_qaoa_circuit``, optional ``haiqu.state_compression``,
+    ``haiqu.run``, and ``haiqu.postprocess``; it uses the ``polynomial_problem`` payload. This
+    deprecated class remains as a thin adapter that serializes itself to the
+    legacy LP compatibility wire.
 
-    A QUBO problem can be initialized in multiple ways:
+    Historical constructors (all deprecated):
+
     1. From a Docplex model / CPLEX file
     2. From an Ising-like Hamiltonian (SparsePauliOp)
-    3. From a Qiskit QuadraticProgram.
+    3. From a community ``qiskit_optimization.QuadraticProgram``
+    4. From an official ``OptimizationProblem`` (``from_optimization_problem``)
     """
 
+    @_deprecate_qubo_api()
     def __init__(self):
         raise RuntimeError(
             "Direct initialization is not allowed. "
             "Please use one of the class constructors: "
-            "QUBO.from_quadratic_program(), QUBO.from_file(), "
-            "QUBO.from_docplex(), or QUBO.from_hamiltonian()."
+            "QUBO.from_optimization_problem(), QUBO.from_hamiltonian(), "
+            "QUBO.from_quadratic_program(), QUBO.from_file(), or QUBO.from_docplex()."
         )
 
     @staticmethod
@@ -70,8 +106,9 @@ class QUBO:
                     qp.objective.quadratic[(i, i)] = 0
 
     @classmethod
+    @_deprecate_qubo_api()
     def from_quadratic_program(cls, qp: QuadraticProgram) -> "QUBO":
-        """Create a QUBO from a Qiskit QuadraticProgram.
+        """Create a QUBO from a community ``qiskit_optimization.QuadraticProgram``.
 
         Note on Qiskit's Quadratic Coefficient Storage:
             Qiskit's QuadraticExpression internally stores quadratic coefficients in
@@ -94,6 +131,10 @@ class QUBO:
 
             All QUBO methods in this class properly handle Qiskit's upper-triangle representation.
         """
+        return cls._from_quadratic_program(qp)
+
+    @classmethod
+    def _from_quadratic_program(cls, qp: QuadraticProgram) -> "QUBO":
         # Normalize diagonal quadratic terms before conversion
         # For binary variables: x_i^2 = x_i, so diagonal terms should be linear
         qp = deepcopy(qp)
@@ -116,25 +157,61 @@ class QUBO:
         return instance
 
     @classmethod
+    @_deprecate_qubo_api()
+    def from_optimization_problem(cls, op: "OptimizationProblem") -> "QUBO":
+        """Create a QUBO adapter from an official ``OptimizationProblem``.
+
+        Constrained problems must be penalty-folded with ``to_unconstrained_problem`` first.
+        Higher-order objectives must be reduced to QUBO first (extra variables);
+        this path does not perform that reduction.
+        """
+        return cls._from_optimization_problem(op)
+
+    @classmethod
+    def _from_optimization_problem(cls, op: "OptimizationProblem") -> "QUBO":
+        _validate_qubo_solver_problem(op)
+        if _objective_sense(op) == "max":
+            op = MaximizeToMinimize().convert(op)
+        hamiltonian, offset = op.to_ising()
+        if not isinstance(hamiltonian, SparsePauliOp):
+            hamiltonian = SparsePauliOp(hamiltonian)
+        qp = from_ising(hamiltonian, offset=offset)
+        return cls._from_quadratic_program(qp)
+
+    @classmethod
+    @_deprecate_qubo_api()
     def from_file(cls, path: str) -> "QUBO":
         """Load a problem from a CPLEX/LP file and convert it to QUBO form."""
+        return cls._from_file(path)
+
+    @classmethod
+    def _from_file(cls, path: str) -> "QUBO":
         qp = QuadraticProgram()
         ext = path.lower().rsplit(".", 1)[-1]
         if ext == "lp":
             qp.read_from_lp_file(path)
         else:
             raise ValueError(f"Unsupported file extension '.{ext}'. Please provide a .lp file.")
-        return cls.from_quadratic_program(qp)
+        return cls._from_quadratic_program(qp)
 
     @classmethod
+    @_deprecate_qubo_api()
     def from_docplex(cls, docplex_model) -> "QUBO":
         """Create from a DOcplex model (docplex.mp.model.Model)."""
-        qp = from_docplex_mp(docplex_model)
-        return cls.from_quadratic_program(qp)
+        return cls._from_docplex(docplex_model)
 
     @classmethod
+    def _from_docplex(cls, docplex_model) -> "QUBO":
+        qp = from_docplex_mp(docplex_model)
+        return cls._from_quadratic_program(qp)
+
+    @classmethod
+    @_deprecate_qubo_api()
     def from_hamiltonian(cls, H: SparsePauliOp, offset: float = 0.0) -> "QUBO":
         """Create QUBO from an Ising Hamiltonian represented as a Pauli operator.
+
+        Higher-order Hamiltonians must be reduced to QUBO first (extra variables);
+        this path does not perform that reduction.
 
         This method converts an Ising model Hamiltonian (with spin variables sᵢ ∈ {-1, +1})
         to QUBO formulation (with binary variables xᵢ ∈ {0, 1}) using the mapping sᵢ = 1 - 2·xᵢ.
@@ -200,8 +277,7 @@ class QUBO:
 
         Raises:
             TypeError: If H is not a SparsePauliOp
-            QiskitOptimizationError: If H contains Pauli X or Y operators
-            QiskitOptimizationError: If any Pauli term acts on more than 2 qubits (only pairwise interactions supported)
+            ValueError: If H contains Pauli X or Y operators, or any term acts on more than 2 qubits
 
         Example:
             >>> from qiskit.quantum_info import SparsePauliOp
@@ -223,12 +299,15 @@ class QUBO:
             >>> print(qubo._qp.objective.linear.to_dict())  # {0: -2.0, 1: -2.0}
             >>> print(qubo._qp.objective.quadratic.to_dict())  # {(0,1): 4.0}
         """
-        if not isinstance(H, SparsePauliOp):
-            raise TypeError("Input must be a qiskit.quantum_info.SparsePauliOp.")
+        return cls._from_hamiltonian(H, offset)
+
+    @classmethod
+    def _from_hamiltonian(cls, H: SparsePauliOp, offset: float = 0.0) -> "QUBO":
+        _assert_2local_diagonal_ising(H)
         qp = from_ising(H, offset=offset)
 
-        # Normalization of diagonal terms is handled by from_quadratic_program()
-        return cls.from_quadratic_program(qp)
+        # Normalization of diagonal terms is handled by _from_quadratic_program()
+        return cls._from_quadratic_program(qp)
 
     def to_hamiltonian(self) -> Tuple[SparsePauliOp, float]:
         """Convert QUBO to an Ising Hamiltonian represented as Pauli operators.
@@ -314,6 +393,7 @@ class QUBO:
                 os.unlink(temp_path)
 
     @classmethod
+    @_deprecate_qubo_api()
     def from_lp_string(cls, lp_content: str) -> "QUBO":
         """Deserialize QUBO from LP file format string.
 
@@ -323,6 +403,10 @@ class QUBO:
         Returns:
             QUBO instance
         """
+        return cls._from_lp_string(lp_content)
+
+    @classmethod
+    def _from_lp_string(cls, lp_content: str) -> "QUBO":
         import tempfile
         import os
 
@@ -331,8 +415,7 @@ class QUBO:
             temp_path = f.name
 
         try:
-            problem = cls.from_file(temp_path)
-            return problem
+            return cls._from_file(temp_path)
         finally:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)

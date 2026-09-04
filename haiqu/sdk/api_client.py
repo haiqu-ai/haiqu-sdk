@@ -22,7 +22,7 @@ from .utils import HaiquJSONEncoder
 from .version import get_version
 
 if TYPE_CHECKING:
-    from .optimization import QUBO
+    from .optimization import OptimizationProblem, QUBO
 
 API_ACTIONS = {
     "user": "/user",
@@ -61,8 +61,8 @@ API_ACTIONS = {
     "flow": "/flow",
     "run": "/run",
     "dry_run": "/dry-run",
-    "hemistich": "/hemistich",
-    "hemistich_estimates": "/hemistich_estimates",
+    "compression": "/compression",
+    "compression_estimates": "/compression_estimates",
     "postprocess": "/postprocess",
     "postprocess_skqd": "/postprocess_skqd",
     "variational_optimization": "/variational",
@@ -522,7 +522,7 @@ class ApiClient:
 
     def compression_estimates(self, data: schemas.StateCompressionEstimatesSubmitModel) -> schemas.StateCompressionEstimatesModel:
         """Post compression estimates request"""
-        response = self._post(endpoint=API_ACTIONS["hemistich_estimates"], json=data.model_dump())
+        response = self._post(endpoint=API_ACTIONS["compression_estimates"], json=data.model_dump())
         return schemas.StateCompressionEstimatesModel.model_validate_json(response.text)
 
     def flow(self, data: schemas.HybridSubmitModel) -> schemas.HybridJobModel:
@@ -559,14 +559,14 @@ class ApiClient:
 
     def compression(self, data: schemas.StateCompressionSubmitModel) -> list[schemas.StateCompressionJobModel]:
         """Post compression request"""
-        response = self._post(endpoint=API_ACTIONS["hemistich"], json=data.model_dump())
+        response = self._post(endpoint=API_ACTIONS["compression"], json=data.model_dump())
         return schemas.StateCompressionJobModel.parse_items(response.json())
 
     def su2_equivariant_compilation(
         self, data: schemas.StateCompressionSubmitModel
     ) -> list[schemas.Su2EquivariantCompilationJobModel]:
         """Post SU(2)-equivariant gate compilation request"""
-        response = self._post(endpoint=API_ACTIONS["hemistich"], json=data.model_dump())
+        response = self._post(endpoint=API_ACTIONS["compression"], json=data.model_dump())
         return schemas.Su2EquivariantCompilationJobModel.parse_items(response.json())
 
     def pretraining(self, data: schemas.PretrainingSubmitModel) -> schemas.PretrainingJobModel:
@@ -600,7 +600,7 @@ class ApiClient:
     def api_postprocess(
         self,
         counts: Dict[str, Union[int, float]],
-        problem: "QUBO",
+        problem: Union["OptimizationProblem", "QUBO"],
         postprocess_iterations: int = 5,
         use_fast_eval: bool = True,
         seed: Optional[int] = None,
@@ -613,7 +613,7 @@ class ApiClient:
         Args:
             counts: Dictionary mapping bitstrings to their measurement counts.
                    Bitstrings must be in Qiskit's little-endian convention (rightmost bit = qubit 0).
-            problem: The QUBO problem instance.
+            problem: An ``OptimizationProblem`` or deprecated ``QUBO``.
             postprocess_iterations: Maximum number of optimization passes. Defaults to 5.
             use_fast_eval: Enable fast evaluation. Defaults to True.
             seed: Random seed for reproducible results. Defaults to None.
@@ -630,17 +630,21 @@ class ApiClient:
             HTTPException: If the API request fails.
         """
 
-        # Create request payload
-        # Note: params is a dict for API compatibility
-        # Validation happens in quantum_haiqu.py using PostprocessParams
+        from .optimization.problem import serialize_optimization_problem, uses_polynomial_wire
+
+        wire = (
+            {"polynomial_problem": serialize_optimization_problem(problem)}
+            if uses_polynomial_wire(problem)
+            else {"lp_problem": problem.to_lp_string()}
+        )
         request_data = schemas.PostprocessRequest(
-            lp_problem=problem.to_lp_string(),
             counts=counts,
             params={
                 "postprocess_iterations": postprocess_iterations,
                 "use_fast_eval": use_fast_eval,
                 "seed": seed,
             },
+            **wire,
         )
 
         # Make API request

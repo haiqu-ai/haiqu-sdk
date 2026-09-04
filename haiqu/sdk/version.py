@@ -1,6 +1,6 @@
 """Version helpers for the Haiqu SDK package."""
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 
 def get_version() -> str:

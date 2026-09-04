@@ -9,11 +9,12 @@ from typing import Dict, Callable, Union, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .qubo import QUBO
+    from qiskit_addon_opt_mapper.problems import OptimizationProblem
 
 
 def cvar_expectation(
     counts: Dict[str, Union[int, float]],
-    problem: "QUBO" = None,
+    problem: Union["OptimizationProblem", "QUBO", None] = None,
     alpha: float = 1.0,
     cost_function: Optional[Callable[[str], float]] = None,
 ) -> float:
@@ -25,7 +26,8 @@ def cvar_expectation(
     Args:
         counts: Dictionary mapping bitstrings to counts/probabilities.
                 Bitstrings in Qiskit convention (little-endian).
-        problem: The QUBO problem instance. Required if cost_function is not provided.
+        problem: Unconstrained binary ``OptimizationProblem`` or deprecated ``QUBO``.
+                 Required if cost_function is not provided.
         alpha: CVaR parameter (``0 < alpha <= 1``). Defaults to 1.0 (full expectation).
         cost_function: Custom cost function. If None, uses problem.cost().
                       Required if problem is not provided.
@@ -40,9 +42,9 @@ def cvar_expectation(
         Bitstrings use Qiskit convention: rightmost bit = qubit 0.
 
     Examples:
-        Using a QUBO problem:
+        Using an OptimizationProblem:
 
-        >>> cvar = cvar_expectation(counts, problem=my_qubo, alpha=0.1)
+        >>> cvar = cvar_expectation(counts, problem=problem, alpha=0.1)
 
         Using a custom cost function:
 
@@ -55,8 +57,8 @@ def cvar_expectation(
         raise ValueError(
             "Either 'problem' or 'cost_function' must be provided to evaluate costs.\n\n"
             "Examples:\n"
-            "  # Using a QUBO problem:\n"
-            "  cvar = cvar_expectation(counts, problem=my_qubo)\n\n"
+            "  # Using an OptimizationProblem:\n"
+            "  cvar = cvar_expectation(counts, problem=problem)\n\n"
             "  # Using a custom cost function:\n"
             "  def cost_fn(bitstring):\n"
             "      return sum(int(b) for b in bitstring)\n"
@@ -65,11 +67,15 @@ def cvar_expectation(
 
     # Set up cost function
     if cost_function is None:
+        from .problem import _objective_sense, evaluate_problem_cost
+
+        sense = _objective_sense(problem)
 
         def cost_func(bs: str) -> float:
-            return problem.cost(bs)
+            return evaluate_problem_cost(problem, bs)
 
     else:
+        sense = "min"
         cost_func = cost_function
 
     if alpha == 1.0:
@@ -77,24 +83,25 @@ def cvar_expectation(
         for bitstring, prob in counts.items():
             total += cost_func(bitstring) * prob
         return total
-    else:
-        nshots = sum(counts.values())
-        cost_distribution = []
-        for bitstring, prob in counts.items():
-            cost = cost_func(bitstring)
-            cost_distribution.append([cost, prob])
 
-        sorted_costs = sorted(cost_distribution, key=lambda x: x[0])
-        cvar = 0.0
-        total_prob = 0.0
+    nshots = sum(counts.values())
+    cost_distribution = []
+    for bitstring, prob in counts.items():
+        cost = cost_func(bitstring)
+        cost_distribution.append([cost, prob])
 
-        for cost, prob in sorted_costs:
-            cvar += cost * prob
-            total_prob += prob
-            if total_prob >= alpha * nshots:
-                return cvar / total_prob
+    reverse = sense == "max"
+    sorted_costs = sorted(cost_distribution, key=lambda x: x[0], reverse=reverse)
+    cvar = 0.0
+    total_prob = 0.0
 
-        return cvar / total_prob if total_prob > 0 else 0.0
+    for cost, prob in sorted_costs:
+        cvar += cost * prob
+        total_prob += prob
+        if total_prob >= alpha * nshots:
+            return cvar / total_prob
+
+    return cvar / total_prob if total_prob > 0 else 0.0
 
 
 __all__ = [

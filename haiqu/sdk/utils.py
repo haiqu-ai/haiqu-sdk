@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import sys
+import warnings
 from typing import Any
 from urllib.parse import urljoin
 
@@ -113,13 +114,11 @@ IBM_FAKE_DEVICES = {
 }
 AWS_DEVICES = [
     "sv1",
-    "lucy",
-    "aspen_m3",
     "aria_1",
     "forte_1",
     "garnet",
     "emerald",
-    "ankaa_3",
+    "cepheus_1",
 ]
 AWS_DEFAULT_REGION = "us-east-1"
 IQM_DEFAULT_SERVER_URL = "https://resonance.iqm.tech"
@@ -620,6 +619,32 @@ def sparse_op_to_tuple(sparse_op: SparsePauliOp) -> tuple[list[str], list[float]
     return paulis, coeffs
 
 
+@typecheck
+def tuple_to_sparse_op(observable: tuple | list) -> SparsePauliOp:
+    """Rebuild a sparse Pauli operator from its serialized term and coefficient lists.
+
+    The inverse of :func:`sparse_op_to_tuple`, for turning the ``observables`` carried on a job
+    model back into the operator the caller submitted.
+
+    Args:
+        observable (tuple | list): A ``(pauli_strings, coefficients)`` pair.
+
+    Returns:
+        SparsePauliOp: The reconstructed operator.
+
+    Raises:
+        ValueError: If the pair is malformed or the two lists have different lengths.
+    """
+    if len(observable) != 2:
+        raise ValueError(f"Expected a (pauli_strings, coefficients) pair, got {len(observable)} elements.")
+
+    paulis, coeffs = observable
+    if len(paulis) != len(coeffs):
+        raise ValueError(f"Got {len(paulis)} Pauli strings but {len(coeffs)} coefficients.")
+
+    return SparsePauliOp(list(paulis), coeffs=list(coeffs))
+
+
 def get_num_parameters_per_circuit(circuits) -> list[int | None]:
     """Return ``num_parameters`` for each circuit in a run/flow submission.
 
@@ -638,6 +663,116 @@ def get_num_parameters_per_circuit(circuits) -> list[int | None]:
         else:
             nums.append(None)
     return nums
+
+
+def get_num_qubits_per_circuit(circuits) -> list[int | None]:
+    """Return the qubit count for each circuit in a run/flow submission.
+
+    ``QuantumCircuit`` inputs use ``circuit.num_qubits``. ``CircuitModel`` inputs use
+    ``analytics.qubits`` when available; otherwise ``None`` (length checks are skipped).
+    """
+    if not isinstance(circuits, list):
+        circuits = [circuits]
+
+    nums: list[int | None] = []
+    for circuit in circuits:
+        if isinstance(circuit, QuantumCircuit):
+            nums.append(circuit.num_qubits)
+        elif getattr(circuit, "analytics", None) is not None and circuit.analytics.qubits is not None:
+            nums.append(circuit.analytics.qubits)
+        else:
+            nums.append(None)
+    return nums
+
+
+def _is_pre_transpiled(circuit) -> bool:
+    """Whether a submitted circuit has already been transpiled to a device.
+
+    A locally transpiled ``QuantumCircuit`` carries a ``layout``; a ``CircuitModel`` returned by
+    ``Haiqu.transpile`` carries a ``transpilation_target`` instead, and its ``analytics.qubits``
+    reports the transpiled width rather than the logical one.
+    """
+    if isinstance(circuit, QuantumCircuit):
+        return getattr(circuit, "layout", None) is not None
+    return getattr(circuit, "transpilation_target", None) is not None
+
+
+def validate_readout_bases(readout_bases, observables, circuits):
+    """Validate ``readout_bases`` for a run submission.
+
+    Checks what can be established client-side: the mutual exclusion with ``observables``, the
+    shape and alphabet of the basis strings, and — only for circuits that are not already
+    transpiled — that each basis covers every qubit. The authoritative width check happens
+    server-side against the circuit's *active* qubits after transpilation and packing, so a
+    pre-transpiled circuit (whose logical width no longer matches its active-qubit count) is
+    deliberately left to the backend rather than rejected here.
+
+    Args:
+        readout_bases: The user-supplied readout bases, or None.
+        observables: The user-supplied observables, or None (used only for mutual exclusion).
+        circuits: The circuits being submitted, used for the width check.
+
+    Returns:
+        list[str] | None: The validated bases, unchanged, or None.
+
+    Raises:
+        ValueError: If the bases are malformed or conflict with ``observables``.
+    """
+    if readout_bases is None:
+        return None
+
+    if observables is not None:
+        raise ValueError(
+            "`observables` and `readout_bases` are mutually exclusive: observables return expectation "
+            "values while readout_bases return one distribution per basis. Pass only one."
+        )
+
+    if isinstance(readout_bases, str) or not isinstance(readout_bases, (list, tuple)):
+        raise ValueError(f"`readout_bases` must be a list of Pauli strings, got {type(readout_bases).__name__}.")
+
+    readout_bases = list(readout_bases)
+    if not readout_bases:
+        raise ValueError("`readout_bases` must not be empty.")
+
+    if any(not isinstance(basis, str) for basis in readout_bases):
+        if all(isinstance(basis, (list, tuple)) for basis in readout_bases):
+            raise ValueError(
+                "Per-circuit readout bases are not supported: `readout_bases` is a flat list of Pauli "
+                "strings applied to every circuit. Submit a separate job for each circuit."
+            )
+        raise ValueError("`readout_bases` must be a list of Pauli strings.")
+
+    invalid = sorted({char for basis in readout_bases for char in basis} - set("XYZ"))
+    if invalid:
+        hint = " Use 'Z' for an unrotated qubit." if "I" in invalid else ""
+        raise ValueError(f"`readout_bases` may only contain 'X', 'Y' or 'Z', got invalid characters {invalid}.{hint}")
+
+    duplicates = sorted({basis for basis in readout_bases if readout_bases.count(basis) > 1})
+    if duplicates:
+        raise ValueError(
+            f"`readout_bases` must not contain duplicates, got {duplicates}. Results are keyed by basis, "
+            "so a repeated basis is ambiguous."
+        )
+
+    widths = {len(basis) for basis in readout_bases}
+    if len(widths) > 1:
+        raise ValueError(
+            f"All `readout_bases` must have the same length (one character per qubit), got lengths {sorted(widths)}."
+        )
+
+    basis_width = widths.pop()
+    circuits_list = circuits if isinstance(circuits, list) else [circuits]
+    for index, (circuit, num_qubits) in enumerate(zip(circuits_list, get_num_qubits_per_circuit(circuits))):
+        if _is_pre_transpiled(circuit):
+            # Already transpiled: the basis must match the active qubits, which the backend knows.
+            continue
+        if num_qubits is not None and basis_width != num_qubits:
+            raise ValueError(
+                f"`readout_bases` entries have {basis_width} characters but circuit {index} has "
+                f"{num_qubits} qubits. Each basis needs exactly one Pauli character per qubit."
+            )
+
+    return readout_bases
 
 
 _PARAMETER_BINDING_ORDER_MSG = (
@@ -1164,3 +1299,61 @@ def setup_logger(logger_name: str, log_level: int = logging.INFO) -> logging.Log
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     return logger
+
+
+def validate_error_mitigation_options(options: dict, use_mitigation: bool) -> None:
+    """Validate the optional ``error_mitigation_options`` entry of an ``options`` dict.
+
+    Shared by ``Haiqu.run`` and ``Haiqu.variational_optimization`` so both expose the same
+    granular error-mitigation controls. Only the key names and value types are validated here;
+    the per-component default values are applied server-side (and differ between the run and
+    variational pipelines), so this function is intentionally default-agnostic.
+
+    Args:
+        options (dict): The user-provided options dict (may or may not contain
+            ``error_mitigation_options``).
+        use_mitigation (bool): Whether mitigation is enabled for this job. Used only to warn when
+            mitigation options are supplied but would have no effect.
+
+    Raises:
+        ValueError: If ``error_mitigation_options`` is not a dict, contains unknown keys, or has a
+            value of the wrong type for a known key.
+    """
+    if "error_mitigation_options" not in options:
+        return
+
+    emo = options["error_mitigation_options"]
+    if not isinstance(emo, dict):
+        raise ValueError("`error_mitigation_options` in `options` must be a dictionary.")
+    dict_type_keys = {"readout_mitigation_options"}
+    bool_type_keys = {
+        "dynamical_decoupling",
+        "readout_mitigation",
+        "noise_tailoring",
+        "advanced_mitigation",
+    }
+    valid_emo_keys = dict_type_keys | bool_type_keys
+    unknown_keys = set(emo.keys()) - valid_emo_keys
+    if unknown_keys:
+        raise ValueError(f"Unknown key(s) in `error_mitigation_options`: {unknown_keys}. " f"Valid keys are: {valid_emo_keys}.")
+    for key, val in emo.items():
+        if key in dict_type_keys:
+            if not isinstance(val, dict):
+                raise ValueError(f"{key} must be a `dict`. Got {type(val).__name__!r} for key '{key}'.")
+        elif key in bool_type_keys:
+            if not isinstance(val, bool):
+                raise ValueError(f"{key} must be a `bool`. Got {type(val).__name__!r} for key '{key}'.")
+    if not use_mitigation:
+        warnings.warn(
+            "`error_mitigation_options` provided but `use_mitigation=False`. "
+            "Mitigation options will have no effect unless `use_mitigation=True`.",
+            UserWarning,
+            stacklevel=3,
+        )
+    if not emo.get("readout_mitigation", False) and emo.get("readout_mitigation_options", None):
+        warnings.warn(
+            "`readout_mitigation_options` provided but `readout_mitigation=False`. "
+            "Readout mitigation options will have no effect unless `readout_mitigation=True`.",
+            UserWarning,
+            stacklevel=3,
+        )
