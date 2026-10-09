@@ -1,7 +1,9 @@
 """Layers that make up a hybrid program.
 
 A program is an ordered list of layers describing how your circuits are processed
-and run. It starts with an :class:`InputLayer` and ends with a :class:`DeviceLayer`.
+and run. It starts with an :class:`InputLayer` and ends with the layer that produces
+its results: a :class:`DeviceLayer` to run on a backend, or a
+:class:`StatevectorLayer` to simulate exactly instead.
 
 Use :class:`EstimatorLayer` or :class:`DistributionMitigationLayer` for grouped
 error mitigation, or compose finer processing steps by hand. For advanced
@@ -11,7 +13,7 @@ mitigation in manual pipelines, pick the layer for the mitigation path:
 """
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class InputLayer(BaseModel):
@@ -21,11 +23,10 @@ class InputLayer(BaseModel):
 
 
 class DeviceLayer(BaseModel):
-    """Runs the circuits on a backend; every program ends with one.
+    """Runs the circuits on a backend.
 
-    ``device_id`` selects the backend; ``options`` carries backend-specific
-    settings (e.g. credentials). For real IBM QPUs, pass
-    ``options={"use_fractional_gates": True}`` to use fractional gates
+    ``device_id`` selects the backend; ``options`` carries backend-specific settings.
+    For real IBM QPUs, pass ``options={"use_fractional_gates": True}`` to use fractional gates
     (continuous-angle ``rx`` / ``rzz``, etc.). Outside hybrid programs, set the
     same flag on :meth:`~haiqu.sdk.quantum_haiqu.Haiqu.get_device` instead.
     """
@@ -34,6 +35,30 @@ class DeviceLayer(BaseModel):
 
     device_id: Annotated[str, Field(max_length=200)]
     options: dict = {}
+    auto_quality: bool = False
+
+
+class StatevectorLayer(BaseModel):
+    """Simulate the circuits exactly and return their statevectors.
+
+    An alternative ending to a program: use this instead of a
+    :class:`DeviceLayer` when you want the exact state rather than measurement
+    results. There is no device and no sampling, so the job's ``shots`` is not
+    used and the result carries no shot noise.
+
+    The job returns one complex-valued statevector per input circuit, each of
+    length ``2 ** num_qubits`` in standard Qiskit ordering (rightmost bit =
+    qubit 0). Final measurements in the input circuits are ignored; circuits
+    that measure part-way through have no statevector and are rejected.
+
+    Exact simulation cost doubles with every qubit, so the circuit size is
+    capped; observables and readout bases do not apply, and neither do the
+    mitigation, packing and observable layers -- there is no noise to mitigate
+    and no measurement to interpret. A program with one of those layers is
+    rejected when it is submitted.
+    """
+
+    type: Literal["statevector"] = "statevector"
 
 
 class PackingLayer(BaseModel):
@@ -51,13 +76,32 @@ class PackingLayer(BaseModel):
 class TranspilationLayer(BaseModel):
     """Transpile the circuits for the target backend.
 
-    ``optimization_level`` (0-3) sets the optimization effort; leave it unset for
-    the default.
+    Every field is optional; one left unset is not passed to the transpiler at all, so
+    Qiskit's own default applies.
+
+    Options not listed here are accepted and forwarded to the transpiler as given, so a
+    Qiskit option this layer has not caught up with can still be used. The trade-off is that
+    a misspelled name is forwarded too.
     """
+
+    model_config = ConfigDict(extra="allow")
 
     type: Literal["transpilation"] = "transpilation"
 
+    #: Optimization effort. Unset means the Haiqu default rather than Qiskit's.
     optimization_level: Literal[0, 1, 2, 3] | None = None
+
+    basis_gates: list[str] | None = None
+    coupling_map: list[list[int]] | None = None
+    initial_layout: list[int] | None = None
+    layout_method: Literal["trivial", "dense", "sabre"] | None = None
+    routing_method: Literal["basic", "lookahead", "sabre", "none"] | None = None
+    translation_method: Literal["translator", "synthesis"] | None = None
+    scheduling_method: Literal["alap", "asap"] | None = None
+    approximation_degree: Annotated[float, Field(ge=0.0, le=1.0)] | None = None
+    seed_transpiler: int | None = None
+    dt: float | None = None
+    qubits_initially_zero: bool | None = None
 
 
 # --- Error mitigation --------------------------------------------------------
@@ -176,6 +220,7 @@ Layer = Annotated[
     Union[
         InputLayer,
         DeviceLayer,
+        StatevectorLayer,
         PackingLayer,
         TranspilationLayer,
         EstimatorLayer,

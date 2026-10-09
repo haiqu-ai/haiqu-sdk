@@ -18,13 +18,15 @@ from urllib3.util import Retry
 from . import schemas
 from .constants import REST_API_URI, SDK_VERSION_HEADER
 from .exceptions import InvalidAPIKeyError, CircuitNotFoundError, OutdatedSDKError
-from .utils import HaiquJSONEncoder
+from .utils import HaiquJSONEncoder, dashboard_uri_from_edge_uri
 from .version import get_version
 
 if TYPE_CHECKING:
     from .optimization import OptimizationProblem, QUBO
 
 API_ACTIONS = {
+    "version": "/version",
+    "health_auth": "/health/auth",
     "user": "/user",
     "benchmarks": "/help/benchmarks",
     "list_experiments": "/experiments",
@@ -60,7 +62,6 @@ API_ACTIONS = {
     "data_loading_estimates": "/data_loading_estimates",
     "flow": "/flow",
     "run": "/run",
-    "dry_run": "/dry-run",
     "compression": "/compression",
     "compression_estimates": "/compression_estimates",
     "postprocess": "/postprocess",
@@ -109,23 +110,54 @@ class ApiClient:
         Args:
             api_access_key (str): Haiqu API key, HAIQU_API_KEY.
             rest_api_uri (str): Base URI to REST API service.
-            retry_total (int, optional): Total number of API request retries to allow.
+            retry_total (int, optional): Total number of API request retries to allow. ``0`` disables retries.
         """
         self.api_access_key = api_access_key
         self.rest_api_uri = rest_api_uri
         self.session = requests.Session()
         self.session.headers["Content-Type"] = "application/json"
-        self.session.headers["authorization"] = api_access_key
+        if api_access_key:
+            self.session.headers["authorization"] = api_access_key
         # Send the installed SDK version with every request.
         self.session.headers[SDK_VERSION_HEADER] = get_version()
-        retries = Retry(
-            total=retry_total,
-            backoff_factor=0.5,
-            allowed_methods={"GET", "POST", "PUT"},
-            status_forcelist={502, 503, 504},
-        )
-        self.session.mount("http://", HTTPAdapter(max_retries=retries))
-        self.session.mount("https://", HTTPAdapter(max_retries=retries))
+        if retry_total:
+            retries = Retry(
+                total=retry_total,
+                backoff_factor=0.5,
+                allowed_methods={"GET", "POST", "PUT"},
+                status_forcelist={502, 503, 504},
+            )
+            self.session.mount("http://", HTTPAdapter(max_retries=retries))
+            self.session.mount("https://", HTTPAdapter(max_retries=retries))
+
+    @property
+    def dashboard_uri(self) -> str:
+        """Base URL of the Haiqu Dashboard that belongs to this API service."""
+        return dashboard_uri_from_edge_uri(self.rest_api_uri)
+
+    def get_api_version(self, timeout: Optional[float] = None) -> str:
+        """Get the version of the Haiqu API service. Does not require an API key.
+
+        Args:
+            timeout (float | None): Seconds to wait for the response.
+
+        Returns:
+            str: API service version.
+        """
+        response = self._get(endpoint=API_ACTIONS["version"], timeout=timeout)
+        return response.json()["version"]
+
+    def health_auth(self, timeout: Optional[float] = None) -> str:
+        """Check that the API key is accepted and this SDK version is supported, without logging in.
+
+        Args:
+            timeout (float | None): Seconds to wait for the response.
+
+        Returns:
+            str: Username the API key belongs to.
+        """
+        response = self._get(endpoint=API_ACTIONS["health_auth"], timeout=timeout)
+        return response.json()["username"]
 
     def get_user(self) -> schemas.UserModel:
         """Get Haiqu user's profile, API key perform identification.
@@ -536,26 +568,6 @@ class ApiClient:
         response = self._post(endpoint=API_ACTIONS["run"], json=data.model_dump())
         job = schemas.RunJobModel.model_validate_json(response.text)
         return job
-
-    def dry_run(self, data: schemas.RunSubmitModel) -> schemas.JobInsights:
-        """Post Dry Run request"""
-        response = self._post(endpoint=API_ACTIONS["dry_run"], json=data.model_dump())
-        payload = response.json()
-        if isinstance(payload, dict) and "job" in payload:
-            job_payload = payload["job"]
-        else:
-            # Backward compatibility for older API servers returning RunJobModel directly.
-            # until we update the API server to return JobInsights.
-            job_payload = payload
-            payload = {}
-
-        job = schemas.RunJobModel.model_validate(job_payload)
-        insights_payload = {"job": job}
-        if "metrics" in payload:
-            insights_payload["metrics"] = payload["metrics"]
-        if "data" in payload:
-            insights_payload["data"] = payload["data"]
-        return schemas.JobInsights.model_validate(insights_payload)
 
     def compression(self, data: schemas.StateCompressionSubmitModel) -> list[schemas.StateCompressionJobModel]:
         """Post compression request"""

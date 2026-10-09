@@ -4,6 +4,7 @@ Haiqu SDK: Utilities functions.
 
 import base64
 import hashlib
+import ipaddress
 from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime
@@ -15,7 +16,7 @@ import os
 import sys
 import warnings
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import openqasm3.parser
 import numpy as np
@@ -23,7 +24,7 @@ import pandas as pd
 import requests
 import qiskit.qasm2
 from ._typecheck import typecheck
-from .constants import MAX_SOURCE_FILE_SIZE
+from .constants import DASHBOARD_LOCAL_PORT, DASHBOARD_URI, MAX_SOURCE_FILE_SIZE
 from qiskit import QuantumCircuit, qpy
 import qiskit.circuit
 from qiskit.circuit import Instruction, ParameterExpression
@@ -41,27 +42,36 @@ from qiskit.transpiler import PassManager
 from qiskit.circuit.equivalence_library import SessionEquivalenceLibrary
 from qiskit_aer import AerSimulator
 
-from qiskit_ibm_runtime.api.session import RetrySession
-from qiskit_ibm_runtime.api.rest import Api
 from qiskit_ibm_runtime.fake_provider import (
-    FakeKyiv,  # Eagle
-    FakeSherbrooke,
+    FakeAachen,
+    FakeAlgiers,
+    FakeBerlin,
+    FakeBoston,
     FakeBrisbane,
-    FakeQuebec,
-    FakeKyoto,
-    FakeWashingtonV2,
-    FakeTorino,  # Heron
+    FakeBrussels,
     FakeFez,
-    FakeMarrakesh,
-    FakeAlgiers,  # Falcon
-    FakeMontrealV2,
     FakeGeneva,
+    FakeKingston,
+    FakeKyiv,
+    FakeKyoto,
+    FakeMarrakesh,
+    FakeMiami,
+    FakeMontrealV2,
+    FakePittsburgh,
+    FakeQuebec,
+    FakeSherbrooke,
+    FakeStrasbourg,
+    FakeTorino,
+    FakeWashingtonV2,
 )
 
 from qiskit_algorithms.utils.circuit_key import _circuit_key
 
 MAX_QUBITS = 1024
-QPY_DUMP_VERSION = 13
+
+# QPY format version written by `to_qpy`. Pinned to 16 to opt in to the circuit start table, which will allow parallel loading in
+# the future. Avoiding 17, as it causes Qiskit 2.5.2 to convert int gate params to float.
+QPY_DUMP_VERSION = 16
 
 assert (
     qpy.QPY_COMPATIBILITY_VERSION <= QPY_DUMP_VERSION <= qpy.QPY_VERSION
@@ -81,36 +91,59 @@ class AerSimulatorMoreQubits(AerSimulator):
 
 
 IBM_DEVICES = [
-    "ibm_boston",  # Heron
-    "ibm_marrakesh",
-    "ibm_fez",
-    "ibm_torino",
-    "ibm_kingston",
-    "ibm_pittsburgh",
-    "ibm_sherbrooke",  # Eagle
+    # Eagle r3
     "ibm_brisbane",
+    "ibm_sherbrooke",
+    # Heron r1
+    "ibm_torino",
+    # Heron r2
+    "ibm_fez",
+    "ibm_kingston",
+    "ibm_marrakesh",
+    # Heron r3
+    "ibm_boston",
+    "ibm_pittsburgh",
 ]
 IBM_EU_DEVICES = [
-    "ibm_aachen",  # Heron
-    "ibm_strasbourg",  # Eagle
+    # Eagle r3
     "ibm_brussels",
+    "ibm_strasbourg",
+    # Heron r3
+    "ibm_aachen",
 ]
 IBM_SIMULATORS = {
     "aer_simulator": AerSimulatorMoreQubits,
 }
 IBM_FAKE_DEVICES = {
-    "fake_kyiv": FakeKyiv,
-    "fake_sherbrooke": FakeSherbrooke,
-    "fake_brisbane": FakeBrisbane,
-    "fake_quebec": FakeQuebec,
-    "fake_kyoto": FakeKyoto,
-    "fake_washington": FakeWashingtonV2,
-    "fake_torino": FakeTorino,
-    "fake_fez": FakeFez,
-    "fake_marrakesh": FakeMarrakesh,
-    "fake_algiers": FakeAlgiers,
+    # Falcon r4
     "fake_montreal": FakeMontrealV2,
+    # Falcon r5.11
+    "fake_algiers": FakeAlgiers,
+    # Falcon r8
     "fake_geneva": FakeGeneva,
+    # Eagle r1
+    "fake_washington": FakeWashingtonV2,
+    # Eagle r3
+    "fake_brisbane": FakeBrisbane,
+    "fake_brussels": FakeBrussels,
+    "fake_kyiv": FakeKyiv,
+    "fake_kyoto": FakeKyoto,
+    "fake_quebec": FakeQuebec,
+    "fake_sherbrooke": FakeSherbrooke,
+    "fake_strasbourg": FakeStrasbourg,
+    # Heron r1
+    "fake_torino": FakeTorino,
+    # Heron r2
+    "fake_fez": FakeFez,
+    "fake_kingston": FakeKingston,
+    "fake_marrakesh": FakeMarrakesh,
+    # Heron r3
+    "fake_aachen": FakeAachen,
+    "fake_boston": FakeBoston,
+    "fake_pittsburgh": FakePittsburgh,
+    # Nighthawk r1
+    "fake_berlin": FakeBerlin,
+    "fake_miami": FakeMiami,
 }
 AWS_DEVICES = [
     "sv1",
@@ -559,33 +592,6 @@ def job_name_from_circuits(circuits):
             job_name += "s"
 
     return job_name
-
-
-@typecheck
-def get_ibmq_temporary_token(
-    user_token: str,
-    ibmq_api_url: str = "https://auth.quantum-computing.ibm.com/api",
-) -> dict[str, Any]:
-    """Exchange an IBM Quantum user token for a temporary token payload.
-
-    The IBM Runtime API returns the temporary token under the ``id`` key. This
-    helper normalizes the response by remapping that field to ``token``.
-
-    Args:
-        user_token (str): IBM Quantum API token.
-        ibmq_api_url (str): IBM Quantum authentication API base URL.
-
-    Returns:
-        dict[str, Any]: Authentication response with the temporary token exposed
-        as ``"token"``.
-    """
-
-    ibmq_api = Api(RetrySession(base_url=ibmq_api_url))
-
-    response = ibmq_api.login(user_token)
-    response["token"] = response.pop("id")
-
-    return response
 
 
 @typecheck
@@ -1053,6 +1059,25 @@ def check_circuit_context(ctx: Any) -> QuantumCircuit | None:
         return ctx
 
     return None
+
+
+def dashboard_uri_from_edge_uri(edge_uri: str) -> str:
+    """Return the base URL of the Haiqu Dashboard."""
+
+    parsed = urlparse(edge_uri if "//" in edge_uri else f"//{edge_uri}")
+    host = parsed.hostname or ""
+    try:
+        ipaddress.ip_address(host)
+        is_local = True
+    except ValueError:
+        is_local = host == "localhost"
+
+    if is_local:
+        netloc = f"[{host}]" if ":" in host else host
+        return f"http://{netloc}:{DASHBOARD_LOCAL_PORT}"
+    if host.startswith("api."):
+        return f"{parsed.scheme or 'https'}://dashboard.{host.removeprefix('api.')}"
+    return DASHBOARD_URI
 
 
 def is_jupyter() -> bool:

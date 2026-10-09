@@ -48,6 +48,9 @@ call `.to_gate()` if you need to embed that cloud circuit in a larger Qiskit cir
 
 ## Quick reference
 
+- Connection or login problems: `haiqu.health_check()` prints a report on whether the Haiqu API can be
+  reached, and also checks the API key and SDK version when a key is passed or `HAIQU_API_KEY` is set.
+  It does not log in, and returns `None`.
 - All `device_id` values, including `"aer_simulator"`, dispatch to the Haiqu cloud; there is no
   local execution path.
 - `haiqu.run(...).result()` returns measurement probability distributions (`dict[str, float]`;
@@ -91,7 +94,7 @@ call `.to_gate()` if you need to embed that cloud circuit in a larger Qiskit cir
   reversed-order convention: rightmost character = qubit 0. Projector terms must use
   `(term_string, coefficient)` pairs; `SparsePauliOp` cannot represent `0`/`1`.
 - Job/circuit model classes are not re-exported at package level; import them from the schemas
-  module for type annotations: `from haiqu.sdk.schemas import RunJobModel, CircuitModel`.
+  module for type annotations: `from haiqu.sdk.schemas import HybridJobModel, CircuitModel`.
 - Combinatorial optimization: the public problem type is
   `qiskit_addon_opt_mapper.problems.OptimizationProblem`. Pass it to
   `haiqu.build_lr_qaoa_circuit`, optionally `haiqu.state_compression`, then

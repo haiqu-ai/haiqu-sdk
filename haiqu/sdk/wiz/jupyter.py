@@ -22,6 +22,7 @@ except ImportError:
     print("Jupyter required! Called function intended to work in Notebook/Lab environment.")
 
 from haiqu.sdk import schemas
+from haiqu.sdk.constants import DASHBOARD_EXPERIMENT_PATH
 from haiqu.sdk.wiz.job_graph import draw_run_job  # noqa: F401
 
 
@@ -788,7 +789,9 @@ def list_experiments(items: list[schemas.ExperimentModel]):
     </tr>"""
     for item in items:
         html_str += f"""<tr>
-            <td style="width: 100px;text-align:left;!important" nowrap>{item.name}</td>
+            <td style="width: 100px;text-align:left;!important" nowrap>
+                <a href="{item.dashboard_url}" target="_blank">{item.name}</a>
+            </td>
             <td style="width: 100px;text-align:left!important" nowrap>{item.id}</td>
             <td style="width: 100px;text-align:left!important" nowrap>{item.creation_date.strftime(DATE_TIME_FORMAT)}</td>
             <td style="width: 100px;text-align:left!important" nowrap>
@@ -815,7 +818,9 @@ def list_circuits(items: list[schemas.CircuitModel], title: str = "CIRCUITS"):
     for item in items:
         jobs_count = len(item.job_ids) if item.job_ids is not None else 0
         html_str += f"""<tr>
-            <td style="width: 100px;text-align:left;!important" nowrap>{item.name}</td>
+            <td style="width: 100px;text-align:left;!important" nowrap>
+                <a href="{item.dashboard_url}" target="_blank">{item.name}</a>
+            </td>
             <td style="width: 100px;text-align:left!important" nowrap>{item.id}</td>
             <td style="width: 100px;text-align:left!important" nowrap>{item.creation_date.strftime(DATE_TIME_FORMAT)}</td>
             <td style="width: 100px;text-align:left!important" nowrap>{item.description or ""}</td>
@@ -842,7 +847,9 @@ def list_transpiled_circuits(items: list[schemas.CircuitModel], title: str = "TR
         transpilation_options = item.transpilation_options or {}
         transpilation_str = ", ".join([f"{k}: {v}" for k, v in transpilation_options.items()])
         html_str += f"""<tr>
-            <td style="width: 100px;text-align:left;!important" nowrap>{item.name}</td>
+            <td style="width: 100px;text-align:left;!important" nowrap>
+                <a href="{item.dashboard_url}" target="_blank">{item.name}</a>
+            </td>
             <td style="width: 100px;text-align:left!important" nowrap>{item.id}</td>
             <td style="width: 100px;text-align:left!important" nowrap>{item.creation_date.strftime(DATE_TIME_FORMAT)}</td>
             <td style="width: 100px;text-align:left!important" nowrap>{transpilation_str}</td>
@@ -926,7 +933,7 @@ def list_jobs(items: list[schemas.BaseJobModel]):
     for item in items:
         name_column = f"""<span style="font-size:.625rem">{item.id}</span>
             <br />
-            {item.name or item.experiment.name}
+            <a href="{item.dashboard_url}" target="_blank">{item.name or item.experiment.name}</a>
             <br />
             <span style="font-size:.625rem">{item.description or _format_job_parameters(item) or "No description"}</span>
         """
@@ -1121,6 +1128,14 @@ def job_progress_widget(title: str, data: str):
     display(HTML(render_template(title, html_str)), clear=True)
 
 
+def dashboard_links(urls: list[str]):
+    """
+    Display links to submitted jobs on the Dashboard.
+    """
+    html_str = "<br />".join(f'View job on Dashboard: <a href="{url}" target="_blank">{url}</a>' for url in urls)
+    display(HTML(html_str))
+
+
 def safe_format_float(val, format="%.6f"):
     """Format metric if float with given precision."""
     if isinstance(val, float):
@@ -1187,7 +1202,12 @@ def loggable_widget(
         button.description = " Done. Artifact is available on the Dashboard."
         dashboard_link.clear_output()
         dashboard_link.append_stdout("Click here to view logged artifact on dashboard:\n")
-        dashboard_link.append_stdout(f"https://dashboard.haiqu.ai/experiment/{circuit.experiment_id}/")
+        dashboard_link.append_stdout(
+            schemas._dashboard_url(
+                circuit._client,
+                DASHBOARD_EXPERIMENT_PATH.format(experiment_id=circuit.experiment_id),
+            )
+        )
 
     text_widget.observe(data_ready, names="value")
 

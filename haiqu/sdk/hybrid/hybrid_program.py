@@ -7,11 +7,15 @@ from .layers import (
     InputLayer,
     Layer,
     ReadoutBasisLayer,
+    StatevectorLayer,
 )
 
 # Grouped mitigation variants are mutually exclusive: a program is either an
 # observable-based (estimator) or distribution-based mitigation path, never both.
 _GROUPED_MITIGATION = (EstimatorLayer, DistributionMitigationLayer)
+
+# A layer that produces the program's results, and so ends it. A program has exactly one.
+_TERMINAL = (DeviceLayer, StatevectorLayer)
 
 
 class HybridProgram(BaseModel):
@@ -36,10 +40,10 @@ class HybridProgram(BaseModel):
             raise ValueError("First layer must be InputLayer")
         elif any(isinstance(layer, InputLayer) for layer in layers[1:-1]):
             raise ValueError("Only one InputLayer is allowed")
-        elif not isinstance(layers[-1], DeviceLayer):
-            raise ValueError("Last layer must be DeviceLayer")
-        elif any(isinstance(layer, DeviceLayer) for layer in layers[1:-1]):
-            raise ValueError("Only one DeviceLayer is allowed")
+        elif not isinstance(layers[-1], _TERMINAL):
+            raise ValueError("Last layer must be DeviceLayer or StatevectorLayer")
+        elif any(isinstance(layer, _TERMINAL) for layer in layers[1:-1]):
+            raise ValueError("Only one DeviceLayer or StatevectorLayer is allowed")
 
         grouped = [layer for layer in layers if isinstance(layer, _GROUPED_MITIGATION)]
         if len(grouped) > 1:

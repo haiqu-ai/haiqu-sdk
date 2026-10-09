@@ -8,13 +8,18 @@ REST_API_URI = "https://api.haiqu.ai/"
 
 SDK_VERSION_HEADER = "haiqu-sdk-version"
 
+# The URI of the Haiqu Dashboard. This is used to generate links to experiments, jobs, and circuits.
+DASHBOARD_URI = "https://dashboard.haiqu.ai"
+DASHBOARD_LOCAL_PORT = 8080
 
-DASHBOARD_EXPERIMENT_SCHEMA = "https://dashboard.haiqu.ai/experiment/{experiment_id}"
+DASHBOARD_EXPERIMENT_PATH = "/experiment/{experiment_id}"
+DASHBOARD_JOB_PATH = "/jobs/{job_id}"
+DASHBOARD_CIRCUIT_PATH = "/circuits/{circuit_id}"
 
 # Maximum soft time limit (seconds) accepted for data-loading jobs.
 MAX_DATA_LOADING_TIME = 900  # 15 min
 # Maximum soft time limit (seconds) accepted for state-compression jobs.
-MAX_COMPRESSION_TIME = 1200  # 20 min
+MAX_COMPRESSION_TIME = 3600  # 1 hour
 
 # Maximum size (bytes) of notebook/script source logged.
 MAX_SOURCE_FILE_SIZE = 5_000_000  # 5 MB
@@ -41,6 +46,9 @@ MAX_DL_FINE_TUNING_ITERATIONS = 500
 MAX_DL_EME_DENSITY = 8
 # Maximum bond dimension accepted by MPS loading.
 MAX_DL_MPS_BOND_DIMENSION = 64
+# Maximum per-layer bond dimension for circuit synthesis. The disentangling gates are
+# ceil(log2(bond_dim)) + 1 qubits wide, so this caps them at 5 qubits.
+MAX_DL_BOND_DIM_LAYER = 16
 # Smallest accepted width (interval_end - interval_start) for interval-based loaders
 # (distribution and function loading).
 MIN_DL_INTERVAL_WIDTH = 1e-8
@@ -72,3 +80,11 @@ class CompressionFineTuning(str, enum.Enum):
     DISABLED = "disabled"
     LOW = "low"
     HEAVY = "heavy"
+
+
+class Verbosity(enum.IntEnum):
+    """How much the SDK displays besides the values its methods return."""
+
+    LOW = 0
+    NORMAL = 1
+    HIGH = 2

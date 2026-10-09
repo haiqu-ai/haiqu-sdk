@@ -7,6 +7,7 @@ import enum
 from datetime import datetime
 from functools import cached_property
 import time
+import warnings
 from typing import Annotated, Any, Dict, Iterable, Literal, Optional, Union, List, Tuple, cast
 import json
 import numpy as np
@@ -19,9 +20,14 @@ from . import gates
 from . import errors
 from . import exceptions
 from .constants import (
+    DASHBOARD_CIRCUIT_PATH,
+    DASHBOARD_EXPERIMENT_PATH,
+    DASHBOARD_JOB_PATH,
+    DASHBOARD_URI,
     MAX_COMPRESSION_QUBITS,
     MAX_COMPRESSION_TIME,
     MAX_DATA_LOADING_TIME,
+    MAX_DL_BOND_DIM_LAYER,
     MAX_DL_EME_DENSITY,
     MAX_DL_FINE_TUNING_ITERATIONS,
     MAX_DL_LAYERS,
@@ -33,7 +39,7 @@ from .constants import (
     MIN_DL_INTERVAL_WIDTH,
 )
 from .errors import JUPYTER_LAB  # TODO: find better place for this constant
-from .hybrid import HybridProgram
+from .hybrid import HybridProgram, layers as hybrid_layers
 from .utils import from_qpy, setup_logger, tuple_to_sparse_op
 from .qml.compression_options import CompressionOptions
 from .qml.optimizer import NFTOptimizerOptions, OptimizerOptionsUnion
@@ -80,6 +86,11 @@ class ClientMixin:
     def model_post_init(self, *args, **kwargs) -> None:
         super().model_post_init(*args, **kwargs)
         self._client = _current_client.get(None)
+
+
+def _dashboard_url(client, path: str) -> str:
+    """Return the URL of ``path`` on the Haiqu Dashboard that belongs to the client's API service."""
+    return (client.dashboard_uri if client is not None else DASHBOARD_URI) + path
 
 
 class ParseIterableMixin:
@@ -168,7 +179,7 @@ class BaseExperimentModel(BaseModel, ParseIterableMixin):
         return f"Experiment {self.name!r}"
 
 
-class ExperimentModel(BaseExperimentModel):
+class ExperimentModel(ClientMixin, BaseExperimentModel):
     """
     Experiment model.
 
@@ -178,6 +189,11 @@ class ExperimentModel(BaseExperimentModel):
     user_id: int
     user: UserModel
     metrics: Optional[dict] = {}
+
+    @property
+    def dashboard_url(self) -> str:
+        """Link to the experiment on the Haiqu Dashboard."""
+        return _dashboard_url(self._client, DASHBOARD_EXPERIMENT_PATH.format(experiment_id=self.id))
 
 
 class CircuitSubmitModel(BaseModel):
@@ -406,6 +422,16 @@ class CircuitModel(ClientMixin, BaseCircuitModel):
         if name in ("analytics", "evolution") and self.status == CircuitStatus.ERROR:
             raise exceptions.CircuitAnalyticsComputationError("Metrics not available, error during the analytics computation.")
         return super().__getattribute__(name)
+
+    def __repr__(self):
+        if errors.JUPYTER_LAB:
+            return f"{super().__repr__()}\nView on Dashboard: {self.dashboard_url}"
+        return super().__repr__()
+
+    @property
+    def dashboard_url(self) -> str:
+        """Link to the circuit on the Haiqu Dashboard."""
+        return _dashboard_url(self._client, DASHBOARD_CIRCUIT_PATH.format(circuit_id=self.id))
 
     def to_gate(self) -> gates.HaiquCircuitGate:
         """
@@ -957,7 +983,7 @@ the metrics over the circuit) could take some time."""
         return display(HTML(plot_correlation_matrix(self, help=help, tiles_layout=tiles_layout)))
 
     @errors.graceful_api_errors_message
-    def draw(self, style: str = ""):
+    def draw(self, style: str = "", return_artifact: bool = False):
         """Render a quantum circuit the cool way — neon, Japan 80s style.
 
         Args:
@@ -973,8 +999,11 @@ the metrics over the circuit) could take some time."""
                          * "neon": classic yellow neon
                          * "neutral": Haiqu light grey
 
+            return_artifact (bool): Return the figure instead of rendering the circuit.
+
         Returns:
-            matplotlib.figure.Figure: The rendered circuit figure.
+            matplotlib.figure.Figure | None: The circuit figure if `return_artifact`
+                is True, otherwise None.
         """
         from haiqu.sdk.wiz.jupyter import draw_neon_circuit
 
@@ -983,8 +1012,9 @@ the metrics over the circuit) could take some time."""
         else:
             raise ValueError("This circuit cannot be drawn, as it has no QPY.")
 
+        if return_artifact:
+            return circuit.draw(output="mpl", fold=-1, style="bw")
         draw_neon_circuit(circuit=circuit, style=style)
-        return circuit.draw(output="mpl", fold=-1, style="bw")
 
     @errors.graceful_api_errors_message
     def draw_evolution(
@@ -1166,9 +1196,15 @@ class BaseJobModel(ClientMixin, ParseIterableMixin, BaseModel):
         if errors.JUPYTER_LAB:
             return f"""{self.__class__.__name__} {repr(self.name or self.id)}
 Run haiqu.list_jobs() to check its progress and access it by ID as haiqu.get_job("{self.id}").
-Check further progress via: job.progress(), job.result()"""
+Check further progress via: job.progress(), job.result()
+View on Dashboard: {self.dashboard_url}"""
         else:
             return f"{self.__class__.__name__} {repr(self.name or self.id)}"
+
+    @property
+    def dashboard_url(self) -> str:
+        """Link to the job on the Haiqu Dashboard."""
+        return _dashboard_url(self._client, DASHBOARD_JOB_PATH.format(job_id=self.id))
 
     def _progress(self, widget_title: str):
         """
@@ -1279,23 +1315,297 @@ class LocalJobModel(BaseJobModel):
     metrics: Optional[dict] = {}
 
 
+class DataLoadingSynthesisOptions(BaseModel):
+    """Circuit synthesis parameters shared by every compilation method.
+
+    Do not instantiate directly; use :class:`AnalyticalSynthesisOptions`,
+    :class:`BlockwiseSynthesisOptions` or :class:`VariationalSynthesisOptions`.
+
+    Each method accepts a different set of parameters, so passing one method's parameter to
+    another is rejected rather than silently ignored.
+
+    Args:
+        fine_tuning_iterations: Maximum refinement iterations that are run after the circuit is
+            built to improve the produced state. ``0`` skips the refinement. Defaults to 0.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    fine_tuning_iterations: int = Field(default=0, ge=0, le=MAX_DL_FINE_TUNING_ITERATIONS)
+
+    def __init__(self, **data):
+        if type(self) is DataLoadingSynthesisOptions:
+            raise TypeError(
+                "DataLoadingSynthesisOptions cannot be instantiated directly. Use a subclass such as "
+                "AnalyticalSynthesisOptions, BlockwiseSynthesisOptions or VariationalSynthesisOptions."
+            )
+        super().__init__(**data)
+
+
+class AnalyticalSynthesisOptions(DataLoadingSynthesisOptions):
+    """Synthesis options for the analytical compilation method.
+
+    Builds a full disentangling layer at once in closed form, with gates as wide as the bond
+    dimension requires. The cheapest of the three methods and the best fit for smooth,
+    weakly entangled targets.
+
+    Args:
+        num_layers: Number of disentangling layers. More layers raise the fidelity at the cost
+            of a deeper circuit. Defaults to 2.
+        layer_type: Geometry of the disentangler staircase, one of ``"V"``, ``"linear"`` and
+            ``"reverse_linear"``. Defaults to ``"V"``.
+        bond_dim_layer: Bond dimension each layer is truncated to, which sets the width of that
+            layer's gates. ``None`` sets it to the embedding's feature ``density``, and to 2 for a
+            ``density`` below that, so that a layer is always wide enough to absorb one feature.
+            It applies to the ``density`` in use, whether it was requested directly or derived from
+            ``num_qubits``, and only :meth:`~haiqu.sdk.Haiqu.entangled_manifold_embedding` accepts
+            it. Defaults to 2.
+        entanglement_cutoff: Bonds carrying less entanglement than this threshold are left
+            without a gate. Applied from the second layer onward. Defaults to ``1e-6``.
+
+    Example:
+        >>> from haiqu.sdk import AnalyticalSynthesisOptions
+        >>> AnalyticalSynthesisOptions(num_layers=3, entanglement_cutoff=1e-8)
+        >>> # the equivalent dict, which every data loading method also accepts
+        >>> {"method": "analytical", "num_layers": 3, "entanglement_cutoff": 1e-8}
+    """
+
+    method: Literal["analytical"] = "analytical"
+    num_layers: int = Field(default=2, ge=1, le=MAX_DL_LAYERS)
+    layer_type: Literal["linear", "reverse_linear", "V"] = "V"
+    bond_dim_layer: Optional[int] = Field(default=2, ge=1, le=MAX_DL_BOND_DIM_LAYER)
+    entanglement_cutoff: float = Field(default=1e-6, ge=0, le=1)
+
+
+class BlockwiseSynthesisOptions(DataLoadingSynthesisOptions):
+    """Synthesis options for the blockwise compilation method.
+
+    Builds each layer block by block.
+    Uses optimal analytical synthesis for 2-qubit gates, optimal numerical
+    synthesis for 3-qubit gates and variational synthesis for larger gates.
+    Costs more classical time than the analytical method but tends to spend
+    fewer CX gates for the same fidelity.
+
+    Args:
+        num_layers: Number of disentangling layers. More layers raise the fidelity at the cost
+            of a deeper circuit. Defaults to 2.
+        layer_type: Geometry of the disentangler staircase, one of ``"V"``, ``"linear"`` and
+            ``"reverse_linear"``. Defaults to ``"V"``.
+        bond_dim_layer: Bond dimension each layer is truncated to, which sets the width of that
+            layer's gates. ``None`` sets it to the embedding's feature ``density``, and to 2 for a
+            ``density`` below that, so that a layer is always wide enough to absorb one feature.
+            It applies to the ``density`` in use, whether it was requested directly or derived from
+            ``num_qubits``, and only :meth:`~haiqu.sdk.Haiqu.entangled_manifold_embedding` accepts
+            it. Defaults to 2.
+
+    Example:
+        >>> from haiqu.sdk import BlockwiseSynthesisOptions
+        >>> BlockwiseSynthesisOptions(num_layers=2, bond_dim_layer=4)
+        >>> # the equivalent dict, which every data loading method also accepts
+        >>> {"method": "blockwise", "num_layers": 2, "bond_dim_layer": 4}
+    """
+
+    method: Literal["blockwise"] = "blockwise"
+    num_layers: int = Field(default=2, ge=1, le=MAX_DL_LAYERS)
+    layer_type: Literal["linear", "reverse_linear", "V"] = "V"
+    bond_dim_layer: Optional[int] = Field(default=2, ge=1, le=MAX_DL_BOND_DIM_LAYER)
+
+
+class VariationalSynthesisOptions(DataLoadingSynthesisOptions):
+    """Synthesis options for the variational compilation method.
+
+    Performs variational synthesis of the quantum circuit which approximately matches
+    the desired quantum state. Supports usage of a brickwork layer, which produces
+    the shallowest circuits.
+
+    Args:
+        num_layers: Number of disentangling layers. More layers raise the fidelity at the cost
+            of a deeper circuit. Defaults to 2.
+        layer_type: Geometry of the gate layers, one of ``"brickwork"``, ``"V"``, ``"linear"`` and
+            ``"reverse_linear"``. Defaults to ``"brickwork"``.
+        gate_cnots: Number of CX gates in each two-qubit gate. More CX gates make a gate able
+            to represent more entanglement. One of 1, 2 or 3. Defaults to 2.
+        force_complex: Use complex rotations even when the target state is real. A real target
+            is preparable with real rotations alone, which halves the parameter count if not forced.
+            Defaults to ``False``.
+        entanglement_cutoff: Bonds carrying less entanglement than this threshold are left
+            without a gate. Defaults to ``1e-6``.
+
+    Example:
+        >>> from haiqu.sdk import VariationalSynthesisOptions
+        >>> VariationalSynthesisOptions(num_layers=4, gate_cnots=3)
+        >>> # the equivalent dict, which every data loading method also accepts
+        >>> {"method": "variational", "num_layers": 4, "gate_cnots": 3}
+    """
+
+    method: Literal["variational"] = "variational"
+    num_layers: int = Field(default=2, ge=1, le=MAX_DL_LAYERS)
+    layer_type: Literal["linear", "reverse_linear", "V", "brickwork"] = "brickwork"
+    gate_cnots: Literal[1, 2, 3] = 2
+    force_complex: bool = False
+    entanglement_cutoff: float = Field(default=1e-6, ge=0, le=1)
+
+
+DataLoadingSynthesisOptionsUnion = Annotated[
+    Union[AnalyticalSynthesisOptions, BlockwiseSynthesisOptions, VariationalSynthesisOptions],
+    Field(discriminator="method"),
+]
+
+_SYNTHESIS_ADAPTER = TypeAdapter(DataLoadingSynthesisOptionsUnion)
+
+# The parameters the loaders accepted before synthesis options replaced them.
+_LEGACY_SYNTHESIS_PARAMS = ("num_layers", "truncation_cutoff", "fine_tuning_iterations")
+
+# Legacy name -> current name. `truncation_cutoff` was renamed rather than replaced.
+_LEGACY_SYNTHESIS_PARAM_MAP = {
+    "num_layers": "num_layers",
+    "truncation_cutoff": "entanglement_cutoff",
+    "fine_tuning_iterations": "fine_tuning_iterations",
+}
+
+
+def validate_synthesis_options(synthesis_options) -> DataLoadingSynthesisOptions:
+    """Validate user-supplied synthesis options into the model for their method.
+
+    Args:
+        synthesis_options: A ``dict`` or an already-constructed options object. A dict with no
+            ``"method"`` key is read as analytical, which is the method the loaders used before
+            the other two became selectable.
+
+    Returns:
+        DataLoadingSynthesisOptions: The subclass matching the requested method.
+
+    Raises:
+        pydantic.ValidationError: If the method is unknown, a value is out of range, or a key
+            does not belong to the requested method.
+    """
+    if isinstance(synthesis_options, dict) and "method" not in synthesis_options:
+        synthesis_options = {**synthesis_options, "method": "analytical"}
+    return _SYNTHESIS_ADAPTER.validate_python(synthesis_options)
+
+
+def resolve_synthesis_options(
+    synthesis_options,
+    dl_type: DataLoadingType,
+    *,
+    num_layers=None,
+    truncation_cutoff=None,
+    fine_tuning_iterations=None,
+) -> dict:
+    """Resolve a loader's synthesis options into the dict that goes into the job payload.
+
+    The returned dict is complete: every parameter of the chosen method is present, so the
+    backend runs the synthesis without filling anything in.
+
+    Args:
+        synthesis_options: A ``dict``, an options object, or ``None`` for the loader's default.
+        dl_type: Which loader is being called, used to pick that loader's defaults.
+        num_layers: Deprecated. Use ``synthesis_options``.
+        truncation_cutoff: Deprecated. Renamed to ``entanglement_cutoff`` in the options.
+        fine_tuning_iterations: Deprecated. Use ``synthesis_options``.
+
+    Returns:
+        dict: The resolved options.
+
+    Raises:
+        ValueError: If a deprecated parameter is combined with ``synthesis_options``, or if
+            ``bond_dim_layer`` is ``None`` for a loader that has no feature density to take it from.
+        pydantic.ValidationError: If the resulting options are not valid for their method.
+    """
+    legacy = {
+        name: value
+        for name, value in zip(_LEGACY_SYNTHESIS_PARAMS, (num_layers, truncation_cutoff, fine_tuning_iterations))
+        if value is not None
+    }
+
+    if legacy and synthesis_options is not None:
+        raise ValueError(
+            f"synthesis_options cannot be combined with the deprecated {', '.join(sorted(legacy))}. "
+            f"Pass the deprecated values inside synthesis_options instead "
+            f"(truncation_cutoff is now entanglement_cutoff)."
+        )
+
+    if legacy:
+        warnings.warn(
+            f"{', '.join(sorted(legacy))} {'are' if len(legacy) > 1 else 'is'} deprecated; "
+            f"pass synthesis_options instead (truncation_cutoff is now entanglement_cutoff). "
+            f"The legacy parameters will be removed not earlier than in November 1st, 2026.",
+            DeprecationWarning,
+            # resolve -> loader -> graceful_api_errors_message wrapper -> caller
+            stacklevel=4,
+        )
+        # Built from the frozen analytical baseline rather than the loader's current default,
+        # so a deprecated call keeps producing the circuit it has always produced even after
+        # that default moves to another method.
+        baseline = _LEGACY_ANALYTICAL_DEFAULTS[dl_type]
+        updates = {_LEGACY_SYNTHESIS_PARAM_MAP[name]: value for name, value in legacy.items()}
+        return validate_synthesis_options({**baseline.model_dump(), **updates}).model_dump()
+
+    if synthesis_options is None:
+        return _DEFAULT_SYNTHESIS_OPTIONS[dl_type].model_dump()
+
+    resolved = validate_synthesis_options(synthesis_options).model_dump()
+    # Only the embedding has a feature density for the synthesis to match a layer width to;
+    # every other loader has to say how wide its layers are.
+    if resolved.get("bond_dim_layer", 2) is None and dl_type is not DataLoadingType.ENTANGLED_MANIFOLD_EMBEDDING:
+        raise ValueError(
+            f"bond_dim_layer=None sets the layer width to the feature density, which only "
+            f"{DataLoadingType.ENTANGLED_MANIFOLD_EMBEDDING.value} has. {dl_type.value} needs an explicit bond_dim_layer."
+        )
+    return resolved
+
+
+# What each loader synthesizes with when the caller asks for nothing. Distribution loading and
+# the entangled manifold embedding build a single layer and never refine it; the rest build two
+# and refine.
+_DEFAULT_SYNTHESIS_OPTIONS: Dict[DataLoadingType, DataLoadingSynthesisOptions] = {
+    DataLoadingType.DISTRIBUTION_LOADING: AnalyticalSynthesisOptions(num_layers=1, fine_tuning_iterations=0),
+    DataLoadingType.MULTIVARIATE_DISTRIBUTION_LOADING: AnalyticalSynthesisOptions(num_layers=2, fine_tuning_iterations=20),
+    DataLoadingType.VECTOR_LOADING: AnalyticalSynthesisOptions(num_layers=2, fine_tuning_iterations=20),
+    DataLoadingType.BLOCK_VECTOR_LOADING: AnalyticalSynthesisOptions(num_layers=2, fine_tuning_iterations=20),
+    # A feature occupies a bond of size `density`, so the embedding's layers have to be wide
+    # enough to absorb one. `None` is the width that equals the `density` in use, which a call
+    # deriving its `density` from `num_qubits` cannot name up front.
+    DataLoadingType.ENTANGLED_MANIFOLD_EMBEDDING: AnalyticalSynthesisOptions(
+        num_layers=1, bond_dim_layer=None, fine_tuning_iterations=0
+    ),
+    DataLoadingType.MPS_LOADING: AnalyticalSynthesisOptions(num_layers=2, fine_tuning_iterations=20),
+    DataLoadingType.FUNCTION_LOADING: AnalyticalSynthesisOptions(num_layers=2, fine_tuning_iterations=20),
+    DataLoadingType.FOURIER_LOADING: AnalyticalSynthesisOptions(num_layers=2, fine_tuning_iterations=20),
+}
+
+# What the deprecated num_layers / truncation_cutoff / fine_tuning_iterations resolve against.
+# Frozen: it records the synthesis the loaders performed before the compilation method became
+# selectable, so a deprecated call keeps producing the circuit it always has. Spelled out
+# rather than derived from the table above, which is free to change.
+_LEGACY_ANALYTICAL_DEFAULTS: Dict[DataLoadingType, AnalyticalSynthesisOptions] = {
+    DataLoadingType.DISTRIBUTION_LOADING: AnalyticalSynthesisOptions(num_layers=1, fine_tuning_iterations=0),
+    DataLoadingType.MULTIVARIATE_DISTRIBUTION_LOADING: AnalyticalSynthesisOptions(num_layers=1, fine_tuning_iterations=20),
+    DataLoadingType.VECTOR_LOADING: AnalyticalSynthesisOptions(num_layers=2, fine_tuning_iterations=20),
+    DataLoadingType.BLOCK_VECTOR_LOADING: AnalyticalSynthesisOptions(num_layers=2, fine_tuning_iterations=20),
+    DataLoadingType.ENTANGLED_MANIFOLD_EMBEDDING: AnalyticalSynthesisOptions(num_layers=2, fine_tuning_iterations=20),
+    DataLoadingType.MPS_LOADING: AnalyticalSynthesisOptions(num_layers=2, fine_tuning_iterations=20),
+    DataLoadingType.FUNCTION_LOADING: AnalyticalSynthesisOptions(num_layers=2, fine_tuning_iterations=20),
+    DataLoadingType.FOURIER_LOADING: AnalyticalSynthesisOptions(num_layers=2, fine_tuning_iterations=20),
+}
+
+
 class _DataLoadingParams(BaseModel):
     """Shared user-facing limits present in every data-loading circuit.
 
     Fields are optional: these models bound values, not presence, so a missing key is left to the
-    backend.
+    backend. The synthesis parameters are bounded by the options model for their method rather
+    than here, since which parameters are even legal depends on the method.
     """
 
     model_config = ConfigDict(extra="ignore")
 
-    num_layers: Optional[int] = Field(default=None, ge=1, le=MAX_DL_LAYERS)
-    truncation_cutoff: Optional[float] = Field(default=None, ge=0, le=1)
+    synthesis_options: Optional[DataLoadingSynthesisOptionsUnion] = None
 
 
-class _FineTunedLoadingParams(_DataLoadingParams):
-    """Loaders that run a post-layer fine-tuning stage under a time budget."""
+class _TimeLimitedLoadingParams(_DataLoadingParams):
+    """Loaders that accept a wall-clock budget for the synthesis."""
 
-    fine_tuning_iterations: Optional[int] = Field(default=None, ge=0, le=MAX_DL_FINE_TUNING_ITERATIONS)
     max_time: Optional[float] = Field(default=None, ge=0, le=MAX_DATA_LOADING_TIME)
 
 
@@ -1316,7 +1626,7 @@ class _IntervalLoadingParams(_DataLoadingParams):
         return self
 
 
-class DistributionLoadingParams(_IntervalLoadingParams):
+class DistributionLoadingParams(_IntervalLoadingParams, _TimeLimitedLoadingParams):
     """User-facing limits for distribution loading."""
 
     loc: Optional[float] = None
@@ -1325,7 +1635,7 @@ class DistributionLoadingParams(_IntervalLoadingParams):
     encoding: Literal["probability", "amplitude"] = "probability"
 
 
-class MultivariateDistributionLoadingParams(_FineTunedLoadingParams):
+class MultivariateDistributionLoadingParams(_TimeLimitedLoadingParams):
     """User-facing limits for multivariate distribution loading.
 
     Only the scalar limits shared with the other loaders are enforced here. The dimension count,
@@ -1339,15 +1649,15 @@ class MultivariateDistributionLoadingParams(_FineTunedLoadingParams):
     encoding: Literal["probability", "amplitude"] = "probability"
 
 
-class FunctionLoadingParams(_IntervalLoadingParams, _FineTunedLoadingParams):
+class FunctionLoadingParams(_IntervalLoadingParams, _TimeLimitedLoadingParams):
     """User-facing limits for function loading."""
 
 
-class VectorLoadingParams(_FineTunedLoadingParams):
+class VectorLoadingParams(_TimeLimitedLoadingParams):
     """User-facing limits for vector loading (length is checked client-side)."""
 
 
-class BlockVectorLoadingParams(_FineTunedLoadingParams):
+class BlockVectorLoadingParams(_TimeLimitedLoadingParams):
     """User-facing limits for block vector loading (block splitting is validated on the backend)."""
 
     # An int is an exact count of overlapping indices; a float is a fraction of a block, so its range is [0, 1).
@@ -1361,20 +1671,20 @@ class BlockVectorLoadingParams(_FineTunedLoadingParams):
         return value
 
 
-class EntangledManifoldEmbeddingParams(_FineTunedLoadingParams):
+class EntangledManifoldEmbeddingParams(_TimeLimitedLoadingParams):
     """User-facing limits for entangled manifold embedding."""
 
     density: Optional[int] = Field(default=None, ge=1, le=MAX_DL_EME_DENSITY)
 
 
-class MpsLoadingParams(_FineTunedLoadingParams):
+class MpsLoadingParams(_TimeLimitedLoadingParams):
     """User-facing limits for MPS loading (the MPS itself is validated on the backend)."""
 
     # Every permutation of the left/physical/right tensor axes.
     shape: Optional[Literal["lpr", "lrp", "plr", "prl", "rlp", "rpl"]] = None
 
 
-class FourierLoadingParams(_FineTunedLoadingParams):
+class FourierLoadingParams(_TimeLimitedLoadingParams):
     """User-facing limits for fourier loading.
 
     num_qubits and min_freqs are per-dimension and long_range is a plain flag; all three are validated
@@ -1437,8 +1747,10 @@ class DataLoadingSubmitModel(BaseModel):
         validated = params_model.model_validate(self.parameters)
 
         # Write validated values back so the payload carries the declared types (an int `num_layers`,
-        # a float rather than a numpy scalar). Only supplied keys are touched: an omitted parameter
-        # must not pick up a model default.
+        # a float rather than a numpy scalar). Only supplied top-level keys are touched: an omitted
+        # parameter must not pick up a model default. A nested model such as `synthesis_options` is
+        # written back whole, its own defaults filled in, so a caller building this payload directly
+        # should pass complete nested dicts.
         coerced = validated.model_dump()
         for key in self.parameters:
             if key in coerced:
@@ -1582,6 +1894,12 @@ class HybridSubmitModel(BaseModel):
     dry_run: bool = False
 
 
+def _to_statevector(state) -> np.ndarray:
+    """Rebuild one statevector from the two real halves it travels as."""
+    real, imaginary = state
+    return np.array(real) + 1.0j * np.array(imaginary)
+
+
 class HybridJobModel(BaseJobModel):
     """
     Hybrid Job (running on Haiqu backend).
@@ -1626,9 +1944,24 @@ class HybridJobModel(BaseJobModel):
 
         Returns:
             list: Results of the job unless interrupted or failed.
+
+            A program ending in a :class:`~haiqu.sdk.hybrid.layers.StatevectorLayer`
+            returns complex-valued statevectors (numpy arrays), each of length
+            ``2 ** num_qubits`` in standard Qiskit ordering (rightmost bit = qubit 0):
+            one per input circuit, or a 2D list ``[circuit][parameter]`` when the job
+            sweeps parameters.
         """
         super().result()
+
+        if self.quantum_results is not None and self._is_statevector_program():
+            if self.parameters is None:
+                return [_to_statevector(state) for state in self.quantum_results]
+            return [[_to_statevector(state) for state in circuit] for circuit in self.quantum_results]
         return self.quantum_results
+
+    def _is_statevector_program(self) -> bool:
+        """Whether the program ends in exact simulation, which returns amplitudes."""
+        return any(isinstance(layer, hybrid_layers.StatevectorLayer) for layer in self.program.layers)
 
     @property
     def estimated_qpu_cost(self) -> Optional[dict]:
@@ -1675,14 +2008,16 @@ class HybridJobModel(BaseJobModel):
     def pre_device_pipeline_time(self) -> Optional[float]:
         """
         Wall-clock seconds to run hybrid program layers up to (but not including)
-        the device layer.
+        the layer that produces the results -- the device layer, or the statevector
+        layer where the program simulates exactly.
 
         Covers classical work in those layers, such as transpilation, mitigation
         ordering, and observable processing. Populated for both full runs and
         ``dry_run=True`` jobs.
 
         Returns:
-            float or None: Pre-device hybrid pipeline duration in seconds.
+            float or None: Duration in seconds of the hybrid pipeline preceding
+            that layer.
 
         Warning:
             This property blocks the current CPU thread until the job reaches a
@@ -1697,7 +2032,12 @@ class HybridJobModel(BaseJobModel):
 
 
 class RunSubmitModel(BaseModel):
-    """Run submit payload data model."""
+    """Run submit payload data model.
+
+    :meth:`Haiqu.run` no longer builds this: it submits a :class:`HybridProgram` instead. It is
+    the request that the deprecated ``haiqu.legacy.run`` sends, as :meth:`Haiqu.run` did before
+    it returned a :class:`HybridJobModel`.
+    """
 
     experiment_id: str
     circuit_ids: Optional[list] = []
@@ -1977,14 +2317,6 @@ class RunJobModel(BaseJobModel):
 
         with open(path, "w") as f:
             json.dump(data, f)
-
-
-class JobInsights(BaseModel):
-    """Dry-run insights payload."""
-
-    job: RunJobModel
-    metrics: BaseModel | dict[str, Any] | None = None
-    data: BaseModel | dict[str, Any] | None = None
 
 
 class LocalJobSubmitModel(BaseModel):
@@ -3042,15 +3374,18 @@ class PretrainingJobModel(BaseJobModel):
 
 
 class QECReferenceModel(BaseModel):
-    authors: list[str]
-    title: str
-    year: int
+    key: str | None = None
+    title: str | None = None
     doi: str | None = None
-    annotation: str | None = None
+    arxiv: str | None = None
+    url: str | None = None
+    note: str | None = None
 
 
 class QECCodeModel(BaseModel):
     """Pydantic model for the QEC Code Library API responses."""
+
+    model_config = ConfigDict(from_attributes=True)
 
     slug: str
     name: str
@@ -3067,9 +3402,6 @@ class QECCodeModel(BaseModel):
     layout_svg_url: str | None = None
     qecx_url: str | None = None
     references: list[QECReferenceModel] | None = None
-
-    class Config:
-        from_attributes = True
 
 
 class QECCodeListResponseModel(BaseModel):

@@ -8,6 +8,7 @@ import json
 import os
 import copy
 import configparser
+import textwrap
 import warnings
 from typing import Any, Optional, Union
 from collections.abc import Sequence
@@ -46,9 +47,11 @@ from requests.exceptions import HTTPError
 
 from . import constants
 from . import errors
+from . import health
 from .api_client import ApiClient
 from .backpropagation import backpropagation
-from .hybrid import HybridProgram, layers
+from .hybrid import HybridProgram, layers, program_from_run_options
+from .legacy import Legacy
 from .qml.compression_options import CompressionOptions
 from .qml.problem import NonlinearVariationalProblem, VariationalProblem
 from .utils import find_shared_parameters
@@ -66,6 +69,7 @@ from .version import get_version
 from .schemas import (
     JOB_MODELS,
     ArtifactModel,
+    BaseJobModel,
     validate_observables_map,
     PretrainingJobModel,
     PretrainingSubmitModel,
@@ -80,9 +84,6 @@ from .schemas import (
     LocalJobSubmitModel,
     HybridSubmitModel,
     HybridJobModel,
-    RunSubmitModel,
-    RunJobModel,
-    JobInsights,
     CircuitModel,
     CircuitSubmitModel,
     ExperimentSubmitModel,
@@ -90,12 +91,14 @@ from .schemas import (
     DataLoadingJobModel,
     DataLoadingSubmitModel,
     DataLoadingEstimatesModel,
+    DataLoadingSynthesisOptions,
+    _DEFAULT_SYNTHESIS_OPTIONS,
+    resolve_synthesis_options,
     DeviceModel,
     SubmitMetricsModel,
     SubmitTranspilationModel,
     SubmitObservableBackpropagationModel,
     DataLoadingType,
-    RunJobType,
     CompressionJobType,
     PretrainingJobType,
     UserModel,
@@ -138,8 +141,6 @@ from .constants import (
     MAX_COMPRESSION_TIME,
     MAX_DATA_LOADING_TIME,
     MAX_DL_EME_DENSITY,
-    MAX_DL_FINE_TUNING_ITERATIONS,
-    MAX_DL_LAYERS,
     MAX_DL_MPS_BOND_DIMENSION,
     MAX_DL_QUBITS,
     MAX_DL_VECTOR_LENGTH,
@@ -147,6 +148,7 @@ from .constants import (
     MIN_COMPRESSION_APPROXIMATION_LEVEL,
     MIN_DL_INTERVAL_WIDTH,
     SUPPORTED_MULTIVARIATE_DIMENSIONS,
+    Verbosity,
 )
 
 __all__ = ["haiqu", "Haiqu"]
@@ -162,6 +164,7 @@ Or export OS environment variable `HAIQU_API_KEY` in the shell as follows:
 
 export HAIQU_API_KEY="..."
 """
+HEALTH_CHECK_HINT = 'To diagnose the problem, run: haiqu.health_check(api_access_key="...")'
 
 
 def format_docstring(**kwargs):
@@ -255,6 +258,64 @@ def _loss_is_nft_compatible(problem: Union[VariationalProblem, NonlinearVariatio
         return False
 
 
+def _device_not_found(device_id: str) -> ValueError:
+    """The error for a device the list of devices does not have."""
+    return ValueError(
+        f"The device `{device_id}` not found in the list of devices. "
+        "Please check input or use `haiqu.list_devices()` to get available devices "
+        "or `haiqu.list_simulators()` to get available simulators."
+    )
+
+
+# The wall-clock budget means the same thing to every loader, so its description lives here
+# rather than being restated once per method.
+_MAX_TIME_ARG = f"""            max_time (int | float): Soft time limit for the job (in seconds).
+                            The data loading job will first always produce the initial result and then limit the fine-tuning
+                            stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
+                            current result will be returned. Defaults to {MAX_DATA_LOADING_TIME}
+                            ({MAX_DATA_LOADING_TIME // 60} min). Max allowed job time is {MAX_DATA_LOADING_TIME // 60} min.
+                            The job can take more wall clock time than user specified `max_time` due to latency,
+                            initialization overheads or if the initial result already takes more time."""
+
+
+# Renders one synthesis option value the way it would be written in a call to its options class.
+def _render_synthesis_default(value):
+    if isinstance(value, str):
+        return f'"{value}"'
+    # An entanglement cutoff reprs as 1e-06; the shortened exponent reads better in the docs.
+    return repr(value).replace("e-0", "e-")
+
+
+# Interpolated into every loader's Args block, so that a parameter shared by all of them is
+# described in exactly one place. The defaults are read back from the table the loaders actually
+# resolve against, so the two cannot drift apart.
+def _synthesis_options_arg(dl_type):
+    options = _DEFAULT_SYNTHESIS_OPTIONS[dl_type]
+    fields = options.model_dump()
+    # The rendered call is prefixed with the options class name, which already names the method.
+    fields.pop("method", None)
+    # Parameters every method shares are the ones declared on the base class. They read better
+    # after the parameters specific to this method.
+    shared = [name for name in DataLoadingSynthesisOptions.model_fields if name in fields]
+    ordered = [name for name in fields if name not in shared] + shared
+    rendered = {name: _render_synthesis_default(fields[name]) for name in ordered}
+    arguments = ", ".join(f"{name}={value}" for name, value in rendered.items())
+    defaults = f"{type(options).__name__}({arguments})"
+    indent = " " * 38
+    # Wrapped as the finished docstring lines, backticks included, so every line lands
+    # inside the project's line length rather than only the first.
+    wrapped = textwrap.fill(defaults, width=124, initial_indent=indent + "``", subsequent_indent=indent)
+    return f"""            synthesis_options (dict | DataLoadingSynthesisOptions): How the circuit
+                                      preparing the data is synthesized. Pass one of
+                                      :class:`~haiqu.sdk.AnalyticalSynthesisOptions`,
+                                      :class:`~haiqu.sdk.BlockwiseSynthesisOptions` or
+                                      :class:`~haiqu.sdk.VariationalSynthesisOptions`, or an equivalent dict whose
+                                      ``"method"`` key names one of them. Those three classes document every option
+                                      each method accepts, what it means and what it defaults to.
+                                      Defaults to ``None``, which this method unwraps into
+{wrapped}``."""
+
+
 class Haiqu:
     """
     High-level object to access all capabilities of the Haiqu quantum computing environment.
@@ -267,11 +328,46 @@ class Haiqu:
         """Haiqu cloud runtime."""
         self._client = None
         self._experiment = None
+        # IBM Quantum (token, instance) pairs that IBM Quantum has accepted in this session
+        self._verified_ibm_credentials: set[tuple[str, str | None]] = set()
 
         # shorthand to omit additional import in user code
         self.JobType = JobType
+        self.Verbosity = Verbosity
 
         self.version = get_version()
+        self._verbosity = Verbosity.NORMAL
+
+        self.legacy = Legacy(self)
+
+    @property
+    def verbosity(self) -> Verbosity:
+        """How much is displayed besides the values that methods return.
+
+        Set it to ``"low"``, ``"normal"`` or ``"high"`` (any case), or to a ``Verbosity`` member:
+
+        * ``"low"``: of the status messages that methods return, only those of :meth:`login` and :meth:`init` include a
+          link to the Dashboard.
+        * ``"normal"`` (default): the messages returned by :meth:`log` and :meth:`update_experiment` include one too.
+        * ``"high"``: in a notebook, each method that submits a job also displays a link to the job on the Dashboard.
+
+        Examples:
+            >>> haiqu.verbosity = "high"
+            >>> haiqu.verbosity
+            <Verbosity.HIGH: 2>
+        """
+        return self._verbosity
+
+    @verbosity.setter
+    def verbosity(self, level: Verbosity | str) -> None:
+        if isinstance(level, Verbosity):
+            self._verbosity = level
+            return
+        try:
+            self._verbosity = Verbosity[level.upper()]
+        except (AttributeError, KeyError):
+            allowed = ", ".join(repr(v.name.lower()) for v in Verbosity)
+            raise ValueError(f"Unknown verbosity {level!r}; use one of {allowed}.") from None
 
     def login(
         self,
@@ -291,11 +387,11 @@ class Haiqu:
             raise_on_error (bool): By default, human-friendly messages are returned. Set this to raise exceptions instead.
 
         Returns:
-            str: Status message.
+            str: Status message, URL of the Dashboard.
 
         Examples:
             >>> haiqu.login(api_access_key="HAIQU123")
-            'Success: Welcome to the Quantum World, example@haiqu.ai!'
+            'Success: Welcome to the Quantum World, example@haiqu.ai! The Dashboard: https://dashboard.haiqu.ai'
         """
         api_access_key = api_access_key or os.environ.get("HAIQU_API_KEY")
         edge_uri = edge_uri or os.environ.get("HAIQU_EDGE_URI", constants.REST_API_URI)
@@ -314,7 +410,7 @@ class Haiqu:
             self._client = None
             return res
 
-        return f"Success: Welcome to the Quantum World, {res.username}!"
+        return f"Success: Welcome to the Quantum World, {res.username}! The Dashboard: {self._client.dashboard_uri}"
 
     def user(self, raise_on_error: bool = False) -> UserModel | str | None:
         """Get the logged in user.
@@ -339,12 +435,40 @@ class Haiqu:
         except InvalidAPIKeyError as e:
             if raise_on_error:
                 raise e
-            return error_widget_or_string(LOGIN_ERROR_MESSAGE)
+            return error_widget_or_string(f"{LOGIN_ERROR_MESSAGE}\n{HEALTH_CHECK_HINT}")
         except Exception as e:
             if raise_on_error:
                 raise e
-            return error_widget_or_string(str(e))
+            return error_widget_or_string(f"{e}\n\n{HEALTH_CHECK_HINT}")
         return user
+
+    def health_check(self, api_access_key: str | None = None, edge_uri: str | None = None) -> None:
+        """Check the connection to the Haiqu cloud environment and print a report.
+
+        Args:
+            api_access_key (str | None): The token to access the Haiqu API. Optional in the Haiqu Lab environment. Defaults to
+                                         ``None``, in which case the value will be taken from the ``HAIQU_API_KEY`` environment
+                                         variable.
+            edge_uri (str | None): The network location of the Haiqu API service. Defaults to ``None``, in which case the value
+                                   is taken from the ``HAIQU_EDGE_URI`` environment variable if set, and otherwise from the
+                                   default production endpoint.
+
+        Examples:
+            >>> haiqu.health_check()
+            Haiqu health check: https://api.haiqu.ai/
+              [OK]    environment     haiqu-sdk 1.7.0, Python 3.12.4, macOS-15.6
+              [OK]    api_reachable   Haiqu API 1.6.0 responded in 512 ms
+              [SKIP]  authentication  Pass api_access_key to also check your API key or set the HAIQU_API_KEY environment variable
+
+            >>> haiqu.health_check(api_access_key="HAIQU123")
+            Haiqu health check: https://api.haiqu.ai/
+              [OK]    environment     haiqu-sdk 1.7.0, Python 3.12.4, macOS-15.6
+              [OK]    api_reachable   Haiqu API 1.6.0 responded in 498 ms
+              [OK]    authentication  API key accepted for example@haiqu.ai
+        """
+        api_access_key = api_access_key or os.environ.get("HAIQU_API_KEY")
+        edge_uri = edge_uri or os.environ.get("HAIQU_EDGE_URI", constants.REST_API_URI)
+        print(health.run_health_check(api_access_key=api_access_key, edge_uri=edge_uri))
 
     @errors.graceful_api_errors_message
     def init(
@@ -376,7 +500,7 @@ class Haiqu:
 
         Examples:
             >>> haiqu.init("Example Experiment", "The experiment to use for all examples.")
-            'Set current experiment to: Example Experiment. View on Dashboard: https://dashboard.haiqu.ai/experiments/...'
+            'Set current experiment to: Example Experiment. View on Dashboard: https://dashboard.haiqu.ai/experiment/...'
 
             Shared experiment can be set by its ID:
 
@@ -387,10 +511,7 @@ class Haiqu:
             >>> haiqu.init("Example Experiment", log_source_code=True)
         """
         self._init(experiment_ctx, experiment_description, log_source_code=log_source_code)
-        return (
-            f"Set current experiment to: {self._experiment.name}. "
-            f"View on Dashboard: {constants.DASHBOARD_EXPERIMENT_SCHEMA.format(experiment_id=self._experiment.id)}"
-        )
+        return f"Set current experiment to: {self._experiment.name}. View on Dashboard: {self._experiment.dashboard_url}"
 
     @errors.graceful_api_errors_message
     def update_experiment(self, name: str | None = None, description: str | None = None) -> str:
@@ -412,7 +533,8 @@ class Haiqu:
                 experiment report on the Dashboard. If None, the current description is kept.
 
         Returns:
-            str: Status message.
+            str: Status message, URL to view the experiment on the dashboard. The URL is left out when
+                ``haiqu.verbosity`` is ``"low"``.
 
         Raises:
             ValueError: If no experiment is set, or if both ``name`` and ``description`` are None.
@@ -426,7 +548,7 @@ class Haiqu:
             ...         "<ul><li>Best approximation ratio: 0.93 at p = 3</li></ul>"
             ...     )
             ... )
-            'Updated current experiment: Example Experiment'
+            'Updated current experiment: Example Experiment. View on Dashboard: https://dashboard.haiqu.ai/experiment/...'
 
             Rename and re-describe in one call:
 
@@ -448,7 +570,7 @@ class Haiqu:
                 description=description,
             ),
         )
-        return f"Updated current experiment: {self._experiment.name}"
+        return self._with_experiment_link(f"Updated current experiment: {self._experiment.name}.")
 
     @errors.graceful_api_errors_message
     def log(
@@ -471,7 +593,8 @@ class Haiqu:
             description: An optional description if logging a circuit.
 
         Returns:
-            str | CircuitModel: Status message, circuit metadata.
+            str | CircuitModel: Status message, circuit metadata. A message about data logged to the experiment
+                includes a link to the experiment on the Dashboard, unless ``haiqu.verbosity`` is ``"low"``.
 
         Examples:
             If used without parameters, ``haiqu.log()`` displays the nice widget
@@ -545,10 +668,7 @@ class Haiqu:
             # Log objects the W&B way
             # haiqu.log({"some_value": 12.34, ...})
             self._log_experiment_metrics(**parent_ctx)
-            return (
-                f"Logged objects to the experiment {self._experiment.name!r}. "
-                f"View on Dashboard: {constants.DASHBOARD_EXPERIMENT_SCHEMA.format(experiment_id=self._experiment.id)}"
-            )
+            return self._with_experiment_link(f"Logged objects to the experiment {self._experiment.name!r}.")
 
         if isinstance(parent_ctx, CircuitModel):
             # Circuit metadata object is the parent context
@@ -587,10 +707,7 @@ class Haiqu:
         # Anything else is logged as experiment artifact/metric
         name = name or generate_artifact_name(parent_ctx, child_ctx)
         self._log_experiment_metrics(**{name: parent_ctx})
-        return (
-            f"Logged object to the experiment {self._experiment.name!r}. "
-            f"View on Dashboard: {constants.DASHBOARD_EXPERIMENT_SCHEMA.format(experiment_id=self._experiment.id)}"
-        )
+        return self._with_experiment_link(f"Logged object to the experiment {self._experiment.name!r}.")
 
     @errors.graceful_api_errors_message
     def compare_metrics(
@@ -649,16 +766,9 @@ class Haiqu:
             >>> haiqu.transpile(circuit, device)
             >>> haiqu.run(circuit, device=device)
         """
-        try:
-            device = self._client.get_device(device_id=device_id)
-        except HTTPError as e:
-            if e.response is not None and e.response.status_code == 404:
-                raise ValueError(
-                    f"The device `{device_id}` not found in the list of devices. "
-                    "Please check input or use `haiqu.list_devices()` to get available devices"
-                    "or `haiqu.list_simulators()` to get available simulators."
-                ) from None
-            raise e
+        device = self._find_device(device_id)
+        if device is None:
+            raise _device_not_found(device_id)
         if use_fractional_gates and (
             device.simulator
             or device.vendor != "IBM"
@@ -671,6 +781,15 @@ class Haiqu:
             )
         # Copy so the client-only flag does not mutate a shared/catalog instance.
         return device.model_copy(update={"use_fractional_gates": use_fractional_gates})
+
+    def _find_device(self, device_id: str) -> DeviceModel | None:
+        """The device from the list of devices, or ``None`` when the list does not have it."""
+        try:
+            return self._client.get_device(device_id=device_id)
+        except HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                return None
+            raise
 
     @errors.graceful_api_errors_message
     def transpile(
@@ -741,10 +860,12 @@ class Haiqu:
         transpilation_options = TranspilationOptions.model_validate(transpilation_options)
 
         self._check_experiment()
-        logged_circuits = self._prepare_circuits(circuits)
+        circuits = self._normalize_circuits(circuits)
 
         if not isinstance(device, DeviceModel):
             raise ValueError("The device must be a DeviceModel instance as returned by haiqu.get_device().")
+
+        logged_circuits = self._log_circuits(circuits)
 
         submit_data = SubmitTranspilationModel(
             experiment_id=self._experiment.id,
@@ -887,9 +1008,9 @@ class Haiqu:
 
             >>> circuits = haiqu.list_circuits(job_type=haiqu.JobType.COMPRESSION, widget=False)
 
-            Get the circuits for run job type:
+            Get the circuits for execution job type (``run`` and ``flow`` both produce these):
 
-            >>> circuits = haiqu.list_circuits(job_type=haiqu.JobType.RUN, widget=False)
+            >>> circuits = haiqu.list_circuits(job_type=haiqu.JobType.HYBRID, widget=False)
 
             Filter circuits by their IDs:
 
@@ -1020,11 +1141,18 @@ class Haiqu:
         The jobs are filtered by experiment ID (with the current experiment used if not specified) and job type, and limited to
         only the most recent few (10 by default). Jobs can also be optionally filtered by circuit.
 
+        **Warning:** Filtering by ``JobType.RUN`` no longer returns jobs submitted with ``haiqu.run()``, ``haiqu.dry_run()``
+        and ``haiqu.statevector_run()`` - these now execute as hybrid programs, so the jobs they create are typed
+        ``JobType.HYBRID``. Job type ``JobType.RUN`` still matches jobs submitted by older SDK versions.
+
         Args:
             experiment_id (str | None): Return jobs for the provided experiment ID. If ``None``, return jobs for the
                                         current experiment.
             job_type (JobType | None): Filter jobs by type. Only jobs of the provided type will be returned.
-                                       If ``None``, jobs of all types will be returned.
+                                       If ``None``, jobs of all types will be returned. Use
+                                       ``JobType.HYBRID`` for jobs from :meth:`run`, :meth:`dry_run`,
+                                       :meth:`statevector_run` and :meth:`flow`; ``JobType.RUN`` matches
+                                       only jobs submitted by older SDK versions (see the warning above).
             circuit (CircuitModel | str | None): If not ``None``, only show the jobs related to the given circuit (as a
                                                  ``CircuitModel`` or circuit ID).
             limit (int): Limit the number of returned jobs.
@@ -1042,7 +1170,7 @@ class Haiqu:
             Get Python list of the most recent jobs for the current experiment:
 
             >>> jobs = haiqu.list_jobs(widget=False)
-            [RunJobModel 'Run job ABC',
+            [HybridJobModel 'Run job ABC',
              TranspilationJobModel 'Transpilation of 2 circuit(s) to device fake_torino',
              StateCompressionJobModel 'State Compression of Circuit-123',
              ...
@@ -1062,15 +1190,17 @@ class Haiqu:
             ...     widget=False
             ... )
 
-            Get the most recent run job(s) for a specific circuit for a specific experiment:
+            Get the most recent execution job(s) for a specific circuit for a specific experiment.
+            Jobs submitted with :meth:`run`, :meth:`dry_run`, :meth:`statevector_run` and :meth:`flow`
+            are all of type ``HYBRID``; ``JobType.RUN`` now selects only jobs from older SDK versions:
 
             >>> haiqu.list_jobs(
             ...     experiment_id="exp-12345678-1234-5678-1234-567812345678",
-            ...     job_type=haiqu.JobType.RUN,
+            ...     job_type=haiqu.JobType.HYBRID,
             ...     circuit="circ-abcdefab-cdef-abcd-efab-cdefabcdefab",
             ...     widget=False,
             ... )
-            [RunJobModel 'Run job 12345678-abcd-efab-1234-5678abcdefab'
+            [HybridJobModel 'Run job 12345678-abcd-efab-1234-5678abcdefab'
              ...
             ]
         """
@@ -1166,6 +1296,7 @@ class Haiqu:
         Examples:
             >>> haiqu.get_circuit(circuit_id)
             Haiqu Circuit 'circuit-123'
+            View on Dashboard: https://dashboard.haiqu.ai/circuits/...
         """
         try:
             circuit_metadata = self._client.get_circuit(circuit_id=circuit_id)
@@ -1191,6 +1322,7 @@ class Haiqu:
             Run haiqu.list_jobs() to check its progress and access it by ID as
             haiqu.get_job("jb-abcdefab-cdef-abcd-efab-cdefabcdefab").
             Check further progress via: job.progress(), job.result()
+            View on Dashboard: https://dashboard.haiqu.ai/jobs/jb-abcdefab-cdef-abcd-efab-cdefabcdefab
         """
         try:
             job = self._client.get_job(job_id=job_id)
@@ -1209,8 +1341,8 @@ class Haiqu:
         loc,
         scale,
         encoding,
-        num_layers,
-        truncation_cutoff,
+        synthesis_options,
+        max_time,
         name,
         shape,
     ):
@@ -1224,12 +1356,20 @@ class Haiqu:
             "loc": loc,
             "scale": scale,
             "encoding": encoding,
-            "num_layers": num_layers,
-            "truncation_cutoff": truncation_cutoff,
+            "synthesis_options": synthesis_options,
+            "max_time": max_time,
         }
         parameters.update(shape)
 
         return name, parameters
+
+    _DEPRECATED_SYNTHESIS_ARGS = """            num_layers (int): Deprecated. Pass ``num_layers`` inside ``synthesis_options``.
+            truncation_cutoff (Real): Deprecated. Renamed to ``entanglement_cutoff`` inside ``synthesis_options``."""
+
+    _DEPRECATED_FINE_TUNING_ARG = (
+        """            fine_tuning_iterations (int): Deprecated. """
+        """Pass ``fine_tuning_iterations`` inside ``synthesis_options`` instead."""
+    )
 
     _AMPLITUDE_INDEXING_NOTE = """
         .. note::
@@ -1336,11 +1476,9 @@ class Haiqu:
             encoding (str): How function values map to amplitudes. ``"probability"`` (default): amplitudes are proportional to
                             ``sqrt(f(x))``, so measurement probabilities are proportional to ``f(x)``. ``"amplitude"``:
                             amplitudes are proportional to ``f(x)``.
-            num_layers (int): The number of layers in the generated circuit (from 1 to {MAX_DL_LAYERS} layers).
-                              More layers can improve the quality of the output
-                              distribution at the cost of a deeper circuit. Defaults to 1.
-            truncation_cutoff (Real): The entanglement cutoff for later layers, from 0 to 1. Increasing this threshold may result
-                                      in a smaller (but more approximate) circuit. Defaults to ``1e-6``.
+{_synthesis_options_arg(DataLoadingType.DISTRIBUTION_LOADING)}
+{_DEPRECATED_SYNTHESIS_ARGS}
+{_MAX_TIME_ARG}
             name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be automatically
                                generated.
             job_description (str | None): The description for the job.
@@ -1365,8 +1503,10 @@ class Haiqu:
         loc: Real = 0,
         scale: Real = 1,
         encoding: str = "probability",
-        num_layers: int = 1,
-        truncation_cutoff: Real = 1e-6,
+        synthesis_options: dict | DataLoadingSynthesisOptions | None = None,
+        num_layers: int | None = None,
+        truncation_cutoff: Real | None = None,
+        max_time: int | float = MAX_DATA_LOADING_TIME,
         name: str | None = None,
         job_description: str | None = None,
         **shape,
@@ -1377,7 +1517,7 @@ class Haiqu:
         the Haiqu cloud. The result of this job is a circuit which can be used to supply the PDF to a quantum algorithm for
         processing. The cost and time of this job can be estimated with :meth:`distribution_loading_estimates`.
 
-        The complexity of the generated circuit can be controlled by the ``num_layers`` and ``truncation_cutoff`` parameters.
+        The complexity of the generated circuit is controlled by ``synthesis_options``.
         {AMP_INDEXING}
         {DISCRETIZATION}
         Args:{ARGS}
@@ -1387,6 +1527,8 @@ class Haiqu:
                 probability distribution on ``num_qubits`` qubits. ``job.quality`` is the achieved state fidelity vs. the ideal
                 target distribution; ``job.info`` exposes loader metadata (``fidelity``).
                 Run ``help(job.result)`` for the full description of result and ``info`` contents.
+                In a notebook, a link to the job on the Dashboard is also displayed when
+                ``haiqu.verbosity`` is ``"high"``.
 
         Examples:
             >>> num_qubits = 4
@@ -1415,6 +1557,12 @@ class Haiqu:
                  └────────────────────────────────────────────────────────────┘
         """
         self._check_experiment()
+        synthesis_options = resolve_synthesis_options(
+            synthesis_options,
+            DataLoadingType.DISTRIBUTION_LOADING,
+            num_layers=num_layers,
+            truncation_cutoff=truncation_cutoff,
+        )
         name, parameters = self._prepare_distribution_loading_params(
             num_qubits,
             distribution_name,
@@ -1423,8 +1571,8 @@ class Haiqu:
             loc,
             scale,
             encoding,
-            num_layers,
-            truncation_cutoff,
+            synthesis_options,
+            max_time,
             name,
             shape,
         )
@@ -1432,7 +1580,7 @@ class Haiqu:
         # TODO: Add check for the required credits, use data_loading_estimates()
         # TODO: If user has less credits balance - inform the User and don't start a job.
 
-        return self._client.data_loading(
+        job = self._client.data_loading(
             data=DataLoadingSubmitModel(
                 dl_type=DataLoadingType.DISTRIBUTION_LOADING.value,
                 name=name,
@@ -1443,6 +1591,8 @@ class Haiqu:
                 parameters=parameters,
             )
         )
+        self._display_dashboard_links(job)
+        return job
 
     @staticmethod
     def _prepare_multivariate_distribution_loading_params(
@@ -1450,9 +1600,7 @@ class Haiqu:
         distribution_name,
         interval,
         encoding,
-        num_layers,
-        truncation_cutoff,
-        fine_tuning_iterations,
+        synthesis_options,
         distribution_params,
         copula_params,
         marginal_distribution_names,
@@ -1547,9 +1695,7 @@ class Haiqu:
             "num_qubits": num_qubits,
             "interval": interval,
             "encoding": encoding,
-            "num_layers": num_layers,
-            "truncation_cutoff": truncation_cutoff,
-            "fine_tuning_iterations": fine_tuning_iterations,
+            "synthesis_options": synthesis_options,
             "max_time": max_time,
         }
         if distribution_params is not None:
@@ -1586,12 +1732,9 @@ class Haiqu:
             encoding (str): How the pdf maps to amplitudes. ``"probability"`` (default): amplitudes are proportional to
                             ``sqrt(pdf)``, so measurement probabilities are proportional to the pdf. ``"amplitude"``:
                             amplitudes are proportional to the pdf.
-            num_layers (int): The number of layers in the generated circuit (from 1 to {MAX_DL_LAYERS} layers). More layers can
-                              improve the quality of the output distribution at the cost of a deeper circuit. Defaults to 1.
-            truncation_cutoff (Real): The entanglement cutoff for later layers, from 0 to 1. Increasing this threshold may result
-                                      in a smaller (but more approximate) circuit. Defaults to ``1e-6``.
-            fine_tuning_iterations (int): The number of the gradient-based fine-tuning iterations applied after analytical
-                                          compilation. Defaults to 20, maximal is {MAX_DL_FINE_TUNING_ITERATIONS}.
+{_synthesis_options_arg(DataLoadingType.MULTIVARIATE_DISTRIBUTION_LOADING)}
+{_DEPRECATED_SYNTHESIS_ARGS}
+{_DEPRECATED_FINE_TUNING_ARG}
             distribution_params (dict | None): Keyword arguments of a direct multivariate distribution (e.g.
                                                ``{{"nu": 2.0, "rho": 0.5}}`` for ``bivariate_gamma``). Only valid for direct
                                                multivariate distributions.
@@ -1602,9 +1745,7 @@ class Haiqu:
                 distribution names used as copula marginals, e.g. ``["norm", "gamma"]``. Only valid for copulas.
             marginal_distribution_params (Sequence[dict] | None): Dictionaries of ``scipy.stats`` marginal parameters, in the
                                                                   same order as ``marginal_distribution_names``.
-            max_time (int | float): Soft time limit for the job (in seconds). The job will first always produce the initial
-                                    result and then limit the fine-tuning stage by the remaining time left.
-                                    Defaults to {MAX_DATA_LOADING_TIME} ({MAX_DATA_LOADING_TIME // 60} min).
+{_MAX_TIME_ARG}
             name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be
                                automatically generated.
             job_description (str | None): The description for the job.
@@ -1618,9 +1759,10 @@ class Haiqu:
         distribution_name: str,
         interval: Sequence = (0, 1),
         encoding: str = "probability",
-        num_layers: int = 1,
-        truncation_cutoff: Real = 1e-6,
-        fine_tuning_iterations: int = 20,
+        synthesis_options: dict | DataLoadingSynthesisOptions | None = None,
+        num_layers: int | None = None,
+        truncation_cutoff: Real | None = None,
+        fine_tuning_iterations: int | None = None,
         distribution_params: dict | None = None,
         copula_params: dict | None = None,
         marginal_distribution_names: Sequence[str] | None = None,
@@ -1648,6 +1790,8 @@ class Haiqu:
             DataLoadingJobModel: The Data Loading job that will generate the circuit for the joint PDF.
                 Call ``job.result()`` to retrieve a Qiskit-compatible gate (``HaiquCircuitGate``) that prepares the requested
                 distribution. ``job.quality`` is the circuit-to-MPS compilation fidelity.
+                In a notebook, a link to the job on the Dashboard is also displayed when
+                ``haiqu.verbosity`` is ``"high"``.
 
         Examples:
             >>> job = haiqu.multivariate_distribution_loading(
@@ -1670,14 +1814,19 @@ class Haiqu:
             ... )
         """
         self._check_experiment()
+        synthesis_options = resolve_synthesis_options(
+            synthesis_options,
+            DataLoadingType.MULTIVARIATE_DISTRIBUTION_LOADING,
+            num_layers=num_layers,
+            truncation_cutoff=truncation_cutoff,
+            fine_tuning_iterations=fine_tuning_iterations,
+        )
         name, parameters, total_num_qubits = self._prepare_multivariate_distribution_loading_params(
             num_qubits,
             distribution_name,
             interval,
             encoding,
-            num_layers,
-            truncation_cutoff,
-            fine_tuning_iterations,
+            synthesis_options,
             distribution_params,
             copula_params,
             marginal_distribution_names,
@@ -1686,7 +1835,7 @@ class Haiqu:
             name,
         )
 
-        return self._client.data_loading(
+        job = self._client.data_loading(
             data=DataLoadingSubmitModel(
                 dl_type=DataLoadingType.MULTIVARIATE_DISTRIBUTION_LOADING.value,
                 name=name,
@@ -1697,13 +1846,13 @@ class Haiqu:
                 parameters=parameters,
             )
         )
+        self._display_dashboard_links(job)
+        return job
 
     @staticmethod
     def _prepare_vector_loading_params(
         data,
-        num_layers,
-        truncation_cutoff,
-        fine_tuning_iterations,
+        synthesis_options,
         max_time,
         name,
     ):
@@ -1711,9 +1860,7 @@ class Haiqu:
         # limit depends on the materialized array, so it is checked here on the client side.
         parameters = {
             "data": np.array(data),
-            "num_layers": num_layers,
-            "truncation_cutoff": truncation_cutoff,
-            "fine_tuning_iterations": fine_tuning_iterations,
+            "synthesis_options": synthesis_options,
             "max_time": max_time,
         }
 
@@ -1731,21 +1878,10 @@ class Haiqu:
                                      (rightmost bit of ``i`` is qubit 0).
             num_qubits: (int | None): The number of qubits in the generated circuit (from 1 to {MAX_DL_VECTOR_QUBITS} qubits).
                                       If ``None`` (default), it is set automatically from the size of the data.
-            num_layers (int): The number of layers in the generated circuit (from 1 to {MAX_DL_LAYERS} layers).
-                              More layers can improve the quality of the output
-                              vector at the cost of a deeper circuit. Defaults to 2.
-            truncation_cutoff (Real): The entanglement cutoff for later layers, from 0 to 1. Increasing this threshold may result
-                                      in a smaller (but more approximate) circuit. Defaults to ``1e-6``.
-            fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
-                                          Increasing this limit may improve the quality of the circuit by using more classical
-                                          resources. Defaults to 20, maximal is {MAX_DL_FINE_TUNING_ITERATIONS}.
-            max_time (int | float): Soft time limit for the job (in seconds).
-                            The data loading job will first always produce the initial result and then limit the fine-tuning
-                            stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
-                            current result will be returned. Defaults to {MAX_DATA_LOADING_TIME}
-                            ({MAX_DATA_LOADING_TIME // 60} min). Max allowed job time is {MAX_DATA_LOADING_TIME // 60} min.
-                            The job can take more wall clock time than user specified `max_time` due to latency,
-                            initialization overheads or if the initial result already takes more time.
+{_synthesis_options_arg(DataLoadingType.VECTOR_LOADING)}
+{_DEPRECATED_SYNTHESIS_ARGS}
+{_DEPRECATED_FINE_TUNING_ARG}
+{_MAX_TIME_ARG}
             name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be automatically
                                generated.
     """
@@ -1756,9 +1892,10 @@ class Haiqu:
         self,
         data: Sequence[Number],
         num_qubits: int | None = None,
-        num_layers: int = 2,
-        truncation_cutoff: Real = 1e-6,
-        fine_tuning_iterations: int = 20,
+        synthesis_options: dict | DataLoadingSynthesisOptions | None = None,
+        num_layers: int | None = None,
+        truncation_cutoff: Real | None = None,
+        fine_tuning_iterations: int | None = None,
         max_time: int | float = MAX_DATA_LOADING_TIME,
         name: str | None = None,
         job_description: str | None = None,
@@ -1769,8 +1906,7 @@ class Haiqu:
         circuit which can be used to supply the vector to a quantum algorithm for processing. The cost and time of this job can be
         estimated with :meth:`vector_loading_estimates`.
 
-        The complexity and quality of the generated circuit can be controlled by the ``num_layers``, ``truncation_cutoff``, and
-        ``fine_tuning_iterations`` parameters.
+        The complexity and quality of the generated circuit are controlled by ``synthesis_options``.
 
         If ``len(data) < 2**num_qubits``, the vector will be padded with zeros.
         {AMP_INDEXING}
@@ -1786,10 +1922,20 @@ class Haiqu:
                 vector. ``job.quality`` is the achieved state fidelity vs. the ideal target vector; ``job.info`` exposes loader
                 metadata (``fidelity``).
                 Run ``help(job.result)`` for the full description of result and ``info`` contents.
+                In a notebook, a link to the job on the Dashboard is also displayed when
+                ``haiqu.verbosity`` is ``"high"``.
 
         Examples:
             >>> bell_state = [1, 0, 0, 1]  # normalization is not required
             >>> job = haiqu.vector_loading(data=bell_state, name="Bell state Vector Loading")
+
+            Choose the synthesis method and its options explicitly:
+
+            >>> from haiqu.sdk import BlockwiseSynthesisOptions
+            >>> job = haiqu.vector_loading(
+            ...     data=bell_state,
+            ...     synthesis_options=BlockwiseSynthesisOptions(num_layers=3, fine_tuning_iterations=50),
+            ... )
             >>> vl_gate = job.result()  # vl_gate is a Qiskit-compatible gate
             >>> fidelity = job.quality
             >>> print(f"Bell state was loaded with fidelity {{fidelity:.6f}}")
@@ -1806,11 +1952,16 @@ class Haiqu:
                  └────────────────────────────────────────────────────────────┘
         """
         self._check_experiment()
-        name, parameters = self._prepare_vector_loading_params(
-            data, num_layers, truncation_cutoff, fine_tuning_iterations, max_time, name
+        synthesis_options = resolve_synthesis_options(
+            synthesis_options,
+            DataLoadingType.VECTOR_LOADING,
+            num_layers=num_layers,
+            truncation_cutoff=truncation_cutoff,
+            fine_tuning_iterations=fine_tuning_iterations,
         )
+        name, parameters = self._prepare_vector_loading_params(data, synthesis_options, max_time, name)
 
-        return self._client.data_loading(
+        job = self._client.data_loading(
             data=DataLoadingSubmitModel(
                 dl_type=DataLoadingType.VECTOR_LOADING.value,
                 name=name,
@@ -1820,6 +1971,8 @@ class Haiqu:
                 parameters=parameters,
             )
         )
+        self._display_dashboard_links(job)
+        return job
 
     @staticmethod
     def _prepare_block_vector_loading_params(
@@ -1827,9 +1980,7 @@ class Haiqu:
         num_blocks,
         target_num_qubits,
         overlap,
-        num_layers,
-        truncation_cutoff,
-        fine_tuning_iterations,
+        synthesis_options,
         max_time,
         name,
     ):
@@ -1839,9 +1990,7 @@ class Haiqu:
             "num_blocks": num_blocks,
             "target_num_qubits": target_num_qubits,
             "overlap": overlap,
-            "num_layers": num_layers,
-            "truncation_cutoff": truncation_cutoff,
-            "fine_tuning_iterations": fine_tuning_iterations,
+            "synthesis_options": synthesis_options,
             "max_time": max_time,
         }
 
@@ -1866,21 +2015,10 @@ class Haiqu:
                                           An integer indicates the exact number of overlapping indices between consecutive blocks.
                                           A float in [0, 1) indicates fractional overlap between consecutive blocks.
                                           If ``None`` (default), the blocks do not overlap.
-            num_layers (int): The number of layers in the generated circuit (from 1 to {MAX_DL_LAYERS} layers).
-                              More layers can improve the quality of the circuit
-                              blocks at the cost of a deeper circuit. Defaults to 2.
-            truncation_cutoff (Real): The entanglement cutoff for later layers, from 0 to 1. Increasing this threshold may result
-                                      in a smaller (but more approximate) circuit. Defaults to ``1e-6``.
-            fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
-                                          Increasing this limit may improve the quality of the circuit by using more classical
-                                          resources. Defaults to 20, maximal is {MAX_DL_FINE_TUNING_ITERATIONS}.
-            max_time (int | float): Soft time limit for the job (in seconds).
-                            The data loading job will first always produce the initial result and then limit the fine-tuning
-                            stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
-                            current result will be returned. Defaults to {MAX_DATA_LOADING_TIME}
-                            ({MAX_DATA_LOADING_TIME // 60} min). Max allowed job time is {MAX_DATA_LOADING_TIME // 60} min.
-                            The job can take more wall clock time than user specified `max_time` due to latency,
-                            initialization overheads or if the initial result already takes more time. This time limit
+{_synthesis_options_arg(DataLoadingType.BLOCK_VECTOR_LOADING)}
+{_DEPRECATED_SYNTHESIS_ARGS}
+{_DEPRECATED_FINE_TUNING_ARG}
+{_MAX_TIME_ARG} This time limit
                             will be evenly split across generation of each block.
             name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be automatically
                                generated.
@@ -1894,9 +2032,10 @@ class Haiqu:
         num_blocks: int | Sequence[int] | None = None,
         target_num_qubits: int | None = None,
         overlap: float | int | None = None,
-        num_layers: int = 2,
-        truncation_cutoff: Real = 1e-6,
-        fine_tuning_iterations: int = 20,
+        synthesis_options: dict | DataLoadingSynthesisOptions | None = None,
+        num_layers: int | None = None,
+        truncation_cutoff: Real | None = None,
+        fine_tuning_iterations: int | None = None,
         max_time: int | float = MAX_DATA_LOADING_TIME,
         name: str | None = None,
         job_description: str | None = None,
@@ -1914,8 +2053,7 @@ class Haiqu:
         Exactly one of ``num_blocks`` and ``target_num_qubits`` must be specified, which will determine how the vector or matrix
         is decomposed into blocks.
 
-        The complexity and quality of the generated circuit can be controlled by the ``num_layers``, ``truncation_cutoff``, and
-        ``fine_tuning_iterations`` parameters.
+        The complexity and quality of the generated circuit are controlled by ``synthesis_options``.
         {BLOCK_INDEXING}
         Args:{ARGS}
         Returns:
@@ -1925,6 +2063,8 @@ class Haiqu:
                 per-block metadata (``num_blocks``, ``num_qubits_per_block``, ``fidelity_per_block``, ``mean_fidelity``,
                 ``global_fidelity``).
                 Run ``help(job.result)`` for the full description of result and ``info`` contents.
+                In a notebook, a link to the job on the Dashboard is also displayed when
+                ``haiqu.verbosity`` is ``"high"``.
 
         Examples:
             >>> vector = [0.5, 0.2, 1, 14, 0.3, 5, 0.2, 0.6]  # 8 elements (will split into 2 two-qubit blocks)
@@ -1949,10 +2089,17 @@ class Haiqu:
                  └────────────────────────────────────────────────────────────┘
         """
         self._check_experiment()
-        name, parameters = self._prepare_block_vector_loading_params(
-            data, num_blocks, target_num_qubits, overlap, num_layers, truncation_cutoff, fine_tuning_iterations, max_time, name
+        synthesis_options = resolve_synthesis_options(
+            synthesis_options,
+            DataLoadingType.BLOCK_VECTOR_LOADING,
+            num_layers=num_layers,
+            truncation_cutoff=truncation_cutoff,
+            fine_tuning_iterations=fine_tuning_iterations,
         )
-        return self._client.data_loading(
+        name, parameters = self._prepare_block_vector_loading_params(
+            data, num_blocks, target_num_qubits, overlap, synthesis_options, max_time, name
+        )
+        job = self._client.data_loading(
             data=DataLoadingSubmitModel(
                 dl_type=DataLoadingType.BLOCK_VECTOR_LOADING.value,
                 name=name,
@@ -1961,6 +2108,8 @@ class Haiqu:
                 parameters=parameters,
             )
         )
+        self._display_dashboard_links(job)
+        return job
 
     @staticmethod
     def _prepare_entangled_manifold_embedding_params(
@@ -1968,9 +2117,7 @@ class Haiqu:
         density,
         real,
         periodicity,
-        num_layers,
-        truncation_cutoff,
-        fine_tuning_iterations,
+        synthesis_options,
         max_time,
         name,
     ):
@@ -1980,9 +2127,7 @@ class Haiqu:
             "density": density,
             "real": real,
             "periodicity": periodicity,
-            "num_layers": num_layers,
-            "truncation_cutoff": truncation_cutoff,
-            "fine_tuning_iterations": fine_tuning_iterations,
+            "synthesis_options": synthesis_options,
             "max_time": max_time,
         }
 
@@ -1992,41 +2137,36 @@ class Haiqu:
         return name, parameters
 
     _entangled_manifold_embedding_args = f"""
-                data (Sequence[Real]): The real vector with data to encode. ``data[k]`` is the ``k``-th input feature in list
-                                       order (not a computational-basis amplitude index).
-                density: (int | None): Feature density of the encoding (from 1 to {MAX_DL_EME_DENSITY}). Larger values result in
-                                       more features encoded per qubit but resulting quantum states are more entangled. Ignored if
-                                       ``num_qubits`` is set, in which case the minimal density that is compatible
-                                       with the given number of qubits is chosen. Defaults to ``2``.
-                num_qubits: (int | None): number of qubits for the embedding (from 1 to {MAX_DL_QUBITS} qubits). If ``None``,
-                                          then it is set automatically from data size. Otherwise, it uses given number of qubits
-                                          and automatically sets the minimal possible density. Data vector is extended
-                                          with zero padding if necessary. The general scaling of the data size,
-                                          which can be encoded, is O(``num_qubits`` * ``density`` ^2), up to small
-                                          corrections. Defaults to ``None``.
-                real (bool): if True, then a real quantum state is prepared, otherwise imaginary part is also used, doubling
-                             the amount of features, which can be encoded in the same manifold. Defaults to ``True``.
-                periodicity (bool): if True, then additional tangent transform is performed over data, adding periodicity
-                                    properties to the encoding. With ``density==1`` it matches angular encoding.
-                                    Defaults to ``False``.
-                num_layers (int): The number of layers in the generated circuit (from 1 to {MAX_DL_LAYERS} layers).
-                                  More layers can improve the quality of the output
-                                  vector at the cost of a deeper circuit. Defaults to 2.
-                truncation_cutoff (Real): The entanglement cutoff for later layers, from 0 to 1. Increasing this threshold may
-                                          result in a smaller (but more approximate) circuit. Defaults to ``1e-6``.
-                fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
-                                              Increasing this limit may improve the quality of the circuit by using more classical
-                                              resources. Defaults to 20, maximum is {MAX_DL_FINE_TUNING_ITERATIONS}.
-                max_time (int | float): Soft time limit for the job (in seconds).
-                                The data loading job will first always produce the initial result and then limit the fine-tuning
-                                stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
-                                current result will be returned. Defaults to {MAX_DATA_LOADING_TIME}
-                                ({MAX_DATA_LOADING_TIME // 60} min). Max allowed job time is {MAX_DATA_LOADING_TIME // 60} min.
-                                The job can take more wall clock time than user specified `max_time` due to latency,
-                                initialization overheads or if the initial result already takes more time.
-                name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be
-                                   automatically generated.
-        """
+            data (Sequence[Real]): The real vector with data to encode. ``data[k]`` is the ``k``-th input feature in list
+                                   order (not a computational-basis amplitude index).
+            density: (int | None): Feature density of the encoding (from 1 to {MAX_DL_EME_DENSITY}). Larger values result in
+                                   more features encoded per qubit but resulting quantum states are more entangled. Ignored if
+                                   ``num_qubits`` is set, in which case the minimal density that is compatible
+                                   with the given number of qubits is chosen. Whichever way it is arrived at, it also
+                                   sets the width of the synthesis layers unless ``synthesis_options`` gives them a
+                                   width of their own. Defaults to ``2``.
+            num_qubits: (int | None): number of qubits for the embedding (from 1 to {MAX_DL_QUBITS} qubits). If ``None``,
+                                      then it is set automatically from data size. Otherwise, it uses given number of qubits
+                                      and automatically sets the minimal possible density. Data vector is extended
+                                      with zero padding if necessary. The general scaling of the data size,
+                                      which can be encoded, is O(``num_qubits`` * ``density`` ^2), up to small
+                                      corrections. Defaults to ``None``.
+            real (bool): if True, then a real quantum state is prepared, otherwise imaginary part is also used, doubling
+                         the amount of features, which can be encoded in the same manifold. Defaults to ``True``.
+            periodicity (bool): if True, then additional tangent transform is performed over data, adding periodicity
+                                properties to the encoding. With ``density==1`` it matches angular encoding.
+                                Defaults to ``False``.
+{_synthesis_options_arg(DataLoadingType.ENTANGLED_MANIFOLD_EMBEDDING)}
+                                      The ``bond_dim_layer=None`` above is the layer width equal
+                                      to ``density``, and 2 for a ``density`` below that. Options of
+                                      your own replace that whole set, so keep ``bond_dim_layer`` at
+                                      ``None`` in them to keep that width.
+{_DEPRECATED_SYNTHESIS_ARGS}
+{_DEPRECATED_FINE_TUNING_ARG}
+{_MAX_TIME_ARG}
+            name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be
+                               automatically generated.
+    """
 
     @errors.graceful_api_errors_message
     @format_docstring(ARGS=_entangled_manifold_embedding_args, FEATURE_ORDER=_EME_FEATURE_ORDER_NOTE)
@@ -2037,9 +2177,10 @@ class Haiqu:
         num_qubits: int | None = None,
         real: bool = True,
         periodicity: bool = False,
-        num_layers: int = 2,
-        truncation_cutoff: Real = 1e-6,
-        fine_tuning_iterations: int = 20,
+        synthesis_options: dict | DataLoadingSynthesisOptions | None = None,
+        num_layers: int | None = None,
+        truncation_cutoff: Real | None = None,
+        fine_tuning_iterations: int | None = None,
         max_time: int | float = MAX_DATA_LOADING_TIME,
         name: str | None = None,
         job_description: str | None = None,
@@ -2053,8 +2194,7 @@ class Haiqu:
         Given a vector of data, this method creates a Data Loading job that runs in the Haiqu cloud. The result of this job is a
         circuit which can be used to supply the vector to a quantum algorithm for processing.
 
-        The complexity and quality of the generated circuit can be controlled by the ``num_layers``, ``truncation_cutoff``, and
-        ``fine_tuning_iterations`` parameters.
+        The complexity and quality of the generated circuit are controlled by ``synthesis_options``.
         {FEATURE_ORDER}
         Args:{ARGS}
         Returns:
@@ -2063,6 +2203,8 @@ class Haiqu:
                 manifold embedding of the input vector. ``job.quality`` is the achieved encoding fidelity vs. the ideal
                 embedded state; ``job.info`` exposes loader metadata (``fidelity``).
                 Run ``help(job.result)`` for the full description of result and ``info`` contents.
+                In a notebook, a link to the job on the Dashboard is also displayed when
+                ``haiqu.verbosity`` is ``"high"``.
 
         Examples:
             >>> # loading a state with angular encoding
@@ -2101,11 +2243,18 @@ class Haiqu:
 
         """
         self._check_experiment()
+        synthesis_options = resolve_synthesis_options(
+            synthesis_options,
+            DataLoadingType.ENTANGLED_MANIFOLD_EMBEDDING,
+            num_layers=num_layers,
+            truncation_cutoff=truncation_cutoff,
+            fine_tuning_iterations=fine_tuning_iterations,
+        )
         name, parameters = self._prepare_entangled_manifold_embedding_params(
-            data, density, real, periodicity, num_layers, truncation_cutoff, fine_tuning_iterations, max_time, name
+            data, density, real, periodicity, synthesis_options, max_time, name
         )
 
-        return self._client.data_loading(
+        job = self._client.data_loading(
             data=DataLoadingSubmitModel(
                 dl_type=DataLoadingType.ENTANGLED_MANIFOLD_EMBEDDING.value,
                 name=name,
@@ -2115,14 +2264,14 @@ class Haiqu:
                 parameters=parameters,
             )
         )
+        self._display_dashboard_links(job)
+        return job
 
     @staticmethod
     def _prepare_mps_loading_params(
         mps,
         shape,
-        num_layers,
-        truncation_cutoff,
-        fine_tuning_iterations,
+        synthesis_options,
         max_time,
         name,
     ):
@@ -2130,9 +2279,7 @@ class Haiqu:
         parameters = {
             "mps": mps,
             "shape": shape,
-            "num_layers": num_layers,
-            "truncation_cutoff": truncation_cutoff,
-            "fine_tuning_iterations": fine_tuning_iterations,
+            "synthesis_options": synthesis_options,
             "max_time": max_time,
         }
 
@@ -2151,20 +2298,10 @@ class Haiqu:
                          the order of axes in it.
                          p - physical index, l - left index, r - right index.
                          Defaults to "plr", which is standard order in Qiskit.
-            num_layers (int): The number of layers in the generated circuit (from 1 to {MAX_DL_LAYERS} layers). More layers can
-                              improve the quality of the output vector at the cost of a deeper circuit. Defaults to 2.
-            truncation_cutoff (Real): The entanglement cutoff for later layers, from 0 to 1. Increasing this threshold may result
-                                      in a smaller (but more approximate) circuit. Defaults to ``1e-6``.
-            fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
-                                          Increasing this limit may improve the quality of the circuit by using more classical
-                                          resources. Defaults to 20, maximal is {MAX_DL_FINE_TUNING_ITERATIONS}.
-            max_time (int | float): Soft time limit for the job (in seconds).
-                            The data loading job will first always produce the initial result and then limit the fine-tuning
-                            stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
-                            current result will be returned. Defaults to {MAX_DATA_LOADING_TIME}
-                            ({MAX_DATA_LOADING_TIME // 60} min). Max allowed job time is {MAX_DATA_LOADING_TIME // 60} min.
-                            The job can take more wall clock time than user specified `max_time` due to latency,
-                            initialization overheads or if the initial result already takes more time.
+{_synthesis_options_arg(DataLoadingType.MPS_LOADING)}
+{_DEPRECATED_SYNTHESIS_ARGS}
+{_DEPRECATED_FINE_TUNING_ARG}
+{_MAX_TIME_ARG}
             name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be automatically
                                generated.
     """
@@ -2175,9 +2312,10 @@ class Haiqu:
         self,
         mps: Sequence,
         shape: str = "plr",
-        num_layers: int = 2,
-        truncation_cutoff: Real = 1e-6,
-        fine_tuning_iterations: int = 20,
+        synthesis_options: dict | DataLoadingSynthesisOptions | None = None,
+        num_layers: int | None = None,
+        truncation_cutoff: Real | None = None,
+        fine_tuning_iterations: int | None = None,
         max_time: int | float = MAX_DATA_LOADING_TIME,
         name: str | None = None,
         job_description: str | None = None,
@@ -2200,13 +2338,14 @@ class Haiqu:
             │           │           │              │
             Γ₁ ── Λ₁ ── Γ₂ ── Λ₂ ── Γ₃ ── Λ₃ ─ ⋯ ─ Γₙ
 
-        The complexity and quality of the generated circuit can be controlled by the ``num_layers``, ``truncation_cutoff``, and
-        ``fine_tuning_iterations`` parameters. Passing the MPS with high bond dimension may degrade the
-        quality and synthesis time.
+        The complexity and quality of the generated circuit are controlled by ``synthesis_options``.
+        Passing the MPS with high bond dimension may degrade the quality and synthesis time.
         {MPS_ORDER}
         Args:{ARGS}
         Returns:
             DataLoadingJobModel: The Data Loading job that will generate the circuit from the MPS.
+                In a notebook, a link to the job on the Dashboard is also displayed when
+                ``haiqu.verbosity`` is ``"high"``.
 
         Examples:
             Loading Qiskit MPS:
@@ -2222,6 +2361,7 @@ class Haiqu:
             MPS was loaded with fidelity 1.000
             >>> mps_qc = qiskit.QuantumCircuit(2)
             >>> mps_qc.compose(mps_gate, inplace=True)
+            >>> mps_qc.measure_all()
             >>> print(haiqu.statevector_run(mps_qc).result())  # confirm the Bell state was loaded
             [array([0.70710678+0.j, 0.        +0.j, 0.        +0.j, 0.70710678+0.j])]
 
@@ -2238,11 +2378,16 @@ class Haiqu:
             Ground state was loaded with fidelity 1.000
         """
         self._check_experiment()
-        name, parameters = self._prepare_mps_loading_params(
-            mps, shape, num_layers, truncation_cutoff, fine_tuning_iterations, max_time, name
+        synthesis_options = resolve_synthesis_options(
+            synthesis_options,
+            DataLoadingType.MPS_LOADING,
+            num_layers=num_layers,
+            truncation_cutoff=truncation_cutoff,
+            fine_tuning_iterations=fine_tuning_iterations,
         )
+        name, parameters = self._prepare_mps_loading_params(mps, shape, synthesis_options, max_time, name)
 
-        return self._client.data_loading(
+        job = self._client.data_loading(
             data=DataLoadingSubmitModel(
                 dl_type=DataLoadingType.MPS_LOADING.value,
                 name=name,
@@ -2251,6 +2396,8 @@ class Haiqu:
                 parameters=parameters,
             )
         )
+        self._display_dashboard_links(job)
+        return job
 
     @staticmethod
     def _prepare_function_loading_params(
@@ -2258,9 +2405,7 @@ class Haiqu:
         func,
         interval_start,
         interval_end,
-        num_layers,
-        truncation_cutoff,
-        fine_tuning_iterations,
+        synthesis_options,
         max_time,
         name,
     ):
@@ -2283,9 +2428,7 @@ class Haiqu:
             "func": func_str,
             "interval_start": interval_start,
             "interval_end": interval_end,
-            "num_layers": num_layers,
-            "truncation_cutoff": truncation_cutoff,
-            "fine_tuning_iterations": fine_tuning_iterations,
+            "synthesis_options": synthesis_options,
             "max_time": max_time,
         }
 
@@ -2301,21 +2444,10 @@ class Haiqu:
             interval_start (Real): The beginning of the interval on which the function is sampled.
             interval_end (Real): The end of the interval on which the function is sampled. The interval width
                                  ``interval_end - interval_start`` must be at least {MIN_DL_INTERVAL_WIDTH}.
-            num_layers (int): The number of layers in the generated circuit (from 1 to {MAX_DL_LAYERS} layers).
-                              More layers can improve the quality of the output
-                              function at the cost of a deeper circuit. Defaults to 2.
-            truncation_cutoff (Real): The entanglement cutoff for later layers, from 0 to 1. Increasing this threshold may result
-                                      in a smaller (but more approximate) circuit. Defaults to ``1e-6``.
-            fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
-                                          Increasing this limit may improve the quality of the circuit by using more classical
-                                          resources. Defaults to 20, maximal is {MAX_DL_FINE_TUNING_ITERATIONS}.
-            max_time (int | float): Soft time limit for the job (in seconds).
-                            The data loading job will first always produce the initial result and then limit the fine-tuning
-                            stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
-                            current result will be returned. Defaults to {MAX_DATA_LOADING_TIME}
-                            ({MAX_DATA_LOADING_TIME // 60} min). Max allowed job time is {MAX_DATA_LOADING_TIME // 60} min.
-                            The job can take more wall clock time than user specified `max_time` due to latency,
-                            initialization overheads or if the initial result already takes more time.
+{_synthesis_options_arg(DataLoadingType.FUNCTION_LOADING)}
+{_DEPRECATED_SYNTHESIS_ARGS}
+{_DEPRECATED_FINE_TUNING_ARG}
+{_MAX_TIME_ARG}
             name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be automatically
                                generated.
     """
@@ -2332,9 +2464,10 @@ class Haiqu:
         func: str | sympy.Expr,
         interval_start: Real,
         interval_end: Real,
-        num_layers: int = 2,
-        truncation_cutoff: Real = 1e-6,
-        fine_tuning_iterations: int = 20,
+        synthesis_options: dict | DataLoadingSynthesisOptions | None = None,
+        num_layers: int | None = None,
+        truncation_cutoff: Real | None = None,
+        fine_tuning_iterations: int | None = None,
         max_time: int | float = MAX_DATA_LOADING_TIME,
         name: str | None = None,
     ) -> DataLoadingJobModel:
@@ -2354,8 +2487,7 @@ class Haiqu:
         bin of the interval, and the resulting values are normalized as a quantum state. Singularities and non-finite values
         (``nan``, ``+/-inf``) are nullified (set to 0).
 
-        The complexity and quality of the generated circuit can be controlled by the ``num_layers``, ``truncation_cutoff``,
-        and ``fine_tuning_iterations`` parameters.
+        The complexity and quality of the generated circuit are controlled by ``synthesis_options``.
         {AMP_INDEXING}
         {DISCRETIZATION}
         Args:{ARGS}
@@ -2365,6 +2497,8 @@ class Haiqu:
                 values. ``job.quality`` is the achieved state fidelity vs. the ideal target function; ``job.info`` exposes
                 loader metadata (``fidelity``).
                 Run ``help(job.result)`` for the full description of result and ``info`` contents.
+                In a notebook, a link to the job on the Dashboard is also displayed when
+                ``haiqu.verbosity`` is ``"high"``.
 
         Examples:
             Encoding a Gaussian given as a SymPy expression:
@@ -2389,19 +2523,24 @@ class Haiqu:
             >>> job = haiqu.function_loading(num_qubits=6, func="exp(1j*x)", interval_start=0, interval_end=10)
         """
         self._check_experiment()
+        synthesis_options = resolve_synthesis_options(
+            synthesis_options,
+            DataLoadingType.FUNCTION_LOADING,
+            num_layers=num_layers,
+            truncation_cutoff=truncation_cutoff,
+            fine_tuning_iterations=fine_tuning_iterations,
+        )
         name, parameters = self._prepare_function_loading_params(
             num_qubits,
             func,
             interval_start,
             interval_end,
-            num_layers,
-            truncation_cutoff,
-            fine_tuning_iterations,
+            synthesis_options,
             max_time,
             name,
         )
 
-        return self._client.data_loading(
+        job = self._client.data_loading(
             data=DataLoadingSubmitModel(
                 dl_type=DataLoadingType.FUNCTION_LOADING.value,
                 name=name,
@@ -2410,6 +2549,8 @@ class Haiqu:
                 parameters=parameters,
             )
         )
+        self._display_dashboard_links(job)
+        return job
 
     @staticmethod
     def _prepare_fourier_loading_params(
@@ -2417,13 +2558,11 @@ class Haiqu:
         num_qubits,
         min_freqs,
         long_range,
-        num_layers,
-        truncation_cutoff,
-        fine_tuning_iterations,
+        synthesis_options,
         max_time,
         name,
     ):
-        # Numeric limits (num_layers, truncation_cutoff, fine_tuning_iterations, max_time) are enforced
+        # Numeric limits (the synthesis options and max_time) are enforced
         # by DataLoadingSubmitModel schema validation, which also coerces them to serializable types.
         if not isinstance(long_range, bool):
             raise ValueError("long_range must be a boolean")
@@ -2490,9 +2629,7 @@ class Haiqu:
             "num_qubits": num_qubits,
             "min_freqs": min_freqs,
             "long_range": long_range,
-            "num_layers": num_layers,
-            "truncation_cutoff": truncation_cutoff,
-            "fine_tuning_iterations": fine_tuning_iterations,
+            "synthesis_options": synthesis_options,
             "max_time": max_time,
         }
 
@@ -2523,21 +2660,10 @@ class Haiqu:
                                      frequency-layout note above.
             long_range (bool): Whether to allow long-range gates in the Fourier part of the circuit. The prepared state is
                                the same either way, while ``False`` (default) keeps the gates on a linear chain.
-            num_layers (int): The number of layers used to synthesize the coefficients (from 1 to {MAX_DL_LAYERS} layers).
-                              More layers can improve the quality of the output at the cost of a deeper circuit.
-                              Defaults to 2.
-            truncation_cutoff (Real): The entanglement cutoff for later layers. Increasing this threshold may result in a
-                                      smaller (but more approximate) circuit. Defaults to ``1e-6``.
-            fine_tuning_iterations (int): The maximum number of fine-tuning iterations to perform after each layer is added.
-                                          Increasing this limit may improve the quality of the circuit by using more
-                                          classical resources. Defaults to 20, maximal is {MAX_DL_FINE_TUNING_ITERATIONS}.
-            max_time (int | float): Soft time limit for the job (in seconds).
-                            The data loading job will first always produce the initial result and then limit the fine-tuning
-                            stage by the remaining time left. If time limit exceeds during the fine-tuning - the best
-                            current result will be returned. Defaults to {MAX_DATA_LOADING_TIME}
-                            ({MAX_DATA_LOADING_TIME // 60} min). Max allowed job time is {MAX_DATA_LOADING_TIME // 60} min.
-                            The job can take more wall clock time than user specified `max_time` due to latency,
-                            initialization overheads or if the initial result already takes more time.
+{_synthesis_options_arg(DataLoadingType.FOURIER_LOADING)}
+{_DEPRECATED_SYNTHESIS_ARGS}
+{_DEPRECATED_FINE_TUNING_ARG}
+{_MAX_TIME_ARG}
             name (str | None): The name for the job and the produced circuit. If ``None`` (default), a name will be
                                automatically generated.
             job_description (str | None): The description for the job.
@@ -2553,9 +2679,10 @@ class Haiqu:
         num_qubits: int | Sequence[int] | None = None,
         min_freqs: int | Sequence[int] | None = None,
         long_range: bool = False,
-        num_layers: int = 2,
-        truncation_cutoff: Real = 1e-6,
-        fine_tuning_iterations: int = 20,
+        synthesis_options: dict | DataLoadingSynthesisOptions | None = None,
+        num_layers: int | None = None,
+        truncation_cutoff: Real | None = None,
+        fine_tuning_iterations: int | None = None,
         max_time: int | float = MAX_DATA_LOADING_TIME,
         name: str | None = None,
         job_description: str | None = None,
@@ -2572,8 +2699,7 @@ class Haiqu:
         The coefficients are normally obtained with :func:`~haiqu.sdk.utils.compute_fourier_coefficients`, which takes an array of
         values on a uniform grid and returns ``fourier_coefficients`` and ``min_freqs`` in exactly the form this method expects.
 
-        The complexity and quality of the generated circuit can be controlled by the ``num_layers``,
-        ``truncation_cutoff``, and ``fine_tuning_iterations`` parameters.
+        The complexity and quality of the generated circuit are controlled by ``synthesis_options``.
         {FOURIER_FREQUENCY}
         {FOURIER_INDEXING}
         .. note::
@@ -2591,6 +2717,8 @@ class Haiqu:
                 ``job.quality`` is the achieved state fidelity vs. the supplied coefficients; ``job.info`` exposes loader
                 metadata (``fidelity``, ``num_qubits_per_dimension``).
                 Run ``help(job.result)`` for the full description of result and ``info`` contents.
+                In a notebook, a link to the job on the Dashboard is also displayed when
+                ``haiqu.verbosity`` is ``"high"``.
 
         Examples:
             An exact finite Fourier series. ``cos(2*pi*3*x)`` has only the -3 and +3 harmonics, so retaining the band
@@ -2629,21 +2757,26 @@ class Haiqu:
             Fidelity against the original array is about 0.999533
         """
         self._check_experiment()
+        synthesis_options = resolve_synthesis_options(
+            synthesis_options,
+            DataLoadingType.FOURIER_LOADING,
+            num_layers=num_layers,
+            truncation_cutoff=truncation_cutoff,
+            fine_tuning_iterations=fine_tuning_iterations,
+        )
         name, parameters = self._prepare_fourier_loading_params(
             fourier_coefficients,
             num_qubits,
             min_freqs,
             long_range,
-            num_layers,
-            truncation_cutoff,
-            fine_tuning_iterations,
+            synthesis_options,
             max_time,
             name,
         )
 
         # The resolved total width is left to the backend, as in `mps_loading`: `num_qubits` here is
         # per dimension, while the top-level field is a single count.
-        return self._client.data_loading(
+        job = self._client.data_loading(
             data=DataLoadingSubmitModel(
                 dl_type=DataLoadingType.FOURIER_LOADING.value,
                 name=name,
@@ -2652,6 +2785,8 @@ class Haiqu:
                 parameters=parameters,
             )
         )
+        self._display_dashboard_links(job)
+        return job
 
     # TODO: accept CompressionOptions instead of raw string params (compression_level,
     # noise_profile, fine_tuning, approximation_level). Both state_compression and
@@ -2674,7 +2809,8 @@ class Haiqu:
             circuits = [circuit]
             warnings.warn("The 'circuit' parameter is deprecated; use 'circuits' instead.", DeprecationWarning, stacklevel=2)
 
-        logged_circuits = self._prepare_circuits(circuits)
+        circuits = self._normalize_circuits(circuits)
+        logged_circuits = self._log_circuits(circuits)
 
         parameters = {
             "compression_level": compression_level,
@@ -2781,6 +2917,8 @@ class Haiqu:
                 ``compression_percent``, ``approximation_level``).
                 Use ``job.progress()`` for live status updates and ``help(job.result)`` for the full description of result
                 and ``info`` contents.
+                In a notebook, a link to each job on the Dashboard is also displayed when
+                ``haiqu.verbosity`` is ``"high"``.
 
         Examples:
             Generate a circuit:
@@ -2835,6 +2973,7 @@ class Haiqu:
                 compression_type=CompressionJobType.STATE_COMPRESSION,
             )
         )
+        self._display_dashboard_links(jobs)
         if circuit is not None:
             return jobs[0]
         return jobs
@@ -2863,7 +3002,8 @@ class Haiqu:
         transpiled circuit.
 
         Note:
-            2D state compression is currently limited to heavy hex devices.
+            2D state compression is currently supported for IBM devices, and for IQM Garnet and Emerald
+            devices (including those available via AWS).
 
         Haiqu's 2D state compression is an approximate fixed-input-state compilation method to extend
         the effective depth of circuits that can be executed on noisy hardware.
@@ -2924,6 +3064,8 @@ class Haiqu:
                 ``compression_time``, ``compression_percent``, ``approximation_level``).
                 Use ``job.progress()`` for live status updates and ``help(job.result)`` for the full description of result
                 and ``info`` contents.
+                In a notebook, a link to each job on the Dashboard is also displayed when
+                ``haiqu.verbosity`` is ``"high"``.
 
         Examples:
             Generate a circuit:
@@ -2991,6 +3133,7 @@ class Haiqu:
                 compression_type=CompressionJobType.STATE_COMPRESSION_2D,
             )
         )
+        self._display_dashboard_links(jobs)
         if circuit is not None:
             return jobs[0]
         return jobs
@@ -3038,6 +3181,8 @@ class Haiqu:
             ``job.result()`` to retrieve the compressed circuit as a
             ``CircuitModel`` and read ``job.fidelity`` for the achieved
             process fidelity.
+            In a notebook, a link to the job on the Dashboard is also displayed when
+            ``haiqu.verbosity`` is ``"high"``.
 
         Raises:
             ValueError: If ``target`` exceeds the 10-qubit limit.
@@ -3093,6 +3238,7 @@ class Haiqu:
                 compression_type=CompressionJobType.SU2_EQUIVARIANT_COMPILATION,
             )
         )
+        self._display_dashboard_links(jobs[0])
         return jobs[0]
 
     @errors.graceful_api_errors_message
@@ -3107,8 +3253,10 @@ class Haiqu:
         loc: Real = 0,
         scale: Real = 1,
         encoding: str = "probability",
-        num_layers: int = 1,
-        truncation_cutoff: Real = 1e-6,
+        synthesis_options: dict | DataLoadingSynthesisOptions | None = None,
+        num_layers: int | None = None,
+        truncation_cutoff: Real | None = None,
+        max_time: int | float = MAX_DATA_LOADING_TIME,
         name: str | None = None,
         job_description: str | None = None,
         **shape,
@@ -3133,6 +3281,12 @@ class Haiqu:
             DataLoadingEstimatesModel(estimated_time=0.22770169152050562, estimated_cost=0.010079648405964921)
             >>> est.draw()  # in Jupyter notebook
         """
+        synthesis_options = resolve_synthesis_options(
+            synthesis_options,
+            DataLoadingType.DISTRIBUTION_LOADING,
+            num_layers=num_layers,
+            truncation_cutoff=truncation_cutoff,
+        )
         name, parameters = self._prepare_distribution_loading_params(
             num_qubits,
             distribution_name,
@@ -3141,8 +3295,8 @@ class Haiqu:
             loc,
             scale,
             encoding,
-            num_layers,
-            truncation_cutoff,
+            synthesis_options,
+            max_time,
             name,
             shape,
         )
@@ -3161,9 +3315,10 @@ class Haiqu:
         self,
         data: Sequence[Number],
         num_qubits: int | None = None,
-        num_layers: int = 2,
-        truncation_cutoff: Real = 1e-6,
-        fine_tuning_iterations: int = 20,
+        synthesis_options: dict | DataLoadingSynthesisOptions | None = None,
+        num_layers: int | None = None,
+        truncation_cutoff: Real | None = None,
+        fine_tuning_iterations: int | None = None,
         max_time: int | float = MAX_DATA_LOADING_TIME,
         name: str | None = None,
         job_description: str | None = None,
@@ -3179,18 +3334,24 @@ class Haiqu:
 
         Examples:
             >>> est = haiqu.vector_loading_estimates(
+            ...     data=my_vector,
             ...     num_qubits=10,
-            ...     num_layers=5,
-            >>> )
+            ...     synthesis_options={{"num_layers": 5}},
+            ... )
             >>> est
             DataLoadingEstimatesModel(estimated_time=221.07399999999998, estimated_cost=0.06308276)
             >>> est.draw()  # in Jupyter notebook
         """
+        synthesis_options = resolve_synthesis_options(
+            synthesis_options,
+            DataLoadingType.VECTOR_LOADING,
+            num_layers=num_layers,
+            truncation_cutoff=truncation_cutoff,
+            fine_tuning_iterations=fine_tuning_iterations,
+        )
         name, parameters = self._prepare_vector_loading_params(
             data,
-            num_layers,
-            truncation_cutoff,
-            fine_tuning_iterations,
+            synthesis_options,
             max_time,
             name,
         )
@@ -3388,6 +3549,8 @@ class Haiqu:
                 parameter in the input ``VariationalProblem.ansatz``), suitable for use as ``parameters`` in
                 :meth:`run` or as ``initial_parameters`` in :meth:`variational_optimization`.
                 Run ``help(job.result)`` for the full description of result and ``info`` contents.
+                In a notebook, a link to the job on the Dashboard is also displayed when
+                ``haiqu.verbosity`` is ``"high"``.
 
         Examples:
             >>> from qiskit import QuantumCircuit
@@ -3428,7 +3591,7 @@ class Haiqu:
         if initial_parameters is not None:
             initial_parameters = list(initial_parameters)
 
-        return self._client.pretraining(
+        job = self._client.pretraining(
             data=PretrainingSubmitModel(
                 experiment_id=self._experiment.id,
                 circuit_id=circuit.id,
@@ -3442,6 +3605,8 @@ class Haiqu:
                 pretrain_type=PretrainingJobType.PRETRAIN.value,
             )
         )
+        self._display_dashboard_links(job)
+        return job
 
     @errors.graceful_api_errors_message
     def gradient(
@@ -3482,6 +3647,8 @@ class Haiqu:
                 Call ``job.result()`` to retrieve a ``(loss, gradient)`` tuple, where ``loss``
                 is the observable expectation value (float) and ``gradient`` is a list of partial
                 derivatives (one float per parameter in the ansatz).
+                In a notebook, a link to the job on the Dashboard is also displayed when
+                ``haiqu.verbosity`` is ``"high"``.
 
         Examples:
             >>> import numpy as np
@@ -3512,7 +3679,7 @@ class Haiqu:
         if description is None:
             description = f"Gradient of {circuit.name} with a loss over {len(observables)} observable(s)."
 
-        return self._client.pretraining(
+        job = self._client.pretraining(
             data=PretrainingSubmitModel(
                 experiment_id=self._experiment.id,
                 circuit_id=circuit.id,
@@ -3525,6 +3692,8 @@ class Haiqu:
                 pretrain_type=PretrainingJobType.MPS_GRADIENT.value,
             )
         )
+        self._display_dashboard_links(job)
+        return job
 
     @errors.graceful_api_errors_message
     def variational_optimization(
@@ -3646,6 +3815,8 @@ class Haiqu:
                 When ``dry_run=True``, ``result()`` is empty; use ``job.estimated_qpu_cost`` instead.
                 Use ``job.progress()`` for live status updates and ``help(job.result)`` for the full description of result
                 and ``info`` contents.
+                In a notebook, a link to the job on the Dashboard is also displayed when
+                ``haiqu.verbosity`` is ``"high"``.
 
         Examples:
             Default optimizer settings:
@@ -3839,7 +4010,9 @@ class Haiqu:
             description=job_description,
         )
 
-        return self._client.variational_optimization(data=submit_data)
+        job = self._client.variational_optimization(data=submit_data)
+        self._display_dashboard_links(job)
+        return job
 
     @errors.graceful_api_errors_message
     def flow(
@@ -3898,12 +4071,14 @@ class Haiqu:
                          path handles both single and multi-circuit submissions.
             job_name (str | None): The name for the job. If ``None`` (default), a name will be automatically generated.
             job_description (str | None): The description for the job.
-            device_credentials (dict | None): Credentials for device access.
+            device_credentials (dict | None): Credentials for device access. An IBM Quantum device that
+                ``haiqu.list_devices()`` does not show can still be used when your own IBM Quantum account can
+                access it: the IBM Quantum credentials passed here, or saved with ``haiqu.save_ibm_credentials()``,
+                are then sent with the job, on dry runs too.
             dry_run (bool): Whether to stop just prior to backend execution for QPU cost estimation. Defaults to ``False``.
                 When ``True``, the job result will be empty since execution on the device is skipped.
-                The estimated QPU cost is then available via ``job.estimated_qpu_cost``.
-                Wall-clock time to run hybrid program layers up to (but not including) the device
-                layer is available via ``job.pre_device_pipeline_time`` (also on full runs).
+                The estimated QPU cost is then available via ``job.estimated_qpu_cost``, and the wall-clock
+                time of the layers before the device via ``job.pre_device_pipeline_time`` (also on full runs).
 
         Returns:
             HybridJobModel: The Hybrid job that will execute the hybrid program.
@@ -3925,6 +4100,9 @@ class Haiqu:
                 classical hybrid time before the device layer. ``job.info`` also exposes auxiliary
                 metadata (``uncertainty`` when observables are supplied, ``qpu_cost`` on full runs).
                 Run ``help(job.result)`` for the full description of result and ``info`` contents.
+
+                In a notebook, a link to the job on the Dashboard is also displayed when
+                ``haiqu.verbosity`` is ``"high"``.
 
         Examples:
             Single circuit, no parameters, no observables:
@@ -4128,6 +4306,7 @@ class Haiqu:
               [-0.02400000000000002, 0.008000000000000007]]]
         """
         self._check_experiment()
+        circuits = self._normalize_circuits(circuits)
 
         # Validated before uploading anything, so a malformed basis never creates circuits.
         readout_bases = validate_readout_bases(readout_bases, observables, circuits)
@@ -4142,11 +4321,6 @@ class Haiqu:
                 "The program has a ReadoutBasisLayer but no `readout_bases` were supplied, so every circuit "
                 "would be read out in the computational basis. Pass `readout_bases=[...]`."
             )
-
-        logged_circuits = self._prepare_circuits(circuits)
-
-        if job_name is None:
-            job_name = job_name_from_circuits(logged_circuits)
 
         device_id = None
         new_layers = []
@@ -4169,23 +4343,32 @@ class Haiqu:
 
         program = HybridProgram.model_validate(program.model_copy(update={"layers": new_layers}))
 
-        if device_id is None:
-            raise ValueError("No DeviceLayer in HybridProgram")
-
-        # Validate that device exists
-        self.get_device(device_id=device_id)
-
         device_credentials = copy.deepcopy(device_credentials) if device_credentials is not None else {}
 
-        if not dry_run:
-            self._inject_device_credentials(device_id, device_credentials)
+        # A program that simulates exactly names no device, so there is none to look up and
+        # no backend to authenticate against.
+        if device_id is not None:
+            # An IBM Quantum device outside the list of devices is reached through the user's own
+            # IBM Quantum account, so that account's credentials go with the job, dry run or not.
+            listed = self._find_device(device_id) is not None
+            unlisted_ibm = not listed and device_id.startswith("ibm_")
+            if not listed and not unlisted_ibm:
+                raise _device_not_found(device_id)
+
+            if not dry_run or unlisted_ibm:
+                self._inject_device_credentials(device_id, device_credentials)
 
         parameters, observables = validate_and_normalize_parameters_and_observables(
             parameters,
             observables,
-            len(logged_circuits),
+            len(circuits),
             num_parameters_per_circuit=get_num_parameters_per_circuit(circuits),
         )
+
+        logged_circuits = self._log_circuits(circuits)
+
+        if job_name is None:
+            job_name = job_name_from_circuits(logged_circuits)
 
         job = self._client.flow(
             data=HybridSubmitModel(
@@ -4212,9 +4395,9 @@ class Haiqu:
                 "Please contact support."
             )
 
+        self._display_dashboard_links(job)
         return job
 
-    # TODO: reimplement haiqu.run using the flow endpoint
     @errors.graceful_api_errors_message
     def run(
         self,
@@ -4229,11 +4412,14 @@ class Haiqu:
         use_mitigation: bool = False,
         use_packing: bool = False,
         pack_size: int | None = None,
+        auto_quality: bool = False,
         job_name: str | None = None,
         job_description: str | None = None,
         dry_run: bool = False,
-    ) -> RunJobModel:
+    ) -> HybridJobModel:
         """Run quantum circuits on the selected backend.
+
+        For the behaviour before 1.7.0, which returned a :class:`RunJobModel`, use :meth:`Legacy.run` (``haiqu.legacy.run``).
 
         This flexible method supports multiple execution scenarios, with different combinations of circuits, parameters, and
         observables. When multiple values are provided for any of them, the results are returned as nested lists with up to 3
@@ -4282,7 +4468,9 @@ class Haiqu:
 
                 One distribution is returned per basis per circuit, so ``result()`` gains a basis axis in the
                 same position observables occupy: ``[circuit][basis]``, or ``[circuit][basis][parameter]`` with a
-                parameter sweep. Use :meth:`RunJobModel.result_by_basis` to get them keyed by basis string.
+                parameter sweep. The bases keep the order they were passed in, so
+                ``dict(zip(readout_bases, job.result()[i]))`` keys circuit ``i``'s distributions by basis
+                string.
 
                 Mutually exclusive with ``observables``. Combines with ``use_packing``: each packed copy of
                 the circuit is read out in the same basis, so a basis string still has one character per
@@ -4297,8 +4485,8 @@ class Haiqu:
                 individual error mitigation components when ``use_mitigation=True``. Supported keys:
 
                 - ``"dynamical_decoupling"`` (bool): Toggle dynamical decoupling. Defaults to ``True``.
-                - ``"readout_mitigation"`` (bool): Toggle readout error mitigation. Defaults to ``True``.
-                - ``"noise_tailoring"`` (bool): Toggle noise tailoring via Pauli twirling. Defaults to ``False``.
+                - ``"readout_mitigation"`` (bool): Toggle readout error mitigation. Defaults to ``False``.
+                - ``"noise_tailoring"`` (bool): Toggle noise tailoring via Pauli twirling. Defaults to ``True``.
                 - ``"advanced_mitigation"`` (bool): Toggle advanced mitigation. Defaults to ``True``.
 
                 To use MPS simulation on ``aer_simulator``, pass ``{"method": "matrix_product_state"}``.
@@ -4325,6 +4513,12 @@ class Haiqu:
                 See `the run reference <https://docs.haiqu.ai/reference/run/run>`_ for full details.
 
             use_mitigation (bool): Whether to use error mitigation techniques. Defaults to ``False``.
+                When enabled, Pauli twirling is applied and readout twirling is not. Override either
+                through ``options["error_mitigation_options"]``, whose keys are ``noise_tailoring``
+                (Pauli twirling), ``readout_mitigation`` (readout twirling), ``advanced_mitigation``,
+                ``dynamical_decoupling`` and ``readout_mitigation_options``. Twirling and dynamical
+                decoupling are skipped on simulators and fake devices, where there is no hardware
+                noise to tailor.
             use_packing (bool): Whether to use circuit packing for efficient device utilization. Defaults to ``False``.
                 **Warning:** Experimental — packing replicates circuits on unused device qubits
                 to run multiple copies in parallel, which may increase errors for deeper input circuits.
@@ -4334,6 +4528,14 @@ class Haiqu:
             pack_size (int | None): Number of circuit copies to pack onto the device. Must be >= 2.
                 Only valid when ``use_packing=True``. If ``None`` (default), the backend will
                 pack into at most 2/3 of the device qubits.
+            auto_quality (bool): Whether to assess how closely the results match an ideal, noiseless
+                simulation of the same circuits. Defaults to ``False``.
+                Assessment simulates every input circuit exactly, so it applies only to circuits
+                small enough for a statevector reference (24 qubits); larger circuits are skipped
+                individually and reported in ``job.info["quality_assessment"]``. It is unavailable
+                for runs with ``readout_bases``, because the basis axis leaves no single reference
+                distribution to compare against. The assessment runs after the device results are
+                collected, so it adds wall-clock time to the job but no QPU cost.
             job_name (str | None): The name for the job. If ``None`` (default), a name will be automatically generated.
             job_description (str | None): The description for the job.
             dry_run (bool): Whether to stop just prior to backend execution for QPU cost estimation. Defaults to ``False``.
@@ -4341,7 +4543,7 @@ class Haiqu:
                 The estimated QPU cost is then available via ``job.estimated_qpu_cost``.
 
         Returns:
-            RunJobModel: The Run job that will execute the circuit.
+            HybridJobModel: The Hybrid job that will execute the circuits.
                 Call ``job.result()`` to retrieve the execution results as a nested list ordered by
                 *circuits → observables → parameters*:
 
@@ -4350,10 +4552,25 @@ class Haiqu:
                 * With observables, no parameter sweep: 2D list of expectation values, indexed ``[circuit][observable]``.
                 * With observables and a parameter sweep: 3D list of expectation values, indexed
                   ``[circuit][observable][parameter]``.
+                * With readout bases: the basis axis takes the observable position — ``[circuit][basis]``,
+                  or ``[circuit][basis][parameter]`` with a parameter sweep — in the order the bases were
+                  passed.
 
-                When ``dry_run=True``, ``result()`` is empty; use ``job.estimated_qpu_cost`` instead. ``job.info`` exposes
-                auxiliary metadata (``uncertainty`` when observables are supplied, ``qpu_cost``).
-                Run ``help(job.result)`` for the full description of result and ``info`` contents.
+                **Dry runs** (``dry_run=True``): ``result()`` is empty. Use ``job.estimated_qpu_cost`` for
+                the QPU cost estimate and ``job.pre_device_pipeline_time`` for the classical time spent
+                before the device layer. ``job.time`` is ``0`` because the device phase does not run.
+
+                **Full runs** (``dry_run=False``): ``job.qpu_cost`` gives the actual cost and ``job.info``
+                exposes auxiliary metadata (``job.info["uncertainty"]`` when observables are supplied,
+                ``job.info["qpu_cost"]``). Use ``job.progress()`` to stream logs, or poll ``job.status``
+                to avoid blocking.
+
+                In a notebook, a link to the job on the Dashboard is also displayed when
+                ``haiqu.verbosity`` is ``"high"``.
+
+        Raises:
+            ValueError: If IBM Quantum rejects the IBM Quantum token and instance for a run on an IBM device, or
+                cannot be reached to check them. Dry runs do not check them.
 
         Examples:
             Single circuit, no parameters, no observables:
@@ -4520,8 +4737,32 @@ class Haiqu:
             ...                 "method": "matrix_product_state",  # set method to MPS
             ...                 "matrix_product_state_max_bond_dimension": 16,  # preferably, limit the bonds
             ...               })
+
+            Scoring a noisy run against an ideal simulation of the same circuit, to see what
+            mitigation bought you:
+
+            >>> from qiskit import QuantumCircuit
+            >>> qc = QuantumCircuit(2)
+            >>> qc.h(0)
+            >>> qc.cx(0, 1)
+            >>> qc.measure_all()
+            >>> noisy = haiqu.run(qc, device_id="fake_kyiv", shots=4096, auto_quality=True)
+            >>> noisy.result()
+            [{'00': 0.5017, '01': 0.0071, '10': 0.0046, '11': 0.4866}]
+            >>> noisy.quality  # Hellinger fidelity against the ideal Bell state
+            0.9882
+            >>> mitigated = haiqu.run(
+            ...     qc, device_id="fake_kyiv", shots=4096, use_mitigation=True, auto_quality=True
+            ... )
+            >>> mitigated.result()
+            [{'00': 0.4967, '01': 0.0041, '10': 0.0024, '11': 0.4969}]
+            >>> mitigated.quality
+            0.9936
+            >>> mitigated.info["quality_assessment"]  # per-circuit breakdown
+            {'per_circuit': {'circ-abcdefab-cdef-abcd-efab-cdefabcdefab': 0.9936}}
         """
         self._check_experiment()
+        circuits = self._normalize_circuits(circuits)
 
         options = {} if options is None else copy.deepcopy(options)
 
@@ -4542,59 +4783,65 @@ class Haiqu:
 
         self._normalize_noise_model_option(device_id=device_id, options=options)
 
-        if not dry_run:
-            self._inject_device_credentials(device_id, options)
-
         # Validated before uploading anything, so a malformed basis never creates circuits.
         readout_bases = validate_readout_bases(readout_bases, observables, circuits)
-
-        logged_circuits = self._prepare_circuits(circuits)
-
-        if job_name is None:
-            job_name = job_name_from_circuits(logged_circuits)
 
         parameters, observables = validate_and_normalize_parameters_and_observables(
             parameters,
             observables,
-            len(logged_circuits),
+            len(circuits),
             num_parameters_per_circuit=get_num_parameters_per_circuit(circuits),
         )
 
-        # Validate and pass packing options
         self._validate_packing(use_packing, pack_size)
-        options["use_packing"] = use_packing
-        if pack_size is not None:
-            options["pack_size"] = pack_size
 
         if device is not None and device.use_fractional_gates:
             options["use_fractional_gates"] = True
 
+        # The execution pipeline is assembled here, as a hybrid program
+        # The `options` is split as it is translated: pipeline keys become layers
+        program, device_credentials = program_from_run_options(
+            device_id=device_id,
+            options=options,
+            use_mitigation=use_mitigation,
+            use_packing=use_packing,
+            pack_size=pack_size,
+            has_observables=observables is not None,
+            has_readout_bases=bool(readout_bases),
+            auto_quality=auto_quality,
+        )
+
+        if not dry_run:
+            self._inject_device_credentials(device_id, device_credentials)
+
+        logged_circuits = self._log_circuits(circuits)
+
+        if job_name is None:
+            job_name = job_name_from_circuits(logged_circuits)
+
         # Submit the job
-        job = self._client.run(
-            data=RunSubmitModel(
+        job = self._client.flow(
+            data=HybridSubmitModel(
                 experiment_id=self._experiment.id,
                 circuit_ids=[c.id for c in logged_circuits],
+                program=program,
                 parameters=parameters,
                 shots=shots,
                 observables=observables,
                 readout_bases=readout_bases,
-                device_id=device_id,
-                options=options,
-                use_mitigation=use_mitigation,
+                device_credentials=device_credentials,
                 name=job_name,
                 description=job_description,
                 dry_run=dry_run,
-                run_type=RunJobType.DEVICE_RUN.value,
             )
         )
         if readout_bases is not None and job.readout_bases is None:
-            # The submit model tolerates unknown fields, so an older deployment would silently
-            # drop the bases and return computational-basis counts instead.
             raise RuntimeError(
                 "This Haiqu API deployment does not support `readout_bases` (the server did not echo "
                 "them back), so the returned counts would be in the computational basis. "
                 "Please contact support."
             )
+        self._display_dashboard_links(job)
         return job
 
     @errors.graceful_api_errors_message
@@ -4611,60 +4858,48 @@ class Haiqu:
         use_mitigation: bool = False,
         job_name: str | None = None,
         job_description: str | None = None,
-    ) -> JobInsights:
+    ) -> HybridJobModel:
+        """Submit a dry run: execute every classical layer, and stop before the device.
+
+        Builds the same hybrid program as :meth:`run` and submits it with ``dry_run=True``,
+        so transpilation, mitigation ordering and observable processing all run while device
+        execution is skipped. Equivalent to ``run(..., dry_run=True)``.
+
+        .. note::
+
+            This method is planned to be extended to return predictive execution metrics and
+            validation data for a target device. The return type is stable, but the payload
+            may grow.
+
+        Args:
+            Identical to :meth:`run`, except that packing options and auto quality are not exposed.
+
+        Returns:
+            HybridJobModel: The Hybrid job that stops before device execution.
+                ``job.result()`` is empty, because the device layer never runs. Use
+                ``job.estimated_qpu_cost`` for the QPU cost estimate and
+                ``job.pre_device_pipeline_time`` for the classical time spent before the
+                device layer. ``job.time`` is ``0``.
+
+        Examples:
+            >>> job = haiqu.dry_run(qc, device_id="ibm_boston")
+            >>> job.estimated_qpu_cost
+            {'native': {'amount': 4.1, 'unit': 's'}, 'converted': {'amount': 6.56, 'unit': 'USD'}}
         """
-        Submit a dry-run job via the dedicated `/dry-run` endpoint.
-
-        TODO(IMPORTANT): This method is temporary and currently mirrors the `run()` flow.
-        It is planned to be redesigned/repopulated to return predictive execution metrics and
-        validation data for a target device. Do not treat the current behavior as final.
-        """
-        self._check_experiment()
-
-        if options is None:
-            options = {}
-
-        if device is None:
-            if device_id is None:
-                raise ValueError("The `device` or `device_id` is required to run the circuits.")
-            else:
-                self.get_device(device_id=device_id)
-
-        if device is not None:
-            device_id = device.id
-
-        readout_bases = validate_readout_bases(readout_bases, observables, circuits)
-
-        logged_circuits = self._prepare_circuits(circuits)
-
-        if job_name is None:
-            job_name = job_name_from_circuits(logged_circuits)
-
-        parameters, observables = validate_and_normalize_parameters_and_observables(
-            parameters,
-            observables,
-            len(logged_circuits),
-            num_parameters_per_circuit=get_num_parameters_per_circuit(circuits),
+        return self.run(
+            circuits=circuits,
+            parameters=parameters,
+            shots=shots,
+            observables=observables,
+            readout_bases=readout_bases,
+            device=device,
+            device_id=device_id,
+            options=options,
+            use_mitigation=use_mitigation,
+            job_name=job_name,
+            job_description=job_description,
+            dry_run=True,
         )
-
-        insights = self._client.dry_run(
-            data=RunSubmitModel(
-                experiment_id=self._experiment.id,
-                circuit_ids=[c.id for c in logged_circuits],
-                parameters=parameters,
-                shots=shots,
-                observables=observables,
-                readout_bases=readout_bases,
-                device_id=device_id,
-                options=options,
-                use_mitigation=use_mitigation,
-                name=job_name,
-                description=job_description,
-                dry_run=True,
-                run_type=RunJobType.DEVICE_RUN.value,
-            )
-        )
-        return insights
 
     @errors.graceful_api_errors_message
     def statevector_run(
@@ -4672,12 +4907,15 @@ class Haiqu:
         circuits: QuantumCircuit | list[QuantumCircuit] | CircuitModel | list[CircuitModel],
         job_name: str | None = None,
         job_description: str | None = None,
-    ) -> RunJobModel:
+    ) -> HybridJobModel:
         """Run quantum circuits on a statevector simulator and obtain exact amplitudes of the wavefunctions.
 
-        This execution type is restricted to non-parametrized circuits up to 20 qubits in size. Circuits may contain
-        Haiqu gates, but no mid-circuit measurements or other logical operations. Final measurements in the circuit,
-        if present, will be ignored. Statevector is measured over all qubits in their standard qiskit order.
+        For the behaviour before 1.7.0, which returned a :class:`RunJobModel`, use :meth:`Legacy.statevector_run`
+        (``haiqu.legacy.statevector_run``).
+
+        This execution type is restricted to non-parametrized circuits up to 24 qubits in size. Circuits may contain
+        Haiqu gates, but no mid-circuit measurements or other logical operations. Final measurements are mandatory, but ignored:
+        the statevector is measured over all qubits in their standard Qiskit order.
 
         The returned amplitude ordering matches the indexing convention used by amplitude-based data loaders
         (:meth:`vector_loading`, :meth:`block_vector_loading`, :meth:`function_loading`,
@@ -4690,11 +4928,11 @@ class Haiqu:
             job_description (str | None): The description for the job.
 
         Returns:
-            RunJobModel: The Run job that will execute the circuit.
+            HybridJobModel: The Hybrid job that will execute the circuit.
                 Call ``job.result()`` to retrieve a list of complex-valued statevectors (one numpy array per input circuit),
-                each of length ``2**num_qubits`` in standard Qiskit ordering (rightmost bit = qubit 0). Final measurements
-                in the input circuits, if any, are ignored.
-                Run ``help(job.result)`` for the full description of result and ``info`` contents.
+                each of length ``2**num_qubits`` in standard Qiskit ordering (rightmost bit = qubit 0).
+                In a notebook, a link to the job on the Dashboard is also displayed when
+                ``haiqu.verbosity`` is ``"high"``.
 
         Examples:
             Single circuit:
@@ -4703,7 +4941,7 @@ class Haiqu:
             >>> qc = QuantumCircuit(2)
             >>> qc.h(0)
             >>> qc.cx(0, 1)
-            >>> qc.measure_all()  # measurements can be present or not
+            >>> qc.measure_all()
             >>> job = haiqu.statevector_run(qc)
             >>> job.result()  # Returns: [statevector]
             [array([0.70710678+0.j, 0.        +0.j, 0.        +0.j, 0.70710678+0.j])]
@@ -4715,30 +4953,44 @@ class Haiqu:
             >>> qc_bell = QuantumCircuit(2)  # standard bell state
             >>> qc_bell.h(0)
             >>> qc_bell.cx(0, 1)
-            >>> bell_gate_phased, _ = haiqu.vector_loading([1, 0, 0, 1.j]).result()  # notice the imaginary amplitude
+            >>> qc_bell.measure_all()
+            >>> bell_gate_phased = haiqu.vector_loading([1, 0, 0, 1.j]).result()  # notice the imaginary amplitude
             >>> qc_bell_phased = QuantumCircuit(2)  # bell state with different phase on |11> state
             >>> qc_bell_phased.compose(bell_gate_phased, inplace=True)
+            >>> qc_bell_phased.measure_all()
             >>> job = haiqu.statevector_run([qc_bell, qc_bell_phased])
             >>> np.round(job.result(), 3)
-            array([[ 0.707+0.j   ,  0.   +0.j   ,  0.   +0.j   ,  0.707+0.j   ],
-                   [ 0.707+0.j   ,  0.   +0.j   ,  0.   +0.j   , -0.   +0.707j]])
+            array([[0.707+0.j   , 0.   +0.j   , 0.   +0.j   , 0.707+0.j   ],
+                   [0.707-0.j   , 0.   +0.j   , 0.   +0.j   , 0.   +0.707j]])
         """
         self._check_experiment()
-        logged_circuits = self._prepare_circuits(circuits)
+        circuits = self._normalize_circuits(circuits)
+
+        # Exact simulation is its own terminal layer: it runs against no device, so there is
+        # nothing to name, authenticate against or look up.
+        program = HybridProgram(
+            layers=[
+                layers.InputLayer(),
+                layers.StatevectorLayer(),
+            ]
+        )
+
+        logged_circuits = self._log_circuits(circuits)
 
         if job_name is None:
             job_name = job_name_from_circuits(logged_circuits)
 
-        # Submit the job
-        job = self._client.run(
-            data=RunSubmitModel(
+        job = self._client.flow(
+            data=HybridSubmitModel(
                 experiment_id=self._experiment.id,
                 circuit_ids=[c.id for c in logged_circuits],
+                program=program,
+                shots=1,
                 name=job_name,
                 description=job_description,
-                run_type=RunJobType.STATEVECTOR_RUN.value,
             )
         )
+        self._display_dashboard_links(job)
         return job
 
     def build_lr_qaoa_circuit(
@@ -4935,7 +5187,7 @@ class Haiqu:
 
         self._check_experiment()
         # Validate cvar_alpha (not sent to API, used locally)
-        # Other parameters validated by Pydantic models (LRQAOACircuitSubmitModel, RunSubmitModel, PostprocessParams)
+        # Other parameters validated by Pydantic models (LRQAOACircuitSubmitModel, PostprocessParams)
         if cvar_alpha is not None and not 0 < cvar_alpha <= 1:
             raise ValueError(f"cvar_alpha must be between 0 and 1 (exclusive of 0) or None, got {cvar_alpha}")
 
@@ -5148,6 +5400,8 @@ class Haiqu:
         Returns:
             Job handle. Use `job.result()` to block and get
                 `SKQDResult`, or `job.progress()` for live updates.
+                In a notebook, a link to the job on the Dashboard is also displayed when
+                ``haiqu.verbosity`` is ``"high"``.
 
         Examples:
             >>> from haiqu.sdk.skqd import hubbard_hamiltonian, SKQDOptions, build_hubbard_site_basis_krylov_circuits
@@ -5204,12 +5458,20 @@ class Haiqu:
             params=params.model_dump(),
         )
 
-        return self._client.api_postprocess_skqd(submit_data)
+        job = self._client.api_postprocess_skqd(submit_data)
+        self._display_dashboard_links(job)
+        return job
 
-    def draw(self, circuit: Union[QuantumCircuit, CircuitModel], style: str = ""):
+    def draw(
+        self,
+        circuit: Union[QuantumCircuit, CircuitModel],
+        style: str = "",
+        return_artifact: bool = False,
+    ):
         """Render a quantum circuit. Intended to be used with the Haiqu Lab user interface.
 
-        This function also returns the matplotlib figure object for use in haiqu.log() and other contexts.
+        With `return_artifact=True`, this function returns the matplotlib figure object
+        for use in haiqu.log() and other contexts instead of rendering the circuit.
 
         Args:
             circuit (QuantumCircuit | CircuitModel): The quantum circuit to draw.
@@ -5225,15 +5487,18 @@ class Haiqu:
                          * "neon": classic yellow neon
                          * "neutral": Haiqu light grey
 
+            return_artifact (bool): Return the figure instead of rendering the circuit.
+
         Returns:
-            matplotlib.figure.Figure: The rendered circuit figure.
+            matplotlib.figure.Figure | None: The circuit figure if `return_artifact`
+                is True, otherwise None.
 
         Examples:
             >>> haiqu.draw(circuit)
 
         Use the returned figure to log the circuit diagram:
 
-            >>> fig = haiqu.draw(circuit)
+            >>> fig = haiqu.draw(circuit, return_artifact=True)
             >>> haiqu.log(fig, name="Look at this circuit!")
         """
         from haiqu.sdk.wiz.jupyter import draw_neon_circuit
@@ -5247,8 +5512,9 @@ class Haiqu:
             else:
                 raise ValueError("This circuit cannot be drawn, as it has no QPY.")
 
+        if return_artifact:
+            return circuit.draw(output="mpl", fold=-1, style="bw")
         draw_neon_circuit(circuit=circuit, style=style)
-        return circuit.draw(output="mpl", fold=-1, style="bw")
 
     def _init(
         self,
@@ -5338,6 +5604,20 @@ class Haiqu:
         if self._experiment is None:
             self._init(DEFAULT_EXPERIMENT)
 
+    def _display_dashboard_links(self, jobs: BaseJobModel | list[BaseJobModel]) -> None:
+        """In a notebook, display a Dashboard link for each submitted job at high verbosity."""
+        if not errors.JUPYTER_LAB or self.verbosity < Verbosity.HIGH:
+            return
+        from haiqu.sdk.wiz.jupyter import dashboard_links
+
+        dashboard_links([job.dashboard_url for job in (jobs if isinstance(jobs, list) else [jobs])])
+
+    def _with_experiment_link(self, message: str) -> str:
+        """Append the current experiment's Dashboard link to ``message``, unless verbosity is low."""
+        if self.verbosity < Verbosity.NORMAL:
+            return message
+        return f"{message} View on Dashboard: {self._experiment.dashboard_url}"
+
     def _get_or_create_circuit(self, circuit: QuantumCircuit | CircuitModel, **kwargs) -> CircuitModel:
         """Query API for the circuit by hash or log a new one.
         Associate the circuit with the current experiment.
@@ -5386,24 +5666,30 @@ class Haiqu:
             )
         )
 
-    def _prepare_circuits(
+    def _normalize_circuits(
         self,
         circuits: QuantumCircuit | CircuitModel | list[QuantumCircuit | CircuitModel],
-    ) -> list[CircuitModel]:
-        """Validate and log circuits."""
-
+    ) -> list[QuantumCircuit | CircuitModel]:
+        """Ensure that circuits are in the correct format."""
         if not isinstance(circuits, list):
             circuits = [circuits]
 
-        # Log the circuits if they are not logged yet
+        for c in circuits:
+            if not isinstance(c, (QuantumCircuit, CircuitModel)):
+                raise ValueError("The `circuits` must be a logged circuit or a QuantumCircuit, or a list of these types.")
+
+        return circuits
+
+    def _log_circuits(
+        self,
+        circuits: list[QuantumCircuit | CircuitModel],
+    ) -> list[CircuitModel]:
+        """Log circuits that haven't been logged yet."""
         logged_circuits = []
 
         for c in circuits:
-            if isinstance(c, (QuantumCircuit, CircuitModel)):
-                c_logged = self._get_or_create_circuit(circuit=c)
-                logged_circuits.append(c_logged)
-            else:
-                raise ValueError("The `circuits` must be a logged circuit or a QuantumCircuit, or a list of these types.")
+            c_logged = self._get_or_create_circuit(circuit=c)
+            logged_circuits.append(c_logged)
 
         return logged_circuits
 
@@ -5557,6 +5843,7 @@ class Haiqu:
             self.update_aws_credentials(credentials)
         if device_id.lower().startswith("ibm"):
             self.update_ibm_credentials(credentials)
+            self.verify_ibm_credentials(credentials["ibm_quantum_token"], credentials["ibm_quantum_instance"])
         if device_id.lower().startswith("iqm"):
             self.update_iqm_credentials(credentials)
 
@@ -5672,6 +5959,51 @@ class Haiqu:
 
         options["ibm_quantum_token"] = ibm_token
         options["ibm_quantum_instance"] = ibm_instance
+
+    def verify_ibm_credentials(self, ibm_quantum_token: str | None = None, ibm_quantum_instance: str | None = None) -> None:
+        """
+        Check with IBM Quantum that the API token and instance are accepted.
+
+        Arguments that are not passed are taken from the account saved with :meth:`save_ibm_credentials`, so calling
+        it with no arguments checks the saved credentials.
+
+        The check is a read-only request that runs nothing on a QPU. :meth:`run` and :meth:`flow` make it before
+        submitting a job to an IBM Quantum device, so invalid credentials are reported before any circuit is uploaded.
+        Credentials that pass are remembered for the rest of the session, so they are checked once.
+
+        Args:
+            ibm_quantum_token (str | None): IBM Quantum API token. Defaults to the saved account's token.
+            ibm_quantum_instance (str | None): IBM Quantum instance name. Defaults to the saved account's instance,
+                or no instance when none is saved.
+
+        Raises:
+            ValueError: If no token is passed or saved, or if IBM Quantum rejects the credentials or cannot be reached.
+        """
+        if ibm_quantum_token is None or ibm_quantum_instance is None:
+            saved = QiskitRuntimeService.saved_accounts().get("haiqu_ibm_account", {})
+            ibm_quantum_token = ibm_quantum_token if ibm_quantum_token is not None else saved.get("token")
+            ibm_quantum_instance = ibm_quantum_instance if ibm_quantum_instance is not None else saved.get("instance")
+
+        if ibm_quantum_token is None:
+            raise ValueError(
+                "No IBM Quantum API token to verify. Pass `ibm_quantum_token`, or save one with `haiqu.save_ibm_credentials()`."
+            )
+
+        if (ibm_quantum_token, ibm_quantum_instance) in self._verified_ibm_credentials:
+            return
+
+        try:
+            service = QiskitRuntimeService(channel="ibm_quantum_platform", token=ibm_quantum_token, instance=ibm_quantum_instance)
+            service.backends(instance=ibm_quantum_instance)
+        except Exception as e:
+            reason = str(e).replace(str(ibm_quantum_token), "***") if ibm_quantum_token else str(e)
+            # Raised without the original exception attached, since its message may contain the token.
+            raise ValueError(
+                f"IBM Quantum could not verify the credentials in `ibm_quantum_token` and `ibm_quantum_instance`: {reason}. "
+                "Check their values, or save valid ones with `haiqu.save_ibm_credentials()`."
+            ) from None
+
+        self._verified_ibm_credentials.add((ibm_quantum_token, ibm_quantum_instance))
 
     @staticmethod
     def save_iqm_credentials(iqm_token: str, iqm_server_url: str = IQM_DEFAULT_SERVER_URL):

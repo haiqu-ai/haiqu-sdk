@@ -37,12 +37,17 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "pydantic>=2.6.0,<3.0",
     "beartype==0.22.9",
+    "numpy>=2,<3",
+    "openqasm3[parser]>=1,<2",
+    "pydantic>=2.6.0,<3.0",
     "requests>=2.33.0,<3",
+    "scipy>=1.14,<2",
+    "sympy>=1.13,<2",
+    "urllib3>=1.26,<3",
 
-    "qiskit==2.2.*",
-    "qiskit_ibm_runtime==0.45.*",
+    "qiskit>=2.5.2,<2.6",
+    "qiskit_ibm_runtime==0.48.*",
     "qiskit-aer==0.17.*",
     "qiskit_algorithms==0.4.0",
     "qiskit-addon-obp==0.3.0",
@@ -50,11 +55,8 @@ dependencies = [
     "qiskit-addon-opt-mapper==0.1.0",
     "qiskit-qasm3-import==0.6.0",
     "qiskit-optimization[cplex]==0.7.0",  # LP serialization for the quadratic kernel adapter
-    "sympy>=1.13",
 
     "cplex",  # qiskit-optimization==0.7.0 ignores [cplex] for python>=3.13
-    "hashable-list==0.2.*",  # Required by docplex==2.32.257 (via qiskit-optimization)
-    "ordered-set==4.1.*",  # Required by docplex==2.32.257 (via qiskit-optimization)
 
     "tabulate==0.9.0",
     "plotly==6.0.0",
@@ -77,8 +79,9 @@ Source = "https://github.com/haiqu-ai/haiqu-sdk"
 
 [project.optional-dependencies]
 visualization = [
-    "matplotlib==3.9.2",
-    "pylatexenc==2.10",
+    "matplotlib>=3.9,<4",
+    "networkx>=3.4,<4",
+    "pylatexenc>=2.10,<3",
 ]
 skqd = [
     "ffsim",
