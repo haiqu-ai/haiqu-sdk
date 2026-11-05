@@ -147,6 +147,18 @@ class UserModel(BaseModel):
         return f"{self.first_name} {self.last_name}"
 
 
+class ExperimentOwnerModel(BaseModel):
+    """Public details of the user who owns an experiment."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    first_name: str
+    last_name: str
+
+    def full_name(self):
+        return f"{self.first_name} {self.last_name}"
+
+
 class ReferenceModel(BaseModel, ParseIterableMixin):
     """Key metrics data model."""
 
@@ -187,7 +199,7 @@ class ExperimentModel(ClientMixin, BaseExperimentModel):
     """
 
     user_id: int
-    user: UserModel
+    user: ExperimentOwnerModel
     metrics: Optional[dict] = {}
 
     @property

@@ -4348,15 +4348,7 @@ class Haiqu:
         # A program that simulates exactly names no device, so there is none to look up and
         # no backend to authenticate against.
         if device_id is not None:
-            # An IBM Quantum device outside the list of devices is reached through the user's own
-            # IBM Quantum account, so that account's credentials go with the job, dry run or not.
-            listed = self._find_device(device_id) is not None
-            unlisted_ibm = not listed and device_id.startswith("ibm_")
-            if not listed and not unlisted_ibm:
-                raise _device_not_found(device_id)
-
-            if not dry_run or unlisted_ibm:
-                self._inject_device_credentials(device_id, device_credentials)
+            self._check_device_and_inject_credentials(device_id, device_credentials, dry_run=dry_run)
 
         parameters, observables = validate_and_normalize_parameters_and_observables(
             parameters,
@@ -4480,6 +4472,9 @@ class Haiqu:
             device (DeviceModel | None): The device to run the circuits on. If specified, ``device_id`` is ignored.
                 Devices from :meth:`get_device` with ``use_fractional_gates=True`` use fractional gates.
             device_id (str | None): The ID of the device to run the circuits on. Defaults to ``None``.
+                An IBM Quantum device that ``haiqu.list_devices()`` does not show can still be used when your
+                own IBM Quantum account can access it: the IBM Quantum credentials passed in ``options``, or
+                saved with ``haiqu.save_ibm_credentials()``, are then sent with the job, on dry runs too.
             options (dict | None): Options to pass to the device. Supports an optional
                 ``"error_mitigation_options"`` key with a dictionary of boolean flags to control
                 individual error mitigation components when ``use_mitigation=True``. Supported keys:
@@ -4569,8 +4564,9 @@ class Haiqu:
                 ``haiqu.verbosity`` is ``"high"``.
 
         Raises:
+            ValueError: If the device is neither in the list of devices nor an IBM Quantum device.
             ValueError: If IBM Quantum rejects the IBM Quantum token and instance for a run on an IBM device, or
-                cannot be reached to check them. Dry runs do not check them.
+                cannot be reached to check them.
 
         Examples:
             Single circuit, no parameters, no observables:
@@ -4769,13 +4765,8 @@ class Haiqu:
         # Validate error_mitigation_options if provided
         validate_error_mitigation_options(options, use_mitigation)
 
-        # Validate device ID
-        if device is None:
-            if device_id is None:
-                raise ValueError("The `device` or `device_id` is required to run the circuits.")
-            else:
-                # Validate that device exists
-                self.get_device(device_id=device_id)
+        if device is None and device_id is None:
+            raise ValueError("The `device` or `device_id` is required to run the circuits.")
 
         # If both device and device_id are provided, device_id is ignored
         if device is not None:
@@ -4811,8 +4802,7 @@ class Haiqu:
             auto_quality=auto_quality,
         )
 
-        if not dry_run:
-            self._inject_device_credentials(device_id, device_credentials)
+        self._check_device_and_inject_credentials(device_id, device_credentials, dry_run=dry_run)
 
         logged_circuits = self._log_circuits(circuits)
 
@@ -5831,6 +5821,28 @@ class Haiqu:
         os.environ["AWS_DEFAULT_REGION"] = aws_default_region
         if aws_session_token is not None:
             os.environ["AWS_SESSION_TOKEN"] = aws_session_token
+
+    def _check_device_and_inject_credentials(self, device_id: str, credentials: dict, *, dry_run: bool) -> None:
+        """Refuse a device that is neither in the list of devices known by Haiqu nor an IBM Quantum device, and inject the
+        credentials it needs into ``credentials``.
+
+        Args:
+            device_id (str): The device the job runs on.
+            credentials (dict): The device credentials sent with the job. Updated in place.
+            dry_run (bool): Whether the job stops before the device.
+
+        Raises:
+            ValueError: If the device is neither known by Haiqu nor an IBM Quantum device.
+        """
+        listed = self._find_device(device_id) is not None
+        unlisted_ibm = not listed and device_id.startswith("ibm_")
+        if not listed and not unlisted_ibm:
+            raise _device_not_found(device_id)
+
+        # An IBM Quantum device outside the list of devices that are available to Haiqu is reached through the user's own IBM
+        # Quantum account, so that account's credentials are sent with the job even for a dry run.
+        if not dry_run or unlisted_ibm:
+            self._inject_device_credentials(device_id, credentials)
 
     def _inject_device_credentials(self, device_id: str, credentials: dict) -> None:
         """Inject provider credentials into ``credentials`` based on the device id.
