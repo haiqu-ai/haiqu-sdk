@@ -42,8 +42,8 @@ This repository contains the source code for the Haiqu SDK Python package. For u
 > Alternatively, you can request access to **Haiqu Lab**: a pre-built, hosted JupyterLab environment with everything
 > pre-installed and no local setup required. This can be done through your Haiqu account after sign-up.
 
-**Prerequisites** 
-- Python **3.10+** or Conda
+**Prerequisites**
+- Python **3.11+** or Conda
 
 ### Step 1: Set up a Python environment (recommended)
 
@@ -71,7 +71,7 @@ conda activate haiqu-sdk
 **Virtualenv**
 
 ```bash
-virtualenv haiqu-env --python ">=3.10"
+virtualenv haiqu-env --python ">=3.11"
 source haiqu-env/bin/activate
 ```
 

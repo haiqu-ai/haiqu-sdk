@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import warnings
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -27,12 +28,15 @@ from ._typecheck import typecheck
 from .constants import DASHBOARD_LOCAL_PORT, DASHBOARD_URI, MAX_SOURCE_FILE_SIZE
 from qiskit import QuantumCircuit, qpy
 import qiskit.circuit
-from qiskit.circuit import Instruction, ParameterExpression
+from qiskit.circuit import Annotation, BoxOp, ControlFlowOp, Instruction, ParameterExpression
+from qiskit.circuit.annotation import QPYSerializer
 import qiskit.circuit.controlflow
 import qiskit.circuit.library
 from qiskit.primitives import BasePrimitiveJob, EstimatorResult, SamplerResult
 from qiskit.primitives.containers import PrimitiveResult
 from qiskit.providers import Job
+from qiskit.qpy import QpyError
+from qiskit.qpy import common as qpy_common
 from qiskit.quantum_info import SparsePauliOp
 from qiskit.result import Result
 from qiskit.result.models import ExperimentResult, ExperimentResultData
@@ -214,6 +218,13 @@ def ensure_qc(circuit: QuantumCircuit | str) -> QuantumCircuit:
         return qasm3_parse(circuit)
 
 
+# The fallback in `from_qpy` changes a module-level Qiskit setting. Overlapping calls in different threads could
+# otherwise restore each other's value and leave the setting changed for good. The lock only orders `from_qpy` calls:
+# a QPY load elsewhere in another thread during the fallback also uses Qiskit's Python reader, which gives the same
+# circuit, only more slowly. The setting is changed for that one load alone.
+_QPY_READER_LOCK = threading.Lock()
+
+
 @typecheck
 def from_qpy(encoded: str) -> QuantumCircuit:
     """Decode a circuit from base64-encoded QPY data.
@@ -224,9 +235,98 @@ def from_qpy(encoded: str) -> QuantumCircuit:
     Returns:
         QuantumCircuit: The decoded ``QuantumCircuit``.
     """
-    buf = io.BytesIO(base64.b64decode(encoded))
-    circuits = qpy.load(buf)
+    data = base64.b64decode(encoded)
+    try:
+        circuits = qpy.load(io.BytesIO(data))
+    except QpyError as error:
+        # The circuit may carry annotations of a namespace the SDK has no serializer for. Load them as
+        # OpaqueAnnotations through a serializer registered under the root namespace "", which every
+        # namespace falls back to. Qiskit's Rust reader only looks up a namespace exactly, so this needs
+        # Qiskit's Python reader, which is otherwise used only for older QPY versions.
+        # TODO: load these annotations as typed objects once their serializers can be part of the SDK.
+        # TODO: drop this switch once Qiskit's Rust reader looks namespaces up the way its Python reader does.
+        if not hasattr(qpy_common, "QPY_RUST_READ_MIN_VERSION"):
+            raise  # This Qiskit version has no such setting, so report the original error
+        with _QPY_READER_LOCK:
+            rust_read_min_version = qpy_common.QPY_RUST_READ_MIN_VERSION
+            qpy_common.QPY_RUST_READ_MIN_VERSION = sys.maxsize
+            try:
+                circuits = qpy.load(io.BytesIO(data), annotation_factories={"": _OpaqueQPYSerializer})
+            except Exception:
+                raise error from None  # Not caused by annotations, e.g. a corrupt payload: report the original error
+            finally:
+                qpy_common.QPY_RUST_READ_MIN_VERSION = rust_read_min_version
     return circuits[0]  # We get a list back even if we only dumped a single circuit.
+
+
+class OpaqueAnnotation(Annotation):
+    """An annotation the SDK cannot interpret, kept in its serialized form so that it is written back unchanged.
+
+    Attributes:
+        namespace (str): Namespace the annotation was serialized under.
+        state (bytes): Serialized state of that namespace.
+        payload (bytes): The serialized annotation.
+    """
+
+    def __init__(self, namespace: str, state: bytes, payload: bytes):
+        self.namespace = namespace
+        self.state = state
+        self.payload = payload
+
+    def __eq__(self, other):
+        return isinstance(other, OpaqueAnnotation) and (self.namespace, self.state, self.payload) == (
+            other.namespace,
+            other.state,
+            other.payload,
+        )
+
+    def __hash__(self):
+        return hash((self.namespace, self.state, self.payload))
+
+
+class _OpaqueQPYSerializer(QPYSerializer):
+    """Loads annotations of any namespace as OpaqueAnnotations, and dumps OpaqueAnnotations of one namespace unchanged."""
+
+    def __init__(self, namespace: str = "", state: bytes = b""):
+        self.namespace = namespace
+        self.state = state
+
+    def load_state(self, namespace, payload):
+        self.namespace = namespace
+        self.state = payload
+
+    def load_annotation(self, payload):
+        return OpaqueAnnotation(self.namespace, self.state, payload)
+
+    def dump_annotation(self, namespace, annotation):
+        if isinstance(annotation, OpaqueAnnotation) and (annotation.namespace, annotation.state) == (self.namespace, self.state):
+            return annotation.payload
+        return NotImplemented
+
+    def dump_state(self):
+        return self.state
+
+
+def _opaque_annotation_factories(circuit: QuantumCircuit) -> dict:
+    """Return QPY annotation factories that dump the OpaqueAnnotations in ``circuit`` under their original namespaces.
+
+    Registering each factory under the exact namespace, not under the root namespace, makes QPY record the original
+    namespace, so the annotations load again wherever a serializer for that namespace exists.
+    """
+    factories = {}
+    for instruction in circuit.data:
+        operation = instruction.operation
+        if isinstance(operation, BoxOp):
+            for annotation in operation.annotations:
+                if isinstance(annotation, OpaqueAnnotation):
+                    factories.setdefault(
+                        annotation.namespace, functools.partial(_OpaqueQPYSerializer, annotation.namespace, annotation.state)
+                    )
+        if isinstance(operation, ControlFlowOp):
+            for block in operation.blocks:
+                for namespace, factory in _opaque_annotation_factories(block).items():
+                    factories.setdefault(namespace, factory)
+    return factories
 
 
 def _qpy_check_name_collision(operation):
@@ -297,12 +397,13 @@ def to_qpy(circuit: QuantumCircuit, *, check_load: bool = True) -> str:
     else:
         out = circuit
 
+    annotation_factories = _opaque_annotation_factories(out)
     buf = io.BytesIO()
-    qpy.dump(out, buf, version=QPY_DUMP_VERSION)
+    qpy.dump(out, buf, version=QPY_DUMP_VERSION, annotation_factories=annotation_factories)
 
     if check_load:
         buf.seek(0)
-        qpy.load(buf)
+        qpy.load(buf, annotation_factories=annotation_factories)
 
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 

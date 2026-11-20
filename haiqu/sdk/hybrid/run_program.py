@@ -49,7 +49,6 @@ def program_from_run_options(
     use_packing: bool = False,
     pack_size: Optional[int] = None,
     has_observables: bool = False,
-    has_readout_bases: bool = False,
     auto_quality: bool = False,
 ) -> tuple[HybridProgram, dict[str, Any]]:
     """Translate haiqu.run() arguments into a hybrid program.
@@ -64,8 +63,6 @@ def program_from_run_options(
             the device and circuit geometry.
         has_observables: Whether the submission carries observables, which selects the
             estimator branch over the distribution branch.
-        has_readout_bases: Whether the submission carries readout bases, which need a
-            readout-basis layer to be applied at all.
         auto_quality: Whether to assess the results against an ideal simulation.
 
     Returns:
@@ -99,8 +96,6 @@ def program_from_run_options(
     if has_observables:
         program_layers.append(layers.EstimatorLayer(**mitigation_flags))
     else:
-        if has_readout_bases:
-            program_layers.append(layers.ReadoutBasisLayer())
         program_layers.append(layers.DistributionMitigationLayer(**mitigation_flags))
 
     program_layers.append(layers.DeviceLayer(device_id=device_id, options=options, auto_quality=auto_quality))

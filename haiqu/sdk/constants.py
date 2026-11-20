@@ -59,7 +59,7 @@ MAX_COMPRESSION_APPROXIMATION_LEVEL = 100
 
 # Maximum length (characters) of a user-supplied math expression string, e.g. a
 # variational loss expression or a function-loading formula.
-MAX_MATH_EXPRESSION_LENGTH = 1024
+MAX_MATH_EXPRESSION_LENGTH = 2048
 
 # Maximum length of an observable term string (one character per qubit).
 MAX_OBSERVABLE_QUBITS = 1000
@@ -80,6 +80,16 @@ class CompressionFineTuning(str, enum.Enum):
     DISABLED = "disabled"
     LOW = "low"
     HEAVY = "heavy"
+
+
+# Named basis families a function-tomography fit can be expressed in.
+TOMOGRAPHY_FAMILIES = ("legendre", "chebyshev_t", "fourier")
+
+# Maximum qubits encoding one spatial axis of a tomography register.
+MAX_TOMOGRAPHY_AXIS_QUBITS = 40
+
+# Maximum register points a custom tomography grid may hold; every point's coordinates travel in the request.
+MAX_TOMOGRAPHY_GRID_POINTS = 2**20
 
 
 class Verbosity(enum.IntEnum):

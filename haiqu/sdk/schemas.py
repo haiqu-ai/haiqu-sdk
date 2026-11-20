@@ -4,15 +4,17 @@ The Haiqu SDK: Schemas and data models used for analytics, data loading and run 
 
 from contextvars import ContextVar
 import enum
+import math
 from datetime import datetime
 from functools import cached_property
 import time
 import warnings
-from typing import Annotated, Any, Dict, Iterable, Literal, Optional, Union, List, Tuple, cast
+from typing import Annotated, Any, Callable, Dict, Iterable, Literal, Optional, Union, List, Tuple, cast
 import json
 import numpy as np
+import sympy
 
-from pydantic import BaseModel, ConfigDict, TypeAdapter, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, TypeAdapter, Field, ValidationInfo, field_validator, model_validator
 
 # from qiskit.transpiler import Target
 
@@ -36,9 +38,13 @@ from .constants import (
     MAX_MATH_EXPRESSION_LENGTH,
     MAX_OBSERVABLE_QUBITS,
     MAX_ORBITALS,
+    MAX_TOMOGRAPHY_AXIS_QUBITS,
+    MAX_TOMOGRAPHY_GRID_POINTS,
     MIN_DL_INTERVAL_WIDTH,
 )
 from .errors import JUPYTER_LAB  # TODO: find better place for this constant
+from ._function_basis import axis_basis, axis_basis_expressions, check_family, contract, contract_expressions
+from .handles import Handle
 from .hybrid import HybridProgram, layers as hybrid_layers
 from .utils import from_qpy, setup_logger, tuple_to_sparse_op
 from .qml.compression_options import CompressionOptions
@@ -72,6 +78,16 @@ QML_METRICS = (
     "entanglement_capability",
     "expressibility",
     "quantum_fisher_information_matrix",
+)
+
+# The layers of a program that HybridJobModel.draw can show.
+HYBRIDJOB_DRAWABLE_LAYERS = (
+    hybrid_layers.InputLayer,
+    hybrid_layers.PackingLayer,
+    hybrid_layers.TranspilationLayer,
+    hybrid_layers.EstimatorLayer,
+    hybrid_layers.DistributionMitigationLayer,
+    hybrid_layers.DeviceLayer,
 )
 
 logger = setup_logger(__name__)
@@ -137,14 +153,25 @@ class UserModel(BaseModel):
     V2: Haiqu API user is OAuth authenticated user from IBM, Google, etc.
     """
 
+    model_config = ConfigDict(from_attributes=True)
+
     email: str
     username: str
     first_name: str
     last_name: str
     api_access_key: str
+    handle: Optional[str] = None
 
     def full_name(self):
         return f"{self.first_name} {self.last_name}"
+
+
+class HandleSubmitModel(BaseModel):
+    """
+    A request to choose the handle that names you in the Haiqu cloud. A handle cannot be changed once set!
+    """
+
+    handle: Handle
 
 
 class ExperimentOwnerModel(BaseModel):
@@ -408,6 +435,24 @@ class BaseCircuitModel(BaseModel, ParseIterableMixin):
             return self.analytics.depth
 
 
+class QECCircuitInfoModel(BaseModel):
+    """QEC compilation information carried by a QEC-compiled circuit.
+
+    The compiled circuits returned by a QEC compilation job hold this model in their ``qec``
+    field, which marks them as ready to be passed to ``haiqu.qec_run``.
+
+    Attributes:
+        code_slug (str): Slug of the QEC code the circuit was compiled to.
+        compilation_options (dict): The compilation options exactly as given to the compilation
+            job, ``{}`` when none were given.
+    """
+
+    code_slug: str
+    compilation_options: Optional[dict] = {}
+    # Filled in by the service; opaque to the client
+    register_map: Optional[dict] = None
+
+
 class CircuitModel(ClientMixin, BaseCircuitModel):
     """
     Haiqu Circuit model for Analytics Workflows.
@@ -428,6 +473,9 @@ class CircuitModel(ClientMixin, BaseCircuitModel):
 
     # User-defined metrics or artifacts
     metrics: Optional[dict] = None
+
+    # QEC compilation metadata, set by the service on compiled circuits
+    qec: Optional[QECCircuitInfoModel] = None
 
     def __getattribute__(self, name):
         """Check the circuit analytics availability in case it is not yet ready or an error status."""
@@ -1110,6 +1158,9 @@ class JobType(enum.Enum):
     VARIATIONAL = "Variational"
     PRETRAINING = "Pretraining"
     SKQD = "SKQD"
+    TOMOGRAPHY = "Tomography"
+    QEC_COMPILATION = "QEC Compilation"
+    QEC_RUN = "QEC Run"
 
 
 class DataLoadingType(enum.Enum):
@@ -1267,8 +1318,16 @@ View on Dashboard: {self.dashboard_url}"""
         return self.status == JobStatus.SUBMITTED
 
     def draw(self, **kwargs):
-        """Drawing is only supported for run jobs. Use a RunJobModel instance."""
-        raise NotImplementedError("Drawing is only supported for run jobs.")
+        """Drawing is only supported for jobs that run circuits, such as those from ``haiqu.run()``."""
+        raise NotImplementedError("Drawing is only supported for jobs that run circuits, such as those from haiqu.run().")
+
+    def _failed_error(self) -> Exception:
+        """The exception ``result`` raises for a failed job."""
+        return Exception(f"Job has failed. Job runtime errors are present in logs:\n{self.logs}")
+
+    def _cancelled_error(self) -> Exception:
+        """The exception ``result`` raises for a cancelled job."""
+        return Exception("Job was cancelled, result is not available")
 
     def result(self):
         """Baseline method for fetching results for a job.
@@ -1288,9 +1347,9 @@ View on Dashboard: {self.dashboard_url}"""
                 return
 
         if self.status == JobStatus.ERROR:
-            raise Exception(f"Job has failed. Job runtime errors are present in logs:\n{self.logs}")
+            raise self._failed_error()
         elif self.status == JobStatus.CANCELLED:
-            raise Exception("Job was cancelled, result is not available")
+            raise self._cancelled_error()
         elif self.status == JobStatus.DONE:
             return  # job was successfully finished
         else:
@@ -1879,6 +1938,192 @@ PauliBasisStr = Annotated[
     ),
 ]
 
+
+# ---------------------------------------------------------------------------
+# Tomography
+# ---------------------------------------------------------------------------
+
+Bitstring = Annotated[
+    str,
+    Field(min_length=1, pattern=r"^[01]+$", description="Measured outcome, MSB-first (rightmost character is qubit 0)."),
+]
+
+# One entry per spatial axis. `strict` on the integer counts keeps a boolean from being coerced to 1.
+_AxisQubits = Annotated[int, Field(strict=True, ge=1, le=MAX_TOMOGRAPHY_AXIS_QUBITS)]
+_AxisBasisCount = Annotated[int, Field(strict=True, ge=1)]
+# A family name, or the axis' own basis functions as expressions in `x`.
+_AxisBasisFunctions = Union[str, List[Annotated[str, Field(min_length=1, max_length=MAX_MATH_EXPRESSION_LENGTH)]]]
+_AxisInterval = Tuple[float, float]
+
+
+class TomographyType(enum.Enum):
+    """Class for `tomography_type`."""
+
+    VARIATIONAL_FUNCTION = "VariationalFunction"
+
+
+class VariationalFunctionParams(BaseModel):
+    """`parameters` for `TomographyType.VARIATIONAL_FUNCTION`.
+
+    The fit settings, without the measurements themselves; those travel in
+    :class:`VariationalFunctionData`. Every per-axis field is a list with one entry per spatial
+    axis. The SDK expands the shorthand a caller may use (a single family name, one shared
+    interval) before submitting. ``interval`` is ``None`` when the register's points are given
+    explicitly by :attr:`VariationalFunctionData.grid`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    num_qubits: List[_AxisQubits] = Field(min_length=1)
+    m: List[_AxisBasisCount] = Field(min_length=1)
+    basis_functions: List[_AxisBasisFunctions] = Field(min_length=1)
+    interval: Optional[List[_AxisInterval]] = Field(default=None, min_length=1)
+    num_restarts: int = Field(default=3, ge=0, le=100)
+    initial_coefficients: Optional[list] = None
+
+    @field_validator("initial_coefficients", mode="before")
+    @classmethod
+    def _check_initial_coefficients(cls, coefficients, info: ValidationInfo):
+        """Accept finite real numbers in an array of shape ``m``, and carry them as nested lists of floats.
+
+        The shape is left unchecked when ``m`` itself is invalid, as that error is reported on its own.
+        """
+        if coefficients is None:
+            return None
+        m = info.data.get("m")
+        expected = f"shape {tuple(m)}" if m is not None else "a rectangular shape"
+        try:
+            array = np.asarray(coefficients)
+        except ValueError:
+            raise ValueError(f"initial_coefficients must have {expected}, but its rows differ in length") from None
+        if array.dtype.kind not in "iuf":
+            raise ValueError(f"initial_coefficients must hold real numbers, but its values are of type {array.dtype}")
+        if m is not None and array.shape != tuple(m):
+            raise ValueError(
+                f"initial_coefficients must have {expected}, one entry per basis function on each axis, "
+                f"as the coefficients of a result, but its shape is {array.shape}"
+            )
+        if not np.all(np.isfinite(array)):
+            raise ValueError("initial_coefficients must be finite")
+        return array.astype(float).tolist()
+
+    @model_validator(mode="after")
+    def _check_axes(self):
+        """Check that the per-axis lists agree with each other."""
+        num_axes = len(self.num_qubits)
+        for name in ("m", "basis_functions", "interval"):
+            value = getattr(self, name)
+            if value is not None and len(value) != num_axes:
+                raise ValueError(f"{name} has {len(value)} entries but num_qubits declares {num_axes} axes")
+
+        for axis, (size, basis_functions, qubits) in enumerate(zip(self.m, self.basis_functions, self.num_qubits)):
+            if isinstance(basis_functions, str):
+                try:
+                    check_family(basis_functions)
+                except ValueError as exc:
+                    raise ValueError(f"axis {axis}: {exc}") from exc
+            elif not basis_functions:
+                raise ValueError(f"axis {axis}: basis is empty")
+            elif size > len(basis_functions):
+                raise ValueError(f"axis {axis}: m={size} exceeds the {len(basis_functions)} basis functions supplied")
+            if size > 2**qubits:
+                raise ValueError(f"axis {axis}: m={size} exceeds its {2**qubits} grid points, so the fit is not determined")
+        for axis, (low, high) in enumerate(self.interval or []):
+            if not (math.isfinite(low) and math.isfinite(high) and high > low):
+                raise ValueError(f"axis {axis}: interval ({low}, {high}) must be finite and increasing")
+        return self
+
+
+class VariationalFunctionData(BaseModel):
+    """`data` for `TomographyType.VARIATIONAL_FUNCTION`.
+
+    The measurements the fit consumes, kept apart from `parameters` because they are far larger
+    and are never echoed back when a job is read. An optional custom `grid` travels here for the
+    same reason: it gives the coordinates of every register point, as the array of shape
+    ``(2**num_qubits[0], ..., 2**num_qubits[-1], num_axes)`` flattened in C order.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    distributions: Dict[PauliBasisStr, Dict[Bitstring, float]] = Field(min_length=1)
+    grid: Optional[List[float]] = None
+
+    @field_validator("grid")
+    @classmethod
+    def _check_grid(cls, grid):
+        """Reject non-finite coordinates, which no basis function can be evaluated at."""
+        if grid is not None and not np.all(np.isfinite(grid)):
+            raise ValueError("grid coordinates must be finite")
+        return grid
+
+    @field_validator("distributions")
+    @classmethod
+    def _check_distributions(cls, distributions):
+        """Reject what the fit would reject, but locally and with the reason."""
+        width = len(next(iter(distributions)))
+        for basis, dist in distributions.items():
+            if len(basis) != width:
+                raise ValueError(f"basis {basis!r} covers {len(basis)} qubits, expected {width}")
+            rotated = [pauli for pauli in basis if pauli != "Z"]
+            if len(rotated) > 1 or (rotated and rotated[0] != "X"):
+                raise ValueError(
+                    f"basis {basis!r} is not supported: use the unrotated basis and bases rotating exactly one qubit to X"
+                )
+            if not dist:
+                raise ValueError(f"basis {basis!r} has an empty distribution")
+            total = 0.0
+            for bitstring, probability in dist.items():
+                if len(bitstring) != width:
+                    raise ValueError(f"bitstring {bitstring!r} has length {len(bitstring)}, expected {width}")
+                if not math.isfinite(probability):
+                    raise ValueError(f"basis {basis!r} has a non-finite value for {bitstring!r}")
+                if probability < 0:
+                    raise ValueError(
+                        f"basis {basis!r} has a negative value {probability:.6g} for {bitstring!r}; values must be "
+                        "non-negative weights such as probabilities or shot counts. Project the distribution onto "
+                        "the nearest probability distribution, or clip negative values to 0, and resubmit."
+                    )
+                total += probability
+            # Any positive total is accepted: each basis is normalized before the fit.
+            if total <= 0:
+                raise ValueError(f"basis {basis!r} sums to {total}, which is not positive")
+        if "Z" * width not in distributions:
+            raise ValueError("distributions must include the unrotated (all-Z) basis")
+        return distributions
+
+
+class VariationalFunctionSubmission(BaseModel):
+    """The two halves of a variational-function submission, checked against each other."""
+
+    parameters: VariationalFunctionParams
+    data: VariationalFunctionData
+
+    @model_validator(mode="after")
+    def _check_register(self):
+        """Check that the axes account for exactly the qubits the measurements cover, on one kind of grid."""
+        width = len(next(iter(self.data.distributions)))
+        if sum(self.parameters.num_qubits) != width:
+            raise ValueError(f"distributions cover {width} qubits but num_qubits sums to {sum(self.parameters.num_qubits)}")
+
+        grid = self.data.grid
+        if (self.parameters.interval is None) == (grid is None):
+            raise ValueError("give exactly one of `interval`, for a uniform grid, or `grid`, for explicit point coordinates")
+        if grid is not None:
+            num_points = 2**width
+            if num_points > MAX_TOMOGRAPHY_GRID_POINTS:
+                raise ValueError(
+                    f"a custom grid on {width} qubits holds {num_points} points, above the limit of "
+                    f"{MAX_TOMOGRAPHY_GRID_POINTS} points"
+                )
+            num_axes = len(self.parameters.num_qubits)
+            if len(grid) != num_points * num_axes:
+                raise ValueError(
+                    f"grid holds {len(grid)} values, but {num_points} points with {num_axes} coordinate(s) each "
+                    f"need {num_points * num_axes}"
+                )
+        return self
+
+
 READOUT_BASES_DESCRIPTION = (
     "Per-qubit Pauli readout bases, Qiskit little-endian, e.g. ['XXXX', 'ZZZZ', 'XZYZ'] "
     "(basis[-1] applies to qubit 0). One distribution is returned per basis per circuit, nested "
@@ -1912,230 +2157,12 @@ def _to_statevector(state) -> np.ndarray:
     return np.array(real) + 1.0j * np.array(imaginary)
 
 
-class HybridJobModel(BaseJobModel):
-    """
-    Hybrid Job (running on Haiqu backend).
-    """
+class ExecutionResultsMixin:
+    """Result accessors shared by the jobs that run circuits."""
 
-    program: HybridProgram
-
-    input_circuit_ids: list[str]
-    shots: int
-    parameters: Optional[list] = None
-    observables: Optional[List[List[Tuple[List[str], List[float]]]]] = None
-    readout_bases: Optional[List[str]] = None
-
-    # device_credentials omitted
-    dry_run: bool
-
-    # Populated after job finishes
-    quantum_results: Optional[list] = None
-    estimated_qpu_cost_: Annotated[Optional[dict], Field(alias="estimated_qpu_cost")] = None
-
-    def retrieve_status(self) -> JobStatus:
-        """
-        Query backend for the job status.
-        """
-        response = cast(HybridJobModel, self._retrieve_status())
-        self.quantum_results = response.quantum_results
-        self.estimated_qpu_cost_ = response.estimated_qpu_cost_
-
-        return self.status
-
-    def progress(self):
-        """
-        Display the progress widget, stream logs from the job.
-        """
-        self._progress("HYBRID JOB PROGRESS")
-
-    def result(self) -> Union[list, None]:
-        """
-        Block and wait for the job to complete, then return the results.
-
-        Raises an exception if the job failed, with the logs attached.
-
-        Returns:
-            list: Results of the job unless interrupted or failed.
-
-            A program ending in a :class:`~haiqu.sdk.hybrid.layers.StatevectorLayer`
-            returns complex-valued statevectors (numpy arrays), each of length
-            ``2 ** num_qubits`` in standard Qiskit ordering (rightmost bit = qubit 0):
-            one per input circuit, or a 2D list ``[circuit][parameter]`` when the job
-            sweeps parameters.
-        """
-        super().result()
-
-        if self.quantum_results is not None and self._is_statevector_program():
-            if self.parameters is None:
-                return [_to_statevector(state) for state in self.quantum_results]
-            return [[_to_statevector(state) for state in circuit] for circuit in self.quantum_results]
-        return self.quantum_results
-
-    def _is_statevector_program(self) -> bool:
-        """Whether the program ends in exact simulation, which returns amplitudes."""
-        return any(isinstance(layer, hybrid_layers.StatevectorLayer) for layer in self.program.layers)
-
-    @property
-    def estimated_qpu_cost(self) -> Optional[dict]:
-        """
-        Return the estimated QPU cost for the job, based on circuit depth,
-        shot count, and device rep delay.
-
-        Returns:
-            dict or None: ``{"native": {"amount": <seconds>, "unit": "s"},
-            "converted": {"amount": <dollars>, "unit": "USD"}}``
-
-        Warning:
-            This property blocks the current CPU thread until the job reaches a
-            terminal state (Done/Error), similarly to ``result()``. Use ``retrieve_status()``
-            to first check the state of the job to omit the prolonged thread blockade.
-        """
-        self.result()
-
-        return self.estimated_qpu_cost_
-
-    @property
-    def qpu_cost(self) -> Optional[dict]:
-        """
-        Actual QPU cost after execution. Pricing varies by vendor
-        (e.g. time-based for IBM, shot-based for AWS).
-        Returns None if there is no QPU cost (e.g. simulator execution).
-
-        Returns:
-            dict or None: ``{"native": {"amount": <float>, "unit": "<vendor_unit>"},
-            "converted": {"amount": <dollars>, "unit": "USD"}}``
-
-        Warning:
-            This property blocks the current CPU thread until the job reaches a
-            terminal state (Done/Error), similarly to ``result()``. Use ``retrieve_status()``
-            to first check the state of the job to omit the prolonged thread blockade.
-        """
-        self.result()
-
-        if self.info is None:
-            return None
-        return self.info.get("qpu_cost")
-
-    @property
-    def pre_device_pipeline_time(self) -> Optional[float]:
-        """
-        Wall-clock seconds to run hybrid program layers up to (but not including)
-        the layer that produces the results -- the device layer, or the statevector
-        layer where the program simulates exactly.
-
-        Covers classical work in those layers, such as transpilation, mitigation
-        ordering, and observable processing. Populated for both full runs and
-        ``dry_run=True`` jobs.
-
-        Returns:
-            float or None: Duration in seconds of the hybrid pipeline preceding
-            that layer.
-
-        Warning:
-            This property blocks the current CPU thread until the job reaches a
-            terminal state (Done/Error), similarly to ``result()``. Use ``retrieve_status()``
-            to first check the state of the job to omit the prolonged thread blockade.
-        """
-        self.result()
-
-        if self.info is None:
-            return None
-        return self.info.get("pre_device_pipeline_time")
-
-
-class RunSubmitModel(BaseModel):
-    """Run submit payload data model.
-
-    :meth:`Haiqu.run` no longer builds this: it submits a :class:`HybridProgram` instead. It is
-    the request that the deprecated ``haiqu.legacy.run`` sends, as :meth:`Haiqu.run` did before
-    it returned a :class:`HybridJobModel`.
-    """
-
-    experiment_id: str
-    circuit_ids: Optional[list] = []
-    parameters: Optional[list] = None
-    shots: int = Field(ge=1, description="Number of measurement shots (must be >= 1)", default=1024)
-    observables: Optional[List[List[Tuple[List[str], List[float]]]]] = None
-    readout_bases: Optional[List[PauliBasisStr]] = Field(default=None, description=READOUT_BASES_DESCRIPTION)
-    device_id: Optional[Annotated[str, Field(max_length=200)]] = ""
-    options: Optional[dict] = {}
-    use_mitigation: Optional[bool] = False
-    name: Optional[Annotated[str, Field(max_length=200)]] = ""
-    description: Optional[Annotated[str, Field(max_length=1024)]] = ""
-    dry_run: Optional[bool] = False
-    run_type: Optional[str] = RunJobType.DEVICE_RUN.value
-
-
-class RunJobModel(BaseJobModel):
-    """
-    Run Job (running on Haiqu backend).
-    """
-
-    # Run parameters
-    circuit_ids: list
-    parameters: Optional[list] = None
-    shots: int
-    observables: Optional[List[List[Tuple[List[str], List[float]]]]] = None
-    readout_bases: Optional[List[str]] = None
-    device_id: str
-    options: dict
-    use_mitigation: Optional[bool]
-    dry_run: bool
-    run_type: RunJobType
-
-    # Populated after job finishes
-    quantum_results: Optional[list] = None
-    estimated_qpu_cost_: Optional[dict] = Field(default=None, alias="estimated_qpu_cost")
-
-    def retrieve_status(self) -> JobStatus:
-        """
-        Query backend for the job status.
-        """
-        response = cast(RunJobModel, self._retrieve_status())
-        self.quantum_results = response.quantum_results
-        self.estimated_qpu_cost_ = response.estimated_qpu_cost_
-
-        return self.status
-
-    def progress(self):
-        """
-        Display the progress widget, stream logs from the job.
-        """
-        run_type_words = "".join([(" " + s if s.isupper() else s) for s in self.run_type.value]).strip()
-        run_type_words = run_type_words.upper()
-        widget_title = f"{run_type_words} JOB PROGRESS"
-        self._progress(widget_title)
-
-    def result(self) -> Union[list, None]:
-        """
-        Return job result - results or None if interrupted.
-        Block and wait for the job to complete.
-        Raises an exception if the job failed with logs attached.
-        Returns:
-            list: Results of the job unless interrupted or failed.
-            - Without observables: 2D list of quasi-probabilities [[dist1, dist2, ...], [dist1, dist2, ...]]
-            - With observables:
-                * With parameters: 3D list [circuit][observable][parameter]
-                * Without parameters: 2D list [circuit][observable]
-            - With readout bases (readout bases occupy the same axis as observables):
-                * With parameters: 3D list [circuit][basis][parameter] of quasi-probabilities
-                * Without parameters: 2D list [circuit][basis] of quasi-probabilities
-            - Exact statevectors for `statevector_run` execution
-
-        Use :meth:`result_by_observable` or :meth:`result_by_basis` to get results already paired
-        with the observable or readout basis that produced them, instead of indexing by position.
-
-        Job's `info` field contains additional information (not every field may be present):
-            * uncertainty - list of uncertainties for execution with observables
-        """
-        super().result()
-
-        if self.run_type == RunJobType.DEVICE_RUN:
-            return self.quantum_results
-        elif self.run_type == RunJobType.STATEVECTOR_RUN:
-            return [np.array(sv_real) + 1.0j * np.array(sv_imag) for (sv_real, sv_imag) in self.quantum_results]
-        else:
-            raise ValueError(f"Unrecognized run type: {self.run_type}")
+    def _returns_distributions(self) -> bool:
+        """Whether the job's results are measured distributions, rather than statevectors or circuits."""
+        return True
 
     @property
     def estimated_qpu_cost(self) -> Optional[dict]:
@@ -2212,7 +2239,8 @@ class RunJobModel(BaseJobModel):
         Returns:
             list or None: One list per circuit of ``(observable, value, uncertainty)`` tuples,
             where ``value`` is a float without a parameter sweep and a list of floats with one.
-            ``uncertainty`` is None when the job carries none. None if the job has no observables.
+            ``uncertainty`` is None when the job carries none. None if the job has no observables,
+            or no results, as after a dry run.
 
         Warning:
             This method blocks the current CPU thread until the job reaches a
@@ -2221,7 +2249,7 @@ class RunJobModel(BaseJobModel):
         """
         results = self.result()
 
-        if not self.observables:
+        if not self.observables or not results:
             return None
 
         uncertainties = self.uncertainty
@@ -2246,12 +2274,15 @@ class RunJobModel(BaseJobModel):
         Return results keyed by the readout basis that produced them.
 
         Saves indexing ``result()`` by position. Keys are safe because duplicate readout bases
-        are rejected at submission.
+        are rejected at submission. A job run without readout bases was read out in the
+        computational basis, so each circuit's distribution is keyed by ``"Z" * num_qubits``,
+        exactly as if ``readout_bases=["Z" * num_qubits]`` had been passed.
 
         Returns:
             list or None: One dict per circuit mapping a basis string to its distribution
             (or to the list of distributions of the parameter sweep, if there is one).
-            None if the job has no readout bases.
+            None if the job has observables, or exactly simulates or synthesizes its circuits,
+            since none of these return distributions, or if it has no results, as after a dry run.
 
         Warning:
             This method blocks the current CPU thread until the job reaches a
@@ -2260,10 +2291,368 @@ class RunJobModel(BaseJobModel):
         """
         results = self.result()
 
-        if not self.readout_bases:
+        if not results or self.observables or not self._returns_distributions():
             return None
 
-        return [dict(zip(self.readout_bases, circuit_results)) for circuit_results in results]
+        if self.readout_bases:
+            return [dict(zip(self.readout_bases, circuit_results)) for circuit_results in results]
+
+        def _distribution_width(circuit_result) -> int:
+            """Number of measured qubits, read off the bitstrings of a distribution or of a parameter sweep of them."""
+            distributions = circuit_result if isinstance(circuit_result, list) else [circuit_result]
+            for distribution in distributions:
+                for bitstring in distribution:
+                    return len(bitstring)
+            raise ValueError("Cannot infer the number of qubits from a result with no measured bitstrings.")
+
+        return [{"Z" * _distribution_width(circuit_result): circuit_result} for circuit_result in results]
+
+    def to_json(self, path: Optional[str] = None):
+        """
+        Save job results to a JSON file."""
+
+        if path is None:
+            path = f"results_{self.id}.json"
+
+        data = {
+            "job_id": self.id,
+            "status": self.status.value,
+            "logs": self.logs,
+            "results": self.quantum_results,
+        }
+
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+
+class HybridJobModel(ExecutionResultsMixin, BaseJobModel):
+    """
+    Hybrid Job (running on Haiqu backend).
+    """
+
+    program: HybridProgram
+
+    input_circuit_ids: list[str]
+    shots: int
+    parameters: Optional[list] = None
+    observables: Optional[List[List[Tuple[List[str], List[float]]]]] = None
+    readout_bases: Optional[List[str]] = None
+
+    # device_credentials omitted
+    dry_run: bool
+
+    # Populated after job finishes
+    quantum_results: Optional[list] = None
+    estimated_qpu_cost_: Annotated[Optional[dict], Field(alias="estimated_qpu_cost")] = None
+
+    def retrieve_status(self) -> JobStatus:
+        """
+        Query backend for the job status.
+        """
+        response = cast(HybridJobModel, self._retrieve_status())
+        self.quantum_results = response.quantum_results
+        self.estimated_qpu_cost_ = response.estimated_qpu_cost_
+
+        return self.status
+
+    def progress(self):
+        """
+        Display the progress widget, stream logs from the job.
+        """
+        self._progress("HYBRID JOB PROGRESS")
+
+    def result(self) -> Union[list, None]:
+        """
+        Block and wait for the job to complete, then return the results.
+
+        Raises an exception if the job failed, with the logs attached.
+
+        Returns:
+            list: Results of the job unless interrupted or failed.
+
+            A program ending in a :class:`~haiqu.sdk.hybrid.layers.DeviceLayer` returns a nested
+            list ordered by circuits, then observables or readout bases, then parameters:
+
+            * Without observables: measurement distributions (``dict[str, float]``) in Qiskit
+              bit-order, one per circuit, or ``[circuit][parameter]`` with a parameter sweep.
+            * With observables: expectation values, indexed ``[circuit][observable]``, or
+              ``[circuit][observable][parameter]`` with a parameter sweep.
+            * With readout bases: distributions, indexed ``[circuit][basis]``, or
+              ``[circuit][basis][parameter]`` with a parameter sweep.
+
+            Use :meth:`result_by_observable` or :meth:`result_by_basis` to get results already
+            paired with the observable or readout basis that produced them, and :attr:`uncertainty`
+            for the shot-noise uncertainty of each expectation value.
+
+            A program with a :class:`~haiqu.sdk.hybrid.layers.DFSEncodingLayer` reports its
+            distributions over the logical qubits; see :attr:`dfs_discard_fraction` and
+            :attr:`swap_dd_coverage` for what its encoding layers report alongside.
+
+            A program ending in a :class:`~haiqu.sdk.hybrid.layers.StatevectorLayer`
+            returns complex-valued statevectors (numpy arrays), each of length
+            ``2 ** num_qubits`` in standard Qiskit ordering (rightmost bit = qubit 0):
+            one per input circuit, or a 2D list ``[circuit][parameter]`` when the job
+            sweeps parameters.
+
+            A program ending in a :class:`~haiqu.sdk.hybrid.layers.CliffordTSynthesisLayer`
+            returns the synthesized circuits, as :class:`CircuitModel` objects logged to the
+            job's experiment: one per input circuit, in input order. It also reports on the
+            synthesis in ``job.info["clifford_t_synthesis"]``: a list with one dict per input
+            circuit, in input order, holding the ``input_circuit_id``, the
+            ``synthesized_circuit_id`` and the synthesis ``information`` described in
+            :meth:`~haiqu.sdk.quantum_haiqu.Haiqu.clifford_t_synthesis`.
+        """
+        super().result()
+
+        if self.quantum_results is not None and self._is_statevector_program():
+            if self.parameters is None:
+                return [_to_statevector(state) for state in self.quantum_results]
+            return [[_to_statevector(state) for state in circuit] for circuit in self.quantum_results]
+        if self.quantum_results is not None and self._is_synthesis_program():
+            return [self._client.get_circuit(circuit_id=circuit_id) for circuit_id in self.quantum_results]
+        return self.quantum_results
+
+    def _is_statevector_program(self) -> bool:
+        """Whether the program ends in exact simulation, which returns amplitudes."""
+        return any(isinstance(layer, hybrid_layers.StatevectorLayer) for layer in self.program.layers)
+
+    def _is_synthesis_program(self) -> bool:
+        """Whether the program ends in Clifford+T synthesis, whose circuits come back as circuit IDs."""
+        return any(isinstance(layer, hybrid_layers.CliffordTSynthesisLayer) for layer in self.program.layers)
+
+    def _returns_distributions(self) -> bool:
+        """Whether the job's results are measured distributions, rather than statevectors or circuits."""
+        return not (self._is_statevector_program() or self._is_synthesis_program())
+
+    @property
+    def circuit_ids(self) -> list[str]:
+        """IDs of the job's input circuits; the same as ``input_circuit_ids``."""
+        return self.input_circuit_ids
+
+    def draw(self, help: bool = False):
+        """
+        Render the execution flow graph for this job.
+
+        Shows the processing pipeline from input to the target device, including packing,
+        transpilation, readout bases, mitigation and observable stages where the program has them.
+
+        Args:
+            help (bool): If ``True``, add a legend explaining each stage. Defaults to ``False``.
+
+        Returns:
+            IPython display object with the rendered widget.
+
+        Raises:
+            NotImplementedError: If the program has a layer the graph cannot show, such as a
+                :class:`~haiqu.sdk.hybrid.layers.StatevectorLayer`, an encoding layer or one of the
+                finer-grained mitigation layers.
+        """
+        from haiqu.sdk.wiz.jupyter import draw_run_job
+
+        program_layers = self.program.layers
+
+        unsupported = [type(layer).__name__ for layer in program_layers if not isinstance(layer, HYBRIDJOB_DRAWABLE_LAYERS)]
+        if unsupported:
+            raise NotImplementedError(f"Drawing is not supported for programs with these layers: {', '.join(unsupported)}.")
+
+        def find(layer_types):
+            return next((layer for layer in program_layers if isinstance(layer, layer_types)), None)
+
+        # Every drawable program ends in a device layer.
+        device_id = find(hybrid_layers.DeviceLayer).device_id
+
+        mitigation = find((hybrid_layers.EstimatorLayer, hybrid_layers.DistributionMitigationLayer))
+        mitigation_flags = {"uses_mitigation": False}
+        if mitigation is not None:
+            mitigation_flags = {
+                "uses_mitigation": mitigation.mitigation_enabled,
+                "use_advanced": mitigation.advanced_mitigation,
+                "use_noise_tailoring": mitigation.noise_tailoring,
+                "use_dd": mitigation.dynamical_decoupling,
+                "use_readout": mitigation.readout_mitigation,
+            }
+
+        uses_transpilation = find(hybrid_layers.TranspilationLayer) is not None
+        if uses_transpilation:
+            # Pre-transpiled circuits skip the transpilation layer.
+            circuit_models = [self._client.get_circuit(circuit_id=cid) for cid in self.input_circuit_ids]
+            all_pre_transpiled = bool(circuit_models) and all(cm.transpilation_target is not None for cm in circuit_models)
+            uses_transpilation = not all_pre_transpiled
+
+        try:
+            device_label = self._client.get_device(device_id).name
+        except Exception:
+            device_label = device_id
+
+        return draw_run_job(
+            **mitigation_flags,
+            device_id=device_label,
+            uses_observables=bool(self.observables),
+            uses_packing=find(hybrid_layers.PackingLayer) is not None,
+            uses_transpilation=uses_transpilation,
+            uses_readout_bases=bool(self.readout_bases),
+            help=help,
+        )
+
+    @property
+    def dfs_discard_fraction(self) -> Optional[list]:
+        """
+        Fraction of shots discarded by the DFS encoding's postselection, nested like ``result()``
+        for distribution jobs (circuits, then parameters). ``None`` unless the program has a
+        ``DFSEncodingLayer`` with ``postselect=True`` and the job returns distributions.
+
+        Warning:
+            This property blocks the current CPU thread until the job reaches a
+            terminal state (Done/Error), similarly to ``result()``. Use ``retrieve_status()``
+            to first check the state of the job to omit the prolonged thread blockade.
+        """
+        self.result()
+
+        if self.info is None:
+            return None
+        return self.info.get("dfs_discard_fraction")
+
+    @property
+    def swap_dd_coverage(self) -> Optional[list]:
+        """
+        How many encoded qubits swap dynamical decoupling protected, as ``[protected, total]`` per
+        circuit (and per parameter set), nested like ``result()``. ``None`` unless the program has a
+        ``SwapDDLayer`` and the job returns distributions.
+
+        Warning:
+            This property blocks the current CPU thread until the job reaches a
+            terminal state (Done/Error), similarly to ``result()``.
+        """
+        self.result()
+
+        if self.info is None:
+            return None
+        return self.info.get("swap_dd_coverage")
+
+    @property
+    def pre_device_pipeline_time(self) -> Optional[float]:
+        """
+        Wall-clock seconds to run hybrid program layers up to (but not including)
+        the layer that produces the results -- the device layer, or the statevector
+        layer where the program simulates exactly.
+
+        Covers classical work in those layers, such as transpilation, mitigation
+        ordering, and observable processing. Populated for both full runs and
+        ``dry_run=True`` jobs.
+
+        Returns:
+            float or None: Duration in seconds of the hybrid pipeline preceding
+            that layer.
+
+        Warning:
+            This property blocks the current CPU thread until the job reaches a
+            terminal state (Done/Error), similarly to ``result()``. Use ``retrieve_status()``
+            to first check the state of the job to omit the prolonged thread blockade.
+        """
+        self.result()
+
+        if self.info is None:
+            return None
+        return self.info.get("pre_device_pipeline_time")
+
+
+class RunSubmitModel(BaseModel):
+    """Run submit payload data model.
+
+    :meth:`Haiqu.run` no longer builds this: it submits a :class:`HybridProgram` instead. It is
+    the request that the deprecated ``haiqu.legacy.run`` sends, as :meth:`Haiqu.run` did before
+    it returned a :class:`HybridJobModel`.
+    """
+
+    experiment_id: str
+    circuit_ids: Optional[list] = []
+    parameters: Optional[list] = None
+    shots: int = Field(ge=1, description="Number of measurement shots (must be >= 1)", default=1024)
+    observables: Optional[List[List[Tuple[List[str], List[float]]]]] = None
+    readout_bases: Optional[List[PauliBasisStr]] = Field(default=None, description=READOUT_BASES_DESCRIPTION)
+    device_id: Optional[Annotated[str, Field(max_length=200)]] = ""
+    options: Optional[dict] = {}
+    use_mitigation: Optional[bool] = False
+    name: Optional[Annotated[str, Field(max_length=200)]] = ""
+    description: Optional[Annotated[str, Field(max_length=1024)]] = ""
+    dry_run: Optional[bool] = False
+    run_type: Optional[str] = RunJobType.DEVICE_RUN.value
+
+
+class RunJobModel(ExecutionResultsMixin, BaseJobModel):
+    """
+    Run Job (running on Haiqu backend).
+    """
+
+    # Run parameters
+    circuit_ids: list
+    parameters: Optional[list] = None
+    shots: int
+    observables: Optional[List[List[Tuple[List[str], List[float]]]]] = None
+    readout_bases: Optional[List[str]] = None
+    device_id: str
+    options: dict
+    use_mitigation: Optional[bool]
+    dry_run: bool
+    run_type: RunJobType
+
+    # Populated after job finishes
+    quantum_results: Optional[list] = None
+    estimated_qpu_cost_: Optional[dict] = Field(default=None, alias="estimated_qpu_cost")
+
+    def retrieve_status(self) -> JobStatus:
+        """
+        Query backend for the job status.
+        """
+        response = cast(RunJobModel, self._retrieve_status())
+        self.quantum_results = response.quantum_results
+        self.estimated_qpu_cost_ = response.estimated_qpu_cost_
+
+        return self.status
+
+    def _returns_distributions(self) -> bool:
+        """Whether the job's results are measured distributions, rather than statevectors."""
+        return self.run_type != RunJobType.STATEVECTOR_RUN
+
+    def progress(self):
+        """
+        Display the progress widget, stream logs from the job.
+        """
+        run_type_words = "".join([(" " + s if s.isupper() else s) for s in self.run_type.value]).strip()
+        run_type_words = run_type_words.upper()
+        widget_title = f"{run_type_words} JOB PROGRESS"
+        self._progress(widget_title)
+
+    def result(self) -> Union[list, None]:
+        """
+        Return job result - results or None if interrupted.
+        Block and wait for the job to complete.
+        Raises an exception if the job failed with logs attached.
+        Returns:
+            list: Results of the job unless interrupted or failed.
+            - Without observables: 2D list of quasi-probabilities [[dist1, dist2, ...], [dist1, dist2, ...]]
+            - With observables:
+                * With parameters: 3D list [circuit][observable][parameter]
+                * Without parameters: 2D list [circuit][observable]
+            - With readout bases (readout bases occupy the same axis as observables):
+                * With parameters: 3D list [circuit][basis][parameter] of quasi-probabilities
+                * Without parameters: 2D list [circuit][basis] of quasi-probabilities
+            - Exact statevectors for `statevector_run` execution
+
+        Use :meth:`result_by_observable` or :meth:`result_by_basis` to get results already paired
+        with the observable or readout basis that produced them, instead of indexing by position.
+
+        Job's `info` field contains additional information (not every field may be present):
+            * uncertainty - list of uncertainties for execution with observables
+        """
+        super().result()
+
+        if self.run_type == RunJobType.DEVICE_RUN:
+            return self.quantum_results
+        elif self.run_type == RunJobType.STATEVECTOR_RUN:
+            return [np.array(sv_real) + 1.0j * np.array(sv_imag) for (sv_real, sv_imag) in self.quantum_results]
+        else:
+            raise ValueError(f"Unrecognized run type: {self.run_type}")
 
     def draw(self, help: bool = False):
         """
@@ -2312,23 +2701,6 @@ class RunJobModel(BaseJobModel):
             use_readout=emo.get("readout_mitigation", True),
             help=help,
         )
-
-    def to_json(self, path: Optional[str] = None):
-        """
-        Save job results to a JSON file."""
-
-        if path is None:
-            path = f"results_{self.id}.json"
-
-        data = {
-            "job_id": self.id,
-            "status": self.status.value,
-            "logs": self.logs,
-            "results": self.quantum_results,
-        }
-
-        with open(path, "w") as f:
-            json.dump(data, f)
 
 
 class LocalJobSubmitModel(BaseModel):
@@ -3084,6 +3456,14 @@ class VariationalCompressionStats:
         )
 
 
+def _format_vector(values: List[float], *, max_vals: int = 5) -> str:
+    """Render a numeric vector for a repr, truncating long ones to their first few entries."""
+    if len(values) > max_vals:
+        preview = ", ".join(f"{v:.6g}" for v in values[:max_vals])
+        return f"[{preview}, ...] ({len(values)} values)"
+    return repr(values)
+
+
 class VariationalResult:
     """Result of a variational optimization job.
 
@@ -3118,13 +3498,6 @@ class VariationalResult:
         self.compression_stats = compression_stats
 
     @staticmethod
-    def _format_vector(values: List[float], *, max_vals: int = 5) -> str:
-        if len(values) > max_vals:
-            preview = ", ".join(f"{v:.6g}" for v in values[:max_vals])
-            return f"[{preview}, ...] ({len(values)} values)"
-        return repr(values)
-
-    @staticmethod
     def _format_history(values: List[float], *, max_entries: int = 5) -> str:
         if len(values) > max_entries:
             preview = [f"{v:.6f}" for v in values[:max_entries]]
@@ -3137,17 +3510,273 @@ class VariationalResult:
             return "None"
         if len(weights_history) > max_entries:
             return f"[...] ({len(weights_history)} entries)"
-        return "[" + ", ".join(cls._format_vector(w) for w in weights_history) + "]"
+        return "[" + ", ".join(_format_vector(w) for w in weights_history) + "]"
 
     def __repr__(self):
         return (
             f"VariationalResult(\n"
             f"  min_loss={self.min_loss},\n"
-            f"  optimal_parameters={self._format_vector(self.optimal_parameters)},\n"
+            f"  optimal_parameters={_format_vector(self.optimal_parameters)},\n"
             f"  loss_history={self._format_history(self.loss_history)},\n"
             f"  weights_history={self._format_weights_history(self.weights_history)}\n"
             f")"
         )
+
+
+class FunctionTomographyResult:
+    """The outcome of a function-tomography fit.
+
+    Attributes:
+        coefficients: Fitted coefficients, shape ``(m_1, ..., m_dim)``. These are the
+            coefficients of ``f(x) = sum_j c_j g_j(x)`` in the basis named by
+            ``basis_functions``, normalized so that the integral of ``f**2`` over ``interval``
+            is 1, or, for a fit on a custom grid, so that the sum of ``f**2`` over the grid
+            points is 1. Nothing else is needed to evaluate ``f``. Axis 0 takes the leading
+            (most significant) qubits of each bitstring. :meth:`build_function` returns
+            ``f`` as a callable, and :meth:`build_expression` as a SymPy expression.
+        basis_functions: The basis family, or the expressions, used on each axis. Expressions
+            in the result of a completed job have been validated, but expressions from any other
+            source, such as the ``info`` of a failed job, are parsed by SymPy as Python code, so
+            only use ones you trust.
+        interval: ``(lo, hi)`` per axis, or ``None`` for a fit on a custom grid.
+        num_qubits: Register qubits per axis.
+        loss: Final value of the fit's objective. Smaller is a closer fit to the
+            measured distributions.
+        converged: Whether the optimizer reported convergence.
+        basis_condition: Condition number of the basis on the register's grid. Large
+            values mean the coefficients are poorly determined there, typically because
+            the chosen basis functions are nearly linearly dependent; ``None`` if it could not
+            be computed.
+    """
+
+    def __init__(self, *, coefficients, basis_functions, interval, num_qubits, loss, converged, basis_condition):
+        self.coefficients = np.asarray(coefficients, dtype=float)
+        self.basis_functions = basis_functions
+        self.interval = None if interval is None else [tuple(entry) for entry in interval]
+        self.num_qubits = list(num_qubits)
+        self.loss = loss
+        self.converged = converged
+        self.basis_condition = basis_condition
+
+    def build_function(self, *, scale: Optional[str] = None, absolute: bool = False) -> Callable[..., np.ndarray]:
+        """Return the fitted function ``f`` as a callable, evaluable anywhere on the interval or grid.
+
+        The callable takes one coordinate per axis, in axis order: ``f(x)`` for one axis,
+        ``f(x, y)`` for two, and so on. It evaluates ``f = sum_j c_j g_j`` there. Coordinates may
+        be scalars or arrays of any shape that broadcast together, such as the output of
+        ``numpy.meshgrid``; the result has their broadcast shape. Coordinates are used as given,
+        without mapping the interval onto the basis family's own domain.
+
+        Args:
+            scale: Normalization of the returned values. Defaults to ``"interval"``, or to ``"grid"``
+                for a fit on a custom grid.
+
+                * ``"interval"``: the scale of :attr:`coefficients`, with the integral of ``f**2`` over
+                  the interval equal to 1. It does not depend on the number of qubits, so fits on
+                  registers of different sizes can be compared directly. Not available for a fit on a
+                  custom grid, which has no interval.
+                * ``"grid"``: the amplitude scale of the register. Evaluated at the register's grid
+                  points, the values form a unit-norm state vector. The grid points of an axis with
+                  ``n`` qubits on ``(lo, hi)`` are the cell centres ``lo + (i + 1/2) * (hi - lo) / 2**n``
+                  for ``i = 0, ..., 2**n - 1``, not ``numpy.linspace(lo, hi, 2**n)``. On a custom grid
+                  they are the points that were submitted, and this is the scale of
+                  :attr:`coefficients`.
+
+                Neither scale restores the magnitude of the loaded function: the measured state is
+                normalized, so only the shape of ``f`` is recovered.
+            absolute: Return ``|f|``. Use it when the fit was given only the unrotated basis: those
+                measurements determine ``|f|`` but not its sign.
+
+        Returns:
+            Callable ``f(*coords) -> numpy.ndarray``.
+
+        Raises:
+            ValueError: If ``scale`` is unknown, if it is ``"interval"`` for a fit on a custom grid,
+                or if this result's per-axis fields disagree on the number of axes. The returned
+                callable raises ``ValueError`` if it is given the wrong number of coordinates, or
+                coordinates that do not broadcast together.
+
+        Examples:
+            >>> f = result.build_function()
+            >>> f(np.linspace(-1, 1, 200))  # one axis
+            >>> f2 = result_2d.build_function()
+            >>> xs, ys = np.meshgrid(np.linspace(-1, 1, 50), np.linspace(-1, 1, 50))
+            >>> f2(xs, ys)  # two axes, evaluated on a 50 x 50 grid
+        """
+        coefficients = self._scaled_coefficients(scale)
+        num_axes = coefficients.ndim
+        # Built once here, so custom expressions are parsed once rather than on every call.
+        bases = [axis_basis(entry, m) for entry, m in zip(self.basis_functions, coefficients.shape)]
+
+        def evaluate(*coords) -> np.ndarray:
+            if len(coords) != num_axes:
+                raise ValueError(f"expected {num_axes} coordinate(s), one per axis, but got {len(coords)}")
+            arrays = np.broadcast_arrays(*(np.asarray(coord, dtype=float) for coord in coords))
+            shape = arrays[0].shape
+            values = contract(coefficients, [basis(array.ravel()) for basis, array in zip(bases, arrays)]).reshape(shape)
+            return np.abs(values) if absolute else values
+
+        return evaluate
+
+    def build_expression(self, *, scale: Optional[str] = None, absolute: bool = False) -> sympy.Expr:
+        """Return the fitted function ``f`` as a SymPy expression.
+
+        The expression is ``f = sum_j c_j g_j`` written out in full. It depends on ``x`` for a fit
+        with one axis, and on ``x_0, x_1, ...``, one variable per axis in axis order, for a fit with
+        several. The polynomial families are written out as explicit polynomials, and the Fourier
+        family as ``1, cos(pi*x), sin(pi*x), cos(2*pi*x), ...``.
+
+        A one-axis expression can be passed as is to :meth:`~haiqu.sdk.quantum_haiqu.Haiqu.function_loading`,
+        which samples it at the midpoints of the same bins the fit used. To prepare the state the fit
+        describes, load it on the fit's ``num_qubits`` and ``interval``. Function loading normalizes
+        the state it prepares, so ``scale`` makes no difference there.
+
+        The expression of a fit on a custom grid is valid at any point, but function loading would
+        sample it on a uniform grid. To prepare the state of such a fit, evaluate :meth:`build_function`
+        at the grid points instead and pass the values to
+        :meth:`~haiqu.sdk.quantum_haiqu.Haiqu.vector_loading`.
+
+        Args:
+            scale: Normalization of the expression, as in :meth:`build_function`.
+            absolute: Return ``|f|``, as ``Abs(...)``. Use it when the fit was given only the
+                unrotated basis: those measurements determine ``|f|`` but not its sign.
+
+        Returns:
+            sympy.Expr: The fitted function.
+
+        Raises:
+            ValueError: As :meth:`build_function`.
+
+        Examples:
+            Load the state a one-axis fit describes:
+
+            >>> (low, high), = result.interval
+            >>> job = haiqu.function_loading(num_qubits=result.num_qubits[0],
+            ...                              func=result.build_expression(absolute=True),
+            ...                              interval_start=low, interval_end=high)
+
+            A two-axis fit on a custom ``grid`` is loaded from its values at the grid points instead:
+
+            >>> amplitudes = result.build_function()(grid[..., 0], grid[..., 1]).ravel()
+            >>> job = haiqu.vector_loading(amplitudes)
+        """
+        coefficients = self._scaled_coefficients(scale)
+        if coefficients.ndim == 1:
+            symbols = [sympy.Symbol("x")]
+        else:
+            symbols = [sympy.Symbol(f"x_{axis}") for axis in range(coefficients.ndim)]
+        bases = [
+            axis_basis_expressions(entry, m, symbol)
+            for entry, m, symbol in zip(self.basis_functions, coefficients.shape, symbols)
+        ]
+        expression = contract_expressions(coefficients, bases)
+        return sympy.Abs(expression) if absolute else expression
+
+    def _scaled_coefficients(self, scale: Optional[str]) -> np.ndarray:
+        """Return :attr:`coefficients` on the given scale, after checking the result is consistent."""
+        num_axes = self.coefficients.ndim
+        interval = self.interval if self.interval is not None else [None] * num_axes
+        if not len(self.basis_functions) == len(interval) == len(self.num_qubits) == num_axes:
+            raise ValueError(
+                f"The tomography result is inconsistent: coefficients have {num_axes} axes, but basis_functions, "
+                f"interval and num_qubits have {len(self.basis_functions)}, {len(interval)} and "
+                f"{len(self.num_qubits)} entries. Please contact support."
+            )
+        scales = ("grid", "interval")
+        if scale is None:
+            scale = "grid" if self.interval is None else "interval"
+        if scale not in scales:
+            raise ValueError(f"unknown scale {scale!r}; expected one of {list(scales)}")
+        if scale == "interval" and self.interval is None:
+            raise ValueError("this fit ran on a custom grid, which has no interval to normalize over; use scale='grid'")
+        # Coefficients are stored on the interval scale, or on the grid scale for a custom grid.
+        factor = 1.0
+        if scale == "grid" and self.interval is not None:
+            factor = math.sqrt(
+                math.prod((high - low) / 2**qubits for (low, high), qubits in zip(self.interval, self.num_qubits))
+            )
+        return self.coefficients * factor
+
+    def __repr__(self):
+        return (
+            f"FunctionTomographyResult(coefficients={_format_vector(self.coefficients.ravel())}, "
+            f"shape={self.coefficients.shape}, basis_functions={self.basis_functions}, "
+            f"loss={self.loss}, converged={self.converged}, basis_condition={self.basis_condition})"
+        )
+
+
+_TOMOGRAPHY_SUBMISSION_MODELS = {TomographyType.VARIATIONAL_FUNCTION: VariationalFunctionSubmission}
+
+
+class TomographySubmitModel(BaseModel):
+    """Tomography submit payload data model."""
+
+    experiment_id: str
+    name: Annotated[str, Field(max_length=200)] = ""
+    description: Optional[Annotated[str, Field(max_length=1024)]] = ""
+    tomography_type: TomographyType = TomographyType.VARIATIONAL_FUNCTION
+    parameters: dict
+    data: dict
+
+    @model_validator(mode="after")
+    def _validate_payload(self):
+        model = _TOMOGRAPHY_SUBMISSION_MODELS.get(self.tomography_type)
+        if model is not None:
+            submission = model.model_validate({"parameters": self.parameters, "data": self.data})
+            # Store the validated payload, so everything downstream reads the settings with the
+            # omitted defaults filled in and the measurements coerced to plain floats.
+            self.parameters = submission.parameters.model_dump()
+            self.data = submission.data.model_dump()
+        return self
+
+
+class TomographyJobModel(BaseJobModel):
+    """Tomography Job (running on Haiqu backend).
+
+    The submitted measurements are deliberately absent: they dwarf the rest of the job and
+    nothing reading a job back needs them.
+    """
+
+    parameters: dict
+    tomography_type: TomographyType = TomographyType.VARIATIONAL_FUNCTION
+
+    def retrieve_status(self) -> JobStatus:
+        """Query backend for the job status."""
+        self._retrieve_status()
+        return self.status
+
+    def result(self) -> Union["FunctionTomographyResult", None]:
+        """Return the tomography result.
+
+        Blocks until the job completes.
+
+        Returns:
+            FunctionTomographyResult | None: the fitted coefficients and fit diagnostics, or
+                ``None`` if no result is available, as when waiting is interrupted. See
+                :class:`FunctionTomographyResult` for field details.
+
+        Raises:
+            Exception: If the job failed or was cancelled.
+        """
+        super().result()
+
+        info = self.info or {}
+        if self.status != JobStatus.DONE or info.get("coefficients") is None:
+            return None
+
+        return FunctionTomographyResult(
+            coefficients=info["coefficients"],
+            basis_functions=info.get("basis_functions"),
+            interval=info.get("interval"),
+            num_qubits=info.get("num_qubits", []),
+            loss=info.get("loss"),
+            converged=info.get("converged"),
+            basis_condition=info.get("basis_condition"),
+        )
+
+    def progress(self):
+        """Display the progress widget, stream logs from the job."""
+        self._progress("TOMOGRAPHY JOB PROGRESS")
 
 
 class VariationalJobModel(BaseJobModel):
@@ -3386,8 +4015,12 @@ class PretrainingJobModel(BaseJobModel):
 
 
 class QECReferenceModel(BaseModel):
+    """A bibliographic reference for a QEC code."""
+
     key: str | None = None
     title: str | None = None
+    authors: list[str] | str | None = None
+    year: int | None = None
     doi: str | None = None
     arxiv: str | None = None
     url: str | None = None
@@ -3395,7 +4028,37 @@ class QECReferenceModel(BaseModel):
 
 
 class QECCodeModel(BaseModel):
-    """Pydantic model for the QEC Code Library API responses."""
+    """A code of the Haiqu QEC code library, as returned by ``haiqu.get_qec_code`` and ``haiqu.list_qec_codes``.
+
+    A code in the ``"full"`` tier can be passed to ``haiqu.qec_compile`` and ``haiqu.qec_run``
+    either by its slug or as this model. Which logical operations a code supports and how they are
+    implemented is defined by the code's ``.qecx`` file and shown in the code library on the
+    `Haiqu dashboard <https://dashboard.haiqu.ai>`__.
+
+    Attributes:
+        slug (str): Unique identifier of the code, used to refer to it in ``haiqu.get_qec_code``,
+            ``haiqu.qec_compile`` and ``haiqu.qec_run``.
+        name (str): Display name of the code.
+        family (str): Slug of the code family, as used by the ``family`` filter of
+            ``haiqu.list_qec_codes``.
+        sub_family (str): Slug of the sub-family within the code family, ``""`` when the code has
+            none.
+        code_type (str): Type of the code: ``"css"``, ``"stabilizer"``, ``"subsystem_css"`` or
+            ``"subsystem_stabilizer"``.
+        n (int | None): Number of physical qubits, ``None`` when not available.
+        k (int | None): Number of logical qubits, ``None`` when not available.
+        d (int | dict | None): Code distance. For a code whose X and Z distances differ, a dict
+            with the keys ``"X"`` and ``"Z"``. ``None`` when not available.
+        completeness (str): Completeness tier of the code: ``"full"``, ``"partial"`` or
+            ``"metadata_only"``, as explained in
+            `Completeness tiers <https://docs.haiqu.ai/reference/run/qec_codes#completeness-tiers>`__.
+        description (str | None): Short description of the code, ``None`` when not available.
+        stabilizers (dict | None): Stabilizer generators of the code, ``None`` when not available.
+        logical_operators (dict | None): Logical operators of the code, ``None`` when not available.
+        references (list | None): Literature references for the code, ``None`` when not available.
+            Each reference has the optional fields ``key``, ``title``, ``authors``, ``year``,
+            ``doi``, ``arxiv``, ``url`` and ``note``.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -3417,12 +4080,306 @@ class QECCodeModel(BaseModel):
 
 
 class QECCodeListResponseModel(BaseModel):
-    """Pydantic model for the QEC Code Library list API response."""
+    """One page of codes of the Haiqu QEC code library, as returned by ``haiqu.list_qec_codes``.
+
+    Attributes:
+        items (list[QECCodeModel]): The codes on this page, see :class:`QECCodeModel`.
+        total (int): Total number of codes matching the filters, across all pages.
+        page (int): Number of this page, as requested.
+        page_size (int): Maximum number of codes per page, as requested.
+    """
 
     items: list[QECCodeModel]
     total: int
     page: int
     page_size: int
+
+
+class QECSubFamilyModel(BaseModel):
+    """Pydantic model for a QEC code sub-family."""
+
+    id: str
+    name: str
+    family: str
+    description: str | None = None
+    implementations: str | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class QECCustomCodeSubmitModel(BaseModel):
+    """Payload to store a custom code: a QECX file supplied by the user, kept in an experiment."""
+
+    experiment_id: str
+    name: str  # file name the custom code's slug is derived from
+    content: str  # base64-encoded bytes of the QECX file
+
+
+class QECCustomCodeModel(BaseModel):
+    """A custom code stored in an experiment. The file content itself is never returned."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    slug: str  # used as `code_slug`, like the slug of a global code
+    name: str
+    hash: str  # SHA-256 hex digest of the file content
+    experiment_id: str
+    creation_date: datetime
+
+
+class QECNoiseModel(BaseModel):
+    """Uniform noise parameters for a QEC run.
+
+    A plain dict with the keys ``p1q``, ``p2q`` and ``p_meas`` is accepted wherever a noise model
+    is. Where each noise channel is applied is explained in
+    `Noise model <https://docs.haiqu.ai/reference/run/qec_run#noise-model>`__.
+
+    Attributes:
+        p1q (float): Depolarizing probability of single-qubit gates, in ``[0, 1]``.
+        p2q (float): Depolarizing probability of two-qubit gates, in ``[0, 1]``.
+        p_meas (float): Probability that a measurement outcome is flipped, in ``[0, 1]``.
+    """
+
+    p1q: float = Field(ge=0.0, le=1.0, description="Single-qubit gate depolarizing probability")
+    p2q: float = Field(ge=0.0, le=1.0, description="Two-qubit gate depolarizing probability")
+    p_meas: float = Field(ge=0.0, le=1.0, description="Measurement flip probability")
+
+
+class QECCompileSubmitModel(BaseModel):
+    """QEC compilation submit payload data model."""
+
+    experiment_id: str
+    circuit_ids: list = []
+    code_slug: str
+    compilation_options: Optional[dict] = {}
+    name: Optional[str] = ""
+    description: Optional[str] = ""
+
+
+# The QEC workers write a failed job's error after this line in the job's logs.
+QEC_ERROR_MARKER = "QEC job error:"
+
+
+def _qec_job_error_text(logs: str | None) -> str:
+    """The error part of a QEC job's logs: what follows the last error marker, or all logs without one."""
+    if logs and QEC_ERROR_MARKER in logs:
+        return logs.rsplit(QEC_ERROR_MARKER, 1)[1].strip()
+    return (logs or "").strip()
+
+
+class _QECJobErrorsMixin:
+    """Raise JobFailedError and JobCancelledError, with the error part of the logs, from a QEC job's ``result``."""
+
+    def _failed_error(self) -> Exception:
+        return exceptions.JobFailedError(
+            f"QEC job {self.id} failed: {_qec_job_error_text(self.logs) or 'the service reported no details.'}",
+            job_id=self.id,
+            logs=self.logs,
+        )
+
+    def _cancelled_error(self) -> Exception:
+        reason = _qec_job_error_text(self.logs) if self.logs and QEC_ERROR_MARKER in self.logs else ""
+        message = f"QEC job {self.id} was cancelled" + (f": {reason}" if reason else ".")
+        return exceptions.JobCancelledError(message, job_id=self.id, logs=self.logs)
+
+
+class QECCompilationJobModel(_QECJobErrorsMixin, BaseJobModel):
+    """Job that compiles logical circuits to a QEC code, as returned by ``haiqu.qec_compile``.
+
+    Call :meth:`result` to wait for the job to finish and obtain the compiled circuits.
+
+    Attributes:
+        id (str): ID of the job, for retrieving it later with ``haiqu.get_job``.
+        status (JobStatus): Status of the job when it was last checked.
+        circuit_ids (list): IDs of the submitted logical circuits.
+        code_slug (str): Slug of the target QEC code, as given in ``code``.
+        compilation_options (dict): The compilation options exactly as given to
+            ``haiqu.qec_compile``, ``{}`` when none were given.
+        compiled_circuit_ids (list | None): IDs of the compiled circuits, available once the job
+            has finished, ``None`` until then.
+    """
+
+    circuit_ids: list
+    code_slug: str
+    compilation_options: dict
+
+    # Populated after job finishes, list of circuit IDs
+    compiled_circuit_ids: Optional[list] = None
+
+    def retrieve_status(self) -> JobStatus:
+        """
+        Query backend for the job status.
+        """
+        response = cast(QECCompilationJobModel, self._retrieve_status())
+        self.compiled_circuit_ids = response.compiled_circuit_ids
+
+        return self.status
+
+    def result(self) -> CircuitModel | list[CircuitModel] | None:
+        """Wait for the job to finish and return the compiled circuits.
+
+        The call blocks until the job has finished, checking its status every few seconds, with no
+        timeout. Interrupting the wait (for example with Ctrl+C) returns ``None`` without
+        cancelling the job; call :meth:`result` again to resume waiting. The job can also be
+        retrieved later by its ID with ``haiqu.get_job``.
+
+        Each compiled circuit carries a ``qec`` field (see :class:`QECCircuitInfoModel`) and can
+        be passed to ``haiqu.qec_run``.
+
+        Returns:
+            CircuitModel | list[CircuitModel] | None: The compiled circuit when the job produced
+            one, otherwise a list of the compiled circuits. ``None`` if the wait was interrupted.
+
+        Raises:
+            haiqu.sdk.exceptions.JobFailedError: If the job failed. The message describes the problem,
+                and the exception's ``logs`` holds all log messages of the job.
+            haiqu.sdk.exceptions.JobCancelledError: If the job was cancelled, by the user or because it
+                exceeded the time limit of 30 minutes, which the message then says.
+        """
+        super().result()
+
+        if self.compiled_circuit_ids is None:
+            return None
+        compiled = [self._client.get_circuit(circuit_id=c_id) for c_id in self.compiled_circuit_ids]
+        if len(compiled) == 1:
+            return compiled[0]
+        return compiled
+
+    def progress(self):
+        """Display a progress widget for the job and stream its log messages."""
+        self._progress("QEC COMPILATION JOB PROGRESS")
+
+
+class QECRunSubmitModel(BaseModel):
+    """QEC noisy-sampler run submit payload data model."""
+
+    experiment_id: str
+    circuit_ids: list = []
+    shots: int = Field(ge=1, description="Number of measurement shots (must be >= 1)", default=1024)
+    noise: QECNoiseModel
+    sampler: str = "stim"
+    decoder: str = "auto"
+    seed: Optional[int] = Field(default=None, ge=0, description="Random seed (must be >= 0 if provided)")
+    # Selects which labeled boxes of the compiled circuit receive noise; `None` applies noise
+    # everywhere.
+    toggles: Optional[dict] = None
+    # Target code for circuits that are not already QEC-compiled; the service compiles them on the
+    # fly. Ignored for already-compiled circuits (which carry their own `qec` metadata).
+    code_slug: Optional[str] = None
+    compilation_options: Optional[dict] = {}
+    name: Optional[str] = ""
+    description: Optional[str] = ""
+
+
+class QECRunResultModel(BaseModel):
+    """Decoded result of a QEC run for one circuit.
+
+    How to read the counts and the logical error rate is explained in
+    `Reading results <https://docs.haiqu.ai/reference/run/qec_run#reading-results>`__.
+
+    Attributes:
+        counts (dict[str, int]): Decoded counts of the circuit's classical bits in the logical
+            frame, keyed by bitstring in Qiskit's convention: one space-separated group per
+            classical register, the first register rightmost, and bit 0 rightmost within its
+            group.
+        logical_error_rate (float): Fraction of the shots the decoder got wrong. The precise
+            definition is given in
+            `Reading results <https://docs.haiqu.ai/reference/run/qec_run#reading-results>`__.
+        shots (int): Number of shots.
+        decoder (str): The decoder actually used, with ``"auto"`` resolved to its concrete
+            choice.
+        code_slug (str): Slug of the QEC code the circuit was compiled to.
+        decoded_degrees_of_freedom (int | None): Number of logical outcomes, or deterministic
+            combinations of them, that the decoder predicts. ``0`` means none could be decoded, and
+            ``logical_error_rate`` is then ``0.0`` by convention. ``None`` for results of jobs that
+            ran before this was reported.
+    """
+
+    counts: dict[str, int]
+    logical_error_rate: float
+    shots: int
+    decoder: str
+    code_slug: str
+    decoded_degrees_of_freedom: Optional[int] = None
+
+
+class QECRunJobModel(_QECJobErrorsMixin, BaseJobModel):
+    """Job that samples circuits under noise and decodes the outcomes, as returned by ``haiqu.qec_run``.
+
+    Call :meth:`result` to wait for the job to finish and obtain the decoded results.
+
+    Attributes:
+        id (str): ID of the job, for retrieving it later with ``haiqu.get_job``.
+        status (JobStatus): Status of the job when it was last checked.
+        circuit_ids (list): IDs of the submitted circuits.
+        shots (int): Number of shots per circuit.
+        noise (QECNoiseModel): The noise model of the run.
+        sampler (str): The requested sampler.
+        decoder (str): The requested decoder, possibly ``"auto"``. The decoder actually used is
+            reported on each result.
+        seed (int | None): The random seed, ``None`` when none was given.
+        toggles (dict | None): The selection of where noise is applied, ``None`` when noise is
+            applied everywhere. The integer qubit indices of ``"qubit_gate_overrides"`` come back
+            as strings.
+        code_slug (str | None): Slug of the QEC code given in ``code`` for compiling circuits
+            during the run, ``None`` when none was given.
+        compilation_options (dict): The compilation options given for compiling circuits during
+            the run.
+        qec_results (list[QECRunResultModel] | None): One decoded result per circuit, available
+            once the job has finished, ``None`` until then.
+    """
+
+    circuit_ids: list
+    shots: int
+    noise: QECNoiseModel
+    sampler: str
+    decoder: str
+    seed: Optional[int] = None
+    toggles: Optional[dict] = None
+    code_slug: Optional[str] = None
+    compilation_options: Optional[dict] = {}
+
+    # Populated after job finishes, one entry per circuit
+    qec_results: Optional[list[QECRunResultModel]] = None
+
+    def retrieve_status(self) -> JobStatus:
+        """
+        Query backend for the job status.
+        """
+        response = cast(QECRunJobModel, self._retrieve_status())
+        self.qec_results = response.qec_results
+
+        return self.status
+
+    def result(self) -> QECRunResultModel | list[QECRunResultModel] | None:
+        """Wait for the job to finish and return the decoded results.
+
+        The call blocks until the job has finished, checking its status every few seconds, with no
+        timeout. Interrupting the wait (for example with Ctrl+C) returns ``None`` without
+        cancelling the job; call :meth:`result` again to resume waiting. The job can also be
+        retrieved later by its ID with ``haiqu.get_job``.
+
+        Returns:
+            QECRunResultModel | list[QECRunResultModel] | None: The result of the circuit when the
+            job ran one circuit, otherwise a list with one result per circuit. ``None`` if the wait
+            was interrupted.
+
+        Raises:
+            haiqu.sdk.exceptions.JobFailedError: If the job failed. The message describes the problem,
+                and the exception's ``logs`` holds all log messages of the job.
+            haiqu.sdk.exceptions.JobCancelledError: If the job was cancelled, by the user or because it
+                exceeded the time limit of 30 minutes, which the message then says.
+        """
+        super().result()
+
+        if self.qec_results is not None and len(self.qec_results) == 1:
+            return self.qec_results[0]
+        return self.qec_results
+
+    def progress(self):
+        """Display a progress widget for the job and stream its log messages."""
+        self._progress("QEC RUN JOB PROGRESS")
 
 
 JOB_MODELS = (
@@ -3437,4 +4394,7 @@ JOB_MODELS = (
     | VariationalJobModel
     | PretrainingJobModel
     | SKQDJobModel
+    | TomographyJobModel
+    | QECCompilationJobModel
+    | QECRunJobModel
 )

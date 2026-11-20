@@ -30,11 +30,16 @@ DISPLAY_AS_HTML_EXCEPTIONS = (
 
 
 def format_network_error(rest_api_uri: str, exception: Exception):
-    if hasattr(exception, "response") and exception.response is not None and exception.response.status_code == 402:
+    response = getattr(exception, "response", None)
+    if response is not None and response.status_code == 402:
         return (
             "Your account does not have enough credits to run jobs. "
             "Please request more credits http://dashboard.haiqu.ai/pricing"
         )
+    if response is not None and response.status_code not in (502, 503, 504):
+        # The API answered, so the message (with the API's description of the problem) says what went wrong.
+        # A gateway error is left to the message below: the API itself may not be running.
+        return f"The Haiqu API service {rest_api_uri} could not process the request:\n\n{exception}"
 
     return (
         f"Haiqu API service {rest_api_uri} is not responding or returned an error.\n"

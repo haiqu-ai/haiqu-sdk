@@ -4,13 +4,17 @@ accelerate the development of quantum applications with optimized application su
 data loading, circuit compression and performance analytics tools.
 """
 
+import base64
+import hashlib
+import io
 import json
 import os
 import copy
 import configparser
 import textwrap
 import warnings
-from typing import Any, Optional, Union
+from pathlib import Path
+from typing import Any, BinaryIO, Literal, Optional, TypeGuard, Union, cast
 from collections.abc import Sequence
 from inspect import signature
 from numbers import Integral, Number, Real
@@ -33,6 +37,7 @@ from .optimization.problem import (
 )
 from .optimization.qubo import _USE_OPTIMIZATION_PROBLEM
 import numpy as np
+from numpy.typing import ArrayLike
 import pandas as pd
 import sympy
 
@@ -48,8 +53,10 @@ from requests.exceptions import HTTPError
 from . import constants
 from . import errors
 from . import health
+from ._function_basis import check_family, parse_expression
 from .api_client import ApiClient
 from .backpropagation import backpropagation
+from .handles import check_handle
 from .hybrid import HybridProgram, layers, program_from_run_options
 from .legacy import Legacy
 from .qml.compression_options import CompressionOptions
@@ -95,6 +102,7 @@ from .schemas import (
     _DEFAULT_SYNTHESIS_OPTIONS,
     resolve_synthesis_options,
     DeviceModel,
+    HandleSubmitModel,
     SubmitMetricsModel,
     SubmitTranspilationModel,
     SubmitObservableBackpropagationModel,
@@ -108,7 +116,18 @@ from .schemas import (
     PostprocessSKQDParams,
     SKQDSubmitModel,
     SKQDJobModel,
+    QECCodeModel,
+    QECCodeListResponseModel,
+    QECCompileSubmitModel,
+    QECCompilationJobModel,
+    QECCustomCodeSubmitModel,
+    QECNoiseModel,
+    QECRunSubmitModel,
+    QECRunJobModel,
     TranspilationOptions,
+    TomographyJobModel,
+    TomographySubmitModel,
+    TomographyType,
 )
 from .skqd import SKQDOptions
 from .utils import (
@@ -148,6 +167,7 @@ from .constants import (
     MIN_COMPRESSION_APPROXIMATION_LEVEL,
     MIN_DL_INTERVAL_WIDTH,
     SUPPORTED_MULTIVARIATE_DIMENSIONS,
+    TOMOGRAPHY_FAMILIES,
     Verbosity,
 )
 
@@ -267,6 +287,24 @@ def _device_not_found(device_id: str) -> ValueError:
     )
 
 
+def _api_error_reason(response) -> str | None:
+    """The reason that the Haiqu API gives for refusing a request, or ``None`` if the response does not give one."""
+    try:
+        detail = response.json()["detail"]
+    except (ValueError, KeyError, TypeError):  # not JSON, or no `detail`
+        return None
+    if isinstance(detail, str):
+        return detail
+    if isinstance(detail, list):  # field errors: [{"loc": ..., "msg": ..., "type": ...}, ...]
+        messages = [
+            error["msg"].removeprefix("Value error, ")
+            for error in detail
+            if isinstance(error, dict) and isinstance(error.get("msg"), str)
+        ]
+        return " ".join(messages) or None
+    return None
+
+
 # The wall-clock budget means the same thing to every loader, so its description lives here
 # rather than being restated once per method.
 _MAX_TIME_ARG = f"""            max_time (int | float): Soft time limit for the job (in seconds).
@@ -314,6 +352,11 @@ def _synthesis_options_arg(dl_type):
                                       each method accepts, what it means and what it defaults to.
                                       Defaults to ``None``, which this method unwraps into
 {wrapped}``."""
+
+
+def _expression_to_string(expression, what: str = "expression") -> str:
+    """Normalize a string or SymPy expression in the single real variable `x` for transport."""
+    return str(parse_expression(expression, what))
 
 
 class Haiqu:
@@ -1282,6 +1325,39 @@ class Haiqu:
 
             return list_simulators(items)
         return items
+
+    @errors.graceful_api_errors_message
+    def set_handle(self, handle: str) -> UserModel:
+        """Choose your handle, which names you in the Haiqu cloud.
+
+        Other users will see your handle, and you may not change it once it is set!
+
+        A handle has 4 to 32 characters: lowercase letters, digits and hyphens. It starts with a letter, and each hyphen sits
+        between two letters or digits (no repeated, leading, or trailing hyphens), as in ``example-user-2``.
+
+        Args:
+            handle (str): Your new handle.
+
+        Returns:
+            UserModel: Your profile, with the handle.
+
+        Raises:
+            ValueError: If ``handle`` is not a valid handle, if it is reserved or already taken, or if you already have a
+                different handle. The message gives the reason.
+
+        Examples:
+            >>> haiqu.set_handle("example-user-2").handle
+            'example-user-2'
+        """
+        handle = check_handle(handle)  # check before model validation for better error
+        try:
+            return self._client.set_handle(HandleSubmitModel(handle=handle))
+        except HTTPError as e:
+            if e.response is not None and e.response.status_code in (409, 422):
+                reason = _api_error_reason(e.response)
+                if reason is not None:
+                    raise ValueError(reason) from None
+            raise
 
     @errors.graceful_api_errors_message
     def get_circuit(self, circuit_id: str) -> CircuitModel:
@@ -2413,16 +2489,7 @@ class Haiqu:
         # `func` is accepted as a SymPy expression or a string and normalized to a string for transport.
         # Only the single real variable `x` is allowed. The imaginary unit `I` is a SymPy constant, not a
         # free symbol, so complex-valued functions such as `exp(I*x)` pass the single-variable check.
-        try:
-            expression = sympy.sympify(func)
-        except (sympy.SympifyError, SyntaxError, TypeError) as exc:
-            raise ValueError(f"Could not parse `func` as a SymPy expression: {func!r}") from exc
-
-        extra_symbols = {s for s in expression.free_symbols if s.name != "x"}
-        if extra_symbols:
-            raise ValueError(f"`func` must be an expression in the single variable `x`, but also got symbols {extra_symbols}")
-
-        func_str = str(expression)
+        func_str = _expression_to_string(func, "func")
 
         parameters = {
             "func": func_str,
@@ -2885,7 +2952,8 @@ class Haiqu:
 
             noise_profile (str): The device noise profile to assume during compression. The currently available options are:
                                  "ibm_eagle_r3", "ibm_heron_r1", "ibm_heron_r2" (default), "ibm_heron_r3",
-                                 "iqm_garnet" and "iqm_emerald". Used to automatically set the approximation level.
+                                 "ibm_nighthawk_r1", "ibm_nighthawk_r2", "iqm_garnet" and "iqm_emerald". Used to
+                                 automatically set the approximation level.
 
             fine_tuning (str): The extent to which classical resources should be used to further improve the compressed circuit.
                                Three options are available:
@@ -3030,9 +3098,10 @@ class Haiqu:
                                               yielding the most extreme depth reduction. Recommended to combine
                                               with custom approximation level to tune the quality.
 
-            noise_profile (str | None): The device noise profile to use during compression. See `state_compression` options.
-                                        By default (None) the noise profile is automatically chosen to match the device.
-                                        Used to automatically set the approximation level.
+            noise_profile (str | None): The device noise profile to use during compression. The currently available options are:
+                                        "ibm_heron_r2", "ibm_heron_r3", "ibm_nighthawk_r1", "ibm_nighthawk_r2", "iqm_garnet" and
+                                        "iqm_emerald". By default (None) the noise profile is automatically chosen to match the
+                                        device. Used to automatically set the approximation level.
 
             fine_tuning (str): The extent to which classical resources should be used to further improve the compressed circuit.
                                Three options are available:
@@ -3508,6 +3577,181 @@ class Haiqu:
             backpropagated_observables.append(backpropagated_observable)
 
         return result_circuits, backpropagated_observables
+
+    @errors.graceful_api_errors_message
+    def clifford_t_synthesis(
+        self,
+        circuit: Union[QuantumCircuit, CircuitModel],
+        total_t_gate_budget: Optional[int] = None,
+        gate_t_gate_budget: Optional[int] = None,
+        total_precision_tolerance: Optional[float] = None,
+        gate_precision_tolerance: Optional[float] = None,
+        max_trasyn_budget: Optional[int] = 13,
+        exact_spectral_norm: bool = False,
+    ) -> tuple[CircuitModel, dict]:
+        """
+        Synthesizes a circuit into a Clifford+T approximation. The synthesis can be given either a target T-gate budget for
+        the entire circuit, a T-gate budget per gate, a minimum precision tolerance for the entire circuit, or a per gate
+        minimum precision tolerance. Precision tolerance for a gate U_i with approximation V_i is defined using the spectral
+        norm distance minimized over global phase ψ, ε_i = min_ψ ||U_i - V_i e^{iψ}||_2. Precision tolerance for the total
+        circuit is taken as the sum of spectral norm distances for each gate, Σ_i ε_i.
+
+        The two methods used are:
+            1) GridSynth - Approximates a general Z-rotation by mapping the angle and a given precision tolerance onto a
+                           two-dimensional grid where exact factorization is possible. See https://arxiv.org/pdf/1403.2975.
+                           The current implementation uses GridSynth if a target precision tolerance is given or if the per
+                           gate T-gate budget exceeds 'max_trasyn_budget'.
+            2) TRASYN - Uses tensor networks to probabilistically find the best approximation to a general U3 gate available
+                        given a specific T-gate budget. See https://arxiv.org/pdf/2503.15843. TRASYN often leads to a circuit
+                        with fewer T-gates than GridSynth. However, computing times are proportional to the per-gate budget.
+                        TRASYN is used when the gate T-gate budget is less than or equal to 'max_trasyn_budget'.
+
+        If both a target T-gate budget and a target precision tolerance are given, the T-gate budget is used and tolerance is
+        ignored. If both a total and gate budget/tolerance are given, the total is used instead of the gate budget/tolerance.
+        If no variables are given, the synthesis proceeds with total_precision_tolerance = 1e-8.
+
+        NOTE: A minimum precision tolerance (1e-13) before numerical inaccuracies become considerable leads to a cap on the
+        maximum number of T-gates possible in the output circuit.
+
+        The synthesis runs in the Haiqu cloud as a hybrid job (see :meth:`flow`), and this method waits for it to finish.
+        The job's program is an :class:`~haiqu.sdk.hybrid.layers.InputLayer` followed by a
+        :class:`~haiqu.sdk.hybrid.layers.CliffordTSynthesisLayer` with the options given here, which ends the program. The
+        synthesized circuit is logged to the current experiment and linked to the input circuit.
+
+        Args:
+            circuit (QuantumCircuit | CircuitModel): The circuit to synthesize. All of its parameters must be bound.
+            total_t_gate_budget (int, optional): The target T-gate budget for the entire circuit.
+            gate_t_gate_budget (int, optional): The target T-gate budget for each non-Clifford rotation.
+            total_precision_tolerance (float, optional): The precision tolerance for the entire circuit. Must be greater or equal
+                                                         to 1e-13.
+            gate_precision_tolerance (float, optional): The precision tolerance to use for GridSynth for each Rz gate. Must be
+                                                        greater than or equal to 1e-13.
+            max_trasyn_budget (int, optional): The maximum T-gate budget we allow before switching from TRASYN to GridSynth.
+                                               Must be between 0 and 65 (inclusive). Defaults to 13. ``None`` uses the
+                                               synthesis default, which is also 13.
+            exact_spectral_norm (bool, optional): Whether to also compute the exact spectral norm distance between the whole
+                                                  circuit and its approximation, from their full unitaries. Its cost grows
+                                                  exponentially with the width, so it is only available for circuits with 10
+                                                  or fewer qubits. Defaults to False.
+
+        Returns:
+            circuit (CircuitModel): The synthesized Clifford+T circuit, logged to the current experiment.
+            info (dict): Information dictionary about the synthesis process, with keys:
+
+                * full_synthesis_time: Time required for the entire Clifford+T synthesis process.
+                * input_circuit_properties (dict): Properties of the input circuit, with keys:
+
+                    * num_t_gates: Number of T-gates that don't require synthesis.
+                    * num_gates_to_synthesize:  Number of non-Clifford gates to synthesize.
+                    * total_num_non_clifford_gates: Total number of non-Clifford gates.
+
+                * output_circuit_properties (dict): Properties of the output circuit, with keys:
+
+                    * t_gate_count: Total number of T-gates in the synthesized circuit.
+                    * t_gate_depth: T-gate depth of the synthesized circuit.
+                    * overall_spectral_norm: Spectral norm of the difference between the unitary matrices of the
+                      original and synthesized circuits. Only calculated when ``exact_spectral_norm`` is set, with None
+                      returned otherwise.
+                    * overall_spectral_norm_upper_bound: Upper bound to the circuit's spectral norm distance, found
+                      by summing the spectral norm distances for each synthesized gate. This is also 1/2 an upper bound to
+                      the diamond norm distance for noiseless channels.
+                    * budget_allocation_for_synthesis: List of budget allocation to each synthesized gate.
+                    * t_gate_count_for_synthesized_gates: List of the T-gate counts for each individual synthesized gate.
+                    * spectral_norms_for_synthesized_gates: List of the spectral norm distances for each individual
+                      synthesized gate.
+
+        Examples:
+            >>> from qiskit.circuit.random import random_clifford_circuit
+            >>> qc = random_clifford_circuit(5, 10, seed=42)
+            >>> qc.rz(1.0, 0)
+            >>> qc.rx(-2.0, 1)
+            >>> qc.ry(0.5, 4)
+            >>> synth_qc, info = haiqu.clifford_t_synthesis(qc, total_t_gate_budget=20)
+            >>> info['input_circuit_properties']['total_num_non_clifford_gates']
+            3
+            >>> info['output_circuit_properties']['t_gate_count']
+            9
+            >>> info['output_circuit_properties']['overall_spectral_norm_upper_bound']
+            0.3099627526743576
+        """
+        self._check_experiment()
+
+        def _check_param(name, value, expected_type, min_value, max_value):
+            """Checks if one parameter is the expected type between the minimum and maximum value."""
+            if value is None:
+                return
+            if not isinstance(value, expected_type) or isinstance(value, bool):
+                raise ValueError(f"{name} must either be a {expected_type.__name__} or None, not `{type(value).__name__}`")
+            if min_value is not None:
+                if value < min_value:
+                    raise ValueError(f"{name} must be at least {min_value}, not `{value}`")
+            if max_value is not None:
+                if value > max_value:
+                    raise ValueError(f"{name} must be at most {max_value}, not `{value}`")
+
+        _check_param("total_t_gate_budget", total_t_gate_budget, int, 0, None)
+        _check_param("gate_t_gate_budget", gate_t_gate_budget, int, 0, None)
+        _check_param("total_precision_tolerance", total_precision_tolerance, Real, 1e-13, None)
+        _check_param("gate_precision_tolerance", gate_precision_tolerance, Real, 1e-13, None)
+        _check_param("max_trasyn_budget", max_trasyn_budget, int, 0, 65)
+        if not isinstance(exact_spectral_norm, bool):
+            raise ValueError(f"exact_spectral_norm must be a bool, not `{type(exact_spectral_norm).__name__}`")
+
+        if not isinstance(circuit, (QuantumCircuit, CircuitModel)):
+            raise ValueError("The 'circuit' argument must be a QuantumCircuit or CircuitModel instance.")
+
+        if isinstance(circuit, CircuitModel):
+            if not circuit.generated and circuit.qpy is not None:
+                num_parameters = from_qpy(circuit.qpy).num_parameters
+            elif circuit.analytics is not None:
+                num_parameters = circuit.analytics.num_parameters
+            else:
+                num_parameters = None
+        else:
+            num_parameters = circuit.num_parameters
+
+        if num_parameters:
+            raise ValueError("Parametrized circuit can not be synthesized. Bind all parameters first")
+
+        if isinstance(circuit, QuantumCircuit):
+            circuit = self._get_or_create_circuit(circuit=circuit, name=circuit.name)
+
+        program = HybridProgram(
+            layers=[
+                layers.InputLayer(),
+                layers.CliffordTSynthesisLayer(
+                    total_t_gate_budget=total_t_gate_budget,
+                    gate_t_gate_budget=gate_t_gate_budget,
+                    total_precision_tolerance=total_precision_tolerance,
+                    gate_precision_tolerance=gate_precision_tolerance,
+                    max_trasyn_budget=max_trasyn_budget,
+                    exact_spectral_norm=exact_spectral_norm,
+                ),
+            ]
+        )
+
+        job = self._client.flow(
+            data=HybridSubmitModel(
+                experiment_id=self._experiment.id,
+                name=f"Clifford+T synthesis of {circuit.name}"[:200],
+                program=program,
+                circuit_ids=[circuit.id],
+            )
+        )
+        self._display_dashboard_links(job)
+
+        synthesized_circuits = job.result()
+        if job.status != JobStatus.DONE:
+            # Waiting was interrupted; the job itself carries on in the cloud.
+            raise RuntimeError(
+                f"Stopped waiting for the Clifford+T synthesis job {job.id!r}, which is still running. "
+                f"Retrieve it later with haiqu.get_job({job.id!r})."
+            )
+
+        synthesized_circuit = synthesized_circuits[0]
+        synthesis_information = job.info["clifford_t_synthesis"][0]["information"]
+
+        return synthesized_circuit, synthesis_information
 
     @errors.graceful_api_errors_message
     def pretrain(
@@ -4015,6 +4259,96 @@ class Haiqu:
         return job
 
     @errors.graceful_api_errors_message
+    def run_dfs(
+        self,
+        circuits: QuantumCircuit | list[QuantumCircuit] | CircuitModel | list[CircuitModel],
+        device_id: str,
+        *,
+        shots: int = 1000,
+        parameters: list | None = None,
+        observables: SparsePauliOp | list[SparsePauliOp] | list[list[SparsePauliOp]] | None = None,
+        postselect: bool = True,
+        swap_dd: bool = False,
+        dynamical_decoupling: bool = False,
+        optimization_level: Literal[0, 1, 2, 3] | None = None,
+        device_options: dict | None = None,
+        job_name: str | None = None,
+        job_description: str | None = None,
+        device_credentials: dict | None = None,
+        dry_run: bool = False,
+    ) -> HybridJobModel:
+        """
+        Run circuits encoded in a three-qubit decoherence-free subsystem (DFS-3).
+
+        Builds the hybrid program ``InputLayer → [ObservableSplitLayer, QWCComputeLayer] → DFSEncodingLayer →
+        TranspilationLayer → [SwapDDLayer] → [DynamicalDecouplingLayer] → DeviceLayer`` and submits it with
+        :meth:`flow`. Every qubit is encoded into three physical qubits, so the device needs three times the
+        circuit's qubits; results are reported over the logical qubits. On devices that are not all-to-all
+        connected, check that the transpiled circuit keeps each encoded qubit's three physical qubits adjacent;
+        otherwise routing overhead grows and the protection (and swap dynamical decoupling) weakens.
+
+        Args:
+            circuits: The quantum circuit(s) to encode and run. Can be a single circuit or a list of circuits.
+            device_id (str): The device to run on.
+            shots (int): The number of shots for each circuit execution. Defaults to 1000.
+            parameters: The parameters for the circuits, as in :meth:`flow`.
+            observables: The observable(s) to measure, as in :meth:`flow`. When given, the observables are
+                         turned into measurement circuits before encoding and expectation values are returned.
+            postselect (bool): Discard shots in which an encoded qubit left its protected state. The discarded
+                               fraction is reported in ``job.dfs_discard_fraction`` for distribution jobs.
+                               Defaults to ``True``.
+            swap_dd (bool): Add swap dynamical decoupling: while an encoded block idles, its qubits are cycled through
+                            all role permutations so that slowly varying noise looks collective to the code. How many
+                            encoded qubits were protected is reported in ``job.swap_dd_coverage``. To set its options
+                            (``max_dwell_dt``, ``fix_total``, ``strict``), build the program by hand and submit it
+                            with :meth:`flow`.
+            dynamical_decoupling (bool): Add pulse-level dynamical decoupling on the remaining idle time.
+            optimization_level: Transpiler optimization level (0-3); leave unset for the default.
+            device_options (dict | None): Backend-specific settings passed to the ``DeviceLayer`` (see :meth:`flow`).
+            job_name (str | None): The name for the job. If ``None`` (default), a name will be automatically generated.
+            job_description (str | None): The description for the job.
+            device_credentials (dict | None): Credentials for device access.
+            dry_run (bool): Whether to stop just prior to backend execution for QPU cost estimation.
+
+        Returns:
+            HybridJobModel: The Hybrid job executing the encoded circuits; see :meth:`flow` for the result layout.
+
+        Examples:
+            >>> from qiskit import QuantumCircuit
+            >>> circuit = QuantumCircuit(2)
+            >>> circuit.h(0)
+            >>> circuit.cx(0, 1)
+            >>> circuit.measure_all()
+            >>> job = haiqu.run_dfs(circuit, device_id="aer_simulator", shots=2000, swap_dd=True)
+            >>> job.result()
+            [{'00': 0.503, '11': 0.497}]
+            >>> job.dfs_discard_fraction
+            [0.0]
+        """
+        program_layers: list[layers.Layer] = [layers.InputLayer()]
+        if observables is not None:
+            program_layers += [layers.ObservableSplitLayer(), layers.QWCComputeLayer()]
+        program_layers.append(layers.DFSEncodingLayer(postselect=postselect))
+        program_layers.append(layers.TranspilationLayer(optimization_level=optimization_level))
+        if swap_dd:
+            program_layers.append(layers.SwapDDLayer())
+        if dynamical_decoupling:
+            program_layers.append(layers.DynamicalDecouplingLayer())
+        program_layers.append(layers.DeviceLayer(device_id=device_id, options=device_options or {}))
+
+        return self.flow(
+            HybridProgram(layers=program_layers),
+            circuits,
+            shots=shots,
+            parameters=parameters,
+            observables=observables,
+            job_name=job_name,
+            job_description=job_description,
+            device_credentials=device_credentials,
+            dry_run=dry_run,
+        )
+
+    @errors.graceful_api_errors_message
     def flow(
         self,
         program: HybridProgram,
@@ -4053,10 +4387,11 @@ class Haiqu:
                          reversed-order convention (e.g., ``"IZ"`` measures qubit 0 in the Z basis). Defaults to ``None``,
                          in which case the circuits must include their own measurements.
             readout_bases: Per-qubit Pauli bases to read the circuits out in, e.g. ``["XXXX", "ZZZZ"]``, Qiskit
-                           little-endian (the last character applies to qubit 0). Requires a ``ReadoutBasisLayer``
-                           in ``program``, and is mutually exclusive with ``observables``. Each basis is a separate
-                           execution, so the cost is ``len(readout_bases) * shots``. Defaults to ``None``, which
-                           reads out in the computational basis.
+                           little-endian (the last character applies to qubit 0). Mutually exclusive with
+                           ``observables``, and needs a ``program`` that returns measured distributions: one with
+                           no ``EstimatorLayer``, ``StatevectorLayer`` or ``CliffordTSynthesisLayer``. Each basis
+                           is a separate execution, so the cost is ``len(readout_bases) * shots``. Defaults to
+                           ``None``, which reads out in the computational basis.
 
                          Accepted shapes:
 
@@ -4090,6 +4425,13 @@ class Haiqu:
                 * With observables, no parameter sweep: 2D list of expectation values, indexed ``[circuit][observable]``.
                 * With observables and a parameter sweep: 3D list of expectation values, indexed
                   ``[circuit][observable][parameter]``.
+                * With readout bases: the basis axis takes the observable position — ``[circuit][basis]``,
+                  or ``[circuit][basis][parameter]`` with a parameter sweep — in the order the bases were
+                  passed.
+
+                ``job.result_by_observable()`` and ``job.result_by_basis()`` return the same results paired
+                with the observable or readout basis that produced them, and ``job.uncertainty`` the
+                shot-noise uncertainty of each expectation value, nested like ``result()``.
 
                 **Dry runs** (``dry_run=True``): ``result()`` is empty. Use ``job.estimated_qpu_cost`` for
                 the QPU cost estimate and ``job.pre_device_pipeline_time`` for classical hybrid time
@@ -4098,7 +4440,10 @@ class Haiqu:
                 **Full runs** (``dry_run=False``): ``job.time`` is the device-phase wall clock (from when
                 device execution starts to job completion). ``job.pre_device_pipeline_time`` reports
                 classical hybrid time before the device layer. ``job.info`` also exposes auxiliary
-                metadata (``uncertainty`` when observables are supplied, ``qpu_cost`` on full runs).
+                metadata (``uncertainty`` when observables are supplied, ``qpu_cost`` on full runs, and
+                ``dfs_discard_fraction`` for a distribution job whose program has a ``DFSEncodingLayer`` with
+                ``postselect=True``, and ``swap_dd_coverage`` for one whose program has a ``SwapDDLayer``;
+                distributions are then over the logical qubits).
                 Run ``help(job.result)`` for the full description of result and ``info`` contents.
 
                 In a notebook, a link to the job on the Dashboard is also displayed when
@@ -4310,17 +4655,16 @@ class Haiqu:
 
         # Validated before uploading anything, so a malformed basis never creates circuits.
         readout_bases = validate_readout_bases(readout_bases, observables, circuits)
-        has_basis_layer = any(isinstance(layer, layers.ReadoutBasisLayer) for layer in program.layers)
-        if readout_bases is not None and not has_basis_layer:
-            raise ValueError(
-                "`readout_bases` was supplied but the program has no ReadoutBasisLayer, so the bases would "
-                "never be applied. Add a ReadoutBasisLayer to the program."
-            )
-        if has_basis_layer and readout_bases is None:
-            raise ValueError(
-                "The program has a ReadoutBasisLayer but no `readout_bases` were supplied, so every circuit "
-                "would be read out in the computational basis. Pass `readout_bases=[...]`."
-            )
+        if readout_bases is not None:
+            # Layers whose program returns something other than measured distributions: expectation
+            # values, statevectors or circuits.
+            unsupported = (layers.EstimatorLayer, layers.StatevectorLayer, layers.CliffordTSynthesisLayer)
+            rejected = sorted({type(layer).__name__ for layer in program.layers if isinstance(layer, unsupported)})
+            if rejected:
+                raise ValueError(
+                    f"`readout_bases` cannot be combined with {', '.join(rejected)}: readout bases need a program "
+                    "that returns measured distributions, one per basis."
+                )
 
         device_id = None
         new_layers = []
@@ -4345,8 +4689,8 @@ class Haiqu:
 
         device_credentials = copy.deepcopy(device_credentials) if device_credentials is not None else {}
 
-        # A program that simulates exactly names no device, so there is none to look up and
-        # no backend to authenticate against.
+        # A program that simulates exactly or returns its circuits names no device, so there is
+        # none to look up and no backend to authenticate against.
         if device_id is not None:
             self._check_device_and_inject_credentials(device_id, device_credentials, dry_run=dry_run)
 
@@ -4460,9 +4804,8 @@ class Haiqu:
 
                 One distribution is returned per basis per circuit, so ``result()`` gains a basis axis in the
                 same position observables occupy: ``[circuit][basis]``, or ``[circuit][basis][parameter]`` with a
-                parameter sweep. The bases keep the order they were passed in, so
-                ``dict(zip(readout_bases, job.result()[i]))`` keys circuit ``i``'s distributions by basis
-                string.
+                parameter sweep. The bases keep the order they were passed in, and
+                ``job.result_by_basis()`` returns each circuit's distributions keyed by basis string.
 
                 Mutually exclusive with ``observables``. Combines with ``use_packing``: each packed copy of
                 the circuit is read out in the same basis, so a basis string still has one character per
@@ -4550,6 +4893,10 @@ class Haiqu:
                 * With readout bases: the basis axis takes the observable position — ``[circuit][basis]``,
                   or ``[circuit][basis][parameter]`` with a parameter sweep — in the order the bases were
                   passed.
+
+                ``job.result_by_observable()`` and ``job.result_by_basis()`` return the same results paired
+                with the observable or readout basis that produced them, and ``job.uncertainty`` the
+                shot-noise uncertainty of each expectation value, nested like ``result()``.
 
                 **Dry runs** (``dry_run=True``): ``result()`` is empty. Use ``job.estimated_qpu_cost`` for
                 the QPU cost estimate and ``job.pre_device_pipeline_time`` for the classical time spent
@@ -4798,7 +5145,6 @@ class Haiqu:
             use_packing=use_packing,
             pack_size=pack_size,
             has_observables=observables is not None,
-            has_readout_bases=bool(readout_bases),
             auto_quality=auto_quality,
         )
 
@@ -5452,6 +5798,315 @@ class Haiqu:
         self._display_dashboard_links(job)
         return job
 
+    @staticmethod
+    def _prepare_variational_function_tomography_params(
+        distributions, m, basis_functions, interval, grid, num_qubits, num_restarts, initial_coefficients
+    ):
+        """Expand the per-axis shorthand into the canonical (parameters, data) payload."""
+        # Numeric limits and register/axis consistency are left to schema validation.
+        if not isinstance(distributions, dict) or not distributions:
+            raise ValueError("distributions must be a non-empty dict keyed by readout basis")
+        width = len(next(iter(distributions)))
+
+        if num_qubits is None:
+            num_qubits = [width]
+        else:
+            sizes = [num_qubits] if np.ndim(num_qubits) == 0 else list(num_qubits)
+            if any(isinstance(size, bool) or not isinstance(size, (int, np.integer)) for size in sizes):
+                raise ValueError(f"num_qubits must be an integer or a sequence of integers, but {num_qubits!r} was given")
+            num_qubits = [int(size) for size in sizes]
+        num_axes = len(num_qubits)
+
+        def per_axis(name: str, value: Any, is_single) -> list:
+            """Broadcast a single value to every axis, or take a sequence as one entry per axis (length 1 is shared)."""
+            if is_single(value):
+                return [value] * num_axes
+            entries = list(value)
+            if len(entries) == 1:
+                entries = entries * num_axes
+            if len(entries) != num_axes:
+                raise ValueError(f"{name} must have one entry per axis ({num_axes}), but {len(entries)} were given")
+            return entries
+
+        def axis_basis(entry):
+            """A family name passes through; anything else is a sequence of this axis' own basis functions."""
+            if isinstance(entry, str):
+                try:
+                    return check_family(entry)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{exc}. To give an axis its own basis functions, pass them as a nested list, "
+                        'e.g. [["1", "x"], "fourier"]'
+                    ) from exc
+            return [_expression_to_string(expression, "basis function") for expression in entry]
+
+        # A flat sequence with no family name and no nested sequence is a single axis' basis functions;
+        # any other sequence has one entry per axis.
+        if isinstance(basis_functions, str):
+            basis_functions = [axis_basis(basis_functions)] * num_axes
+        else:
+            entries = list(basis_functions)
+            single_axis = not any(isinstance(entry, (list, tuple)) or entry in TOMOGRAPHY_FAMILIES for entry in entries)
+            if single_axis:
+                basis_functions = [axis_basis(entries)] * num_axes
+            else:
+                basis_functions = [axis_basis(entry) for entry in per_axis("basis_functions", entries, lambda value: False)]
+
+        if m is None:
+            if any(isinstance(entry, str) for entry in basis_functions):
+                raise ValueError(
+                    "m is required with a named basis family. Choose it against the shot budget: too many basis "
+                    "functions overfit at low shot counts."
+                )
+            m = [len(entry) for entry in basis_functions]
+        else:
+            m = per_axis("m", m, lambda value: isinstance(value, (int, np.integer)))
+            if any(isinstance(size, bool) or not isinstance(size, (int, np.integer)) for size in m):
+                raise ValueError("m must be an integer or a sequence of integers")
+            m = [int(size) for size in m]
+
+        def is_bound(value) -> bool:
+            return isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool)
+
+        def is_single_interval(value) -> bool:
+            return isinstance(value, (list, tuple, np.ndarray)) and len(value) == 2 and all(is_bound(bound) for bound in value)
+
+        def axis_interval(axis: int, entry) -> tuple:
+            """Coerce one axis' entry to a ``(low, high)`` pair of floats."""
+            bounds = list(entry) if isinstance(entry, (list, tuple, np.ndarray)) else []
+            if len(bounds) != 2 or not all(is_bound(bound) for bound in bounds):
+                raise ValueError(f"axis {axis}: interval must be a (low, high) pair of numbers, but {entry!r} was given")
+            return float(bounds[0]), float(bounds[1])
+
+        def flat_grid(grid) -> list:
+            """Check a grid against the register and flatten it in C order, as the request carries it."""
+            num_points = 2 ** sum(num_qubits)
+            # Checked before the grid is touched, so an oversized one is not copied first.
+            if num_points > constants.MAX_TOMOGRAPHY_GRID_POINTS:
+                raise ValueError(
+                    f"a custom grid on {sum(num_qubits)} qubits holds {num_points} points, above the limit of "
+                    f"{constants.MAX_TOMOGRAPHY_GRID_POINTS} points"
+                )
+            points = np.asarray(grid)
+            if points.dtype.kind not in "iuf":
+                raise ValueError(f"grid must hold real numbers, but its values are of type {points.dtype}")
+            expected = tuple(2**size for size in num_qubits) + (num_axes,)
+            # A single axis may leave out the trailing coordinate axis.
+            if num_axes == 1 and points.shape == expected[:1]:
+                points = points[:, None]
+            if points.shape != expected:
+                raise ValueError(
+                    f"grid must have shape {expected}: 2**num_qubits points along each axis, each holding "
+                    f"{num_axes} coordinate(s), but its shape is {points.shape}"
+                )
+            return points.astype(float).ravel().tolist()
+
+        data = {"distributions": distributions}
+        if grid is None:
+            interval = (-1.0, 1.0) if interval is None else interval
+            interval = [
+                axis_interval(axis, entry) for axis, entry in enumerate(per_axis("interval", interval, is_single_interval))
+            ]
+        elif interval is not None:
+            raise ValueError("pass either interval or grid, not both: a grid gives the coordinates of every point itself")
+        else:
+            data["grid"] = flat_grid(grid)
+
+        parameters = {
+            "num_qubits": num_qubits,
+            "m": m,
+            "basis_functions": basis_functions,
+            "interval": interval,
+            "num_restarts": num_restarts,
+            "initial_coefficients": initial_coefficients,
+        }
+        return parameters, data
+
+    @errors.graceful_api_errors_message
+    def variational_function_tomography(
+        self,
+        distributions: dict[str, dict[str, float]],
+        *,
+        m: int | Sequence[int] | None = None,
+        basis_functions: str | Sequence = "fourier",
+        interval: Sequence | None = None,
+        grid: ArrayLike | None = None,
+        num_qubits: int | Sequence[int] | None = None,
+        num_restarts: int = 3,
+        initial_coefficients: ArrayLike | None = None,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> TomographyJobModel:
+        """Recover a real-valued function encoded in a quantum state amplitudes from measurements of
+        this state.
+
+        Finds the unknown coefficients ``c_j`` of ``f(x) = sum_j c_j g_j(x)``, where the ``g_j`` are the first
+        ``m`` functions of ``basis_functions``, such that ``f`` on the register's grid matches the state measured in
+        ``distributions``. The grid is the one :meth:`function_loading` uses: ``interval`` is divided into
+        ``2**num_qubits`` equal bins, and amplitude index ``i`` holds ``f`` at the midpoint ``x`` of bin ``i``. With
+        several axes, each axis is discretized this way and each ``g_j`` is a product of one basis function per axis.
+        When the amplitudes hold ``f`` at other points, pass their coordinates as ``grid`` instead of ``interval``.
+
+        What can be recovered depends on which bases were measured:
+
+        * With only the unrotated (all-``Z``) basis, the fit identifies ``|f|``. The coefficients
+          describe some function whose magnitude matches, so evaluate it with
+          ``build_function(absolute=True)``.
+        * With the unrotated basis plus at least one basis that rotates a single qubit to ``X``, the
+          tomography will fit ``f`` considering its sign changes on the interval.
+          The result is then determined up to one overall sign (global phase), which you can fix
+          if you know ``f`` anywhere.
+
+        The overall magnitude of ``f`` is not recoverable in either case: the register holds a
+        normalized state, so the coefficients are scaled so that the integral of ``f**2`` over
+        ``interval`` is 1. On a custom ``grid`` they are scaled so that the sum of ``f**2`` over the
+        grid points is 1.
+
+        For sign recovery, rotate the most significant qubits of each axis first (the highest qubit
+        indices); sign flips rarely show at the scale of low-order qubits. As a rule of thumb, if ``f``
+        may change sign up to ``2**r`` times along an axis, measure ``r+1`` rotated bases, one for each
+        of that axis' ``r+1`` most significant qubits.
+
+        Args:
+            distributions (dict): Measured distributions keyed by per-qubit Pauli readout basis, as
+                returned by ``run_job.result_by_basis()``. Must contain the unrotated all-``Z`` basis;
+                every other basis must measure exactly one qubit in ``X`` and the rest in ``Z``.
+                Values map bitstring to a non-negative weight, such as a probability or a shot count;
+                each basis is normalized before the fit, so its values may sum to any positive total.
+                Basis strings and bitstrings follow Qiskit little-endian order: the rightmost character
+                is qubit 0.
+            m (int | Sequence[int] | None): Number of basis functions ``g_j`` to fit, per axis, at most
+                ``2**num_qubits`` of that axis. Required with a named family; defaults to the number of
+                functions when ``basis_functions`` lists them. Choose it against your shot budget: too
+                large overfits at low shot counts.
+            basis_functions (str | Sequence): The basis to fit against. A family name, or one entry per
+                axis, each a family name or a list of that axis' basis functions:
+
+                * ``"fourier"`` (the default): ``1, cos(pi*x), sin(pi*x), cos(2*pi*x), sin(2*pi*x), ...``.
+                * ``"legendre"``: the Legendre polynomials ``P_0, P_1, ...``, as in
+                  `scipy.special.eval_legendre
+                  <https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.eval_legendre.html>`__.
+                * ``"chebyshev_t"``: the Chebyshev polynomials of the first kind ``T_0, T_1, ...``, as in
+                  `scipy.special.eval_chebyt
+                  <https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.eval_chebyt.html>`__.
+
+                The families take ``x`` as is, without rescaling it to ``interval``; ``(-1, 1)`` is the
+                recommended interval for all three. A basis function may be a real-valued string or SymPy
+                expression in the single real variable ``x``, as in :meth:`function_loading`. A flat list
+                of basis functions applies to every axis; nest per axis to mix, e.g.
+                ``[["1", "x"], "fourier"]``.
+            interval (Sequence | None): ``(lo, hi)`` shared by every axis, or one pair per axis.
+                Defaults to ``(-1, 1)``. Leave it out when ``grid`` is given.
+            grid (ArrayLike | None): Coordinates of every register point, replacing the uniform grid
+                derived from ``interval``. Its shape is ``(2**num_qubits[0], ..., 2**num_qubits[-1],
+                num_axes)``: ``grid[i_0, ..., i_k, a]`` is coordinate ``a`` of the point whose index along
+                each axis is ``i_0, ..., i_k``, so one axis' coordinate may vary with the others' indices.
+                With a single axis, a 1D array of ``2**num_qubits`` points is accepted too. Build a grid
+                that is a product of per-axis points with ``numpy.meshgrid(..., indexing="ij")``. The grid
+                may hold at most ``2**20`` points. The coordinates are used as given, so with a named
+                family keep them inside ``[-1, 1]``. Fits on a custom grid take longer than on a uniform
+                one.
+            num_qubits (int | Sequence[int] | None): Qubits per axis, summing to the number of qubits
+                in ``distributions``. An integer declares a single axis of that many qubits; a list
+                declares one axis per entry, e.g. ``[5, 5]`` splits a 10-qubit register into two axes.
+                Defaults to ``None``, a single axis spanning every measured qubit. Axis 0 takes the
+                leading (most significant) qubits of each bitstring.
+            num_restarts (int): Random restarts in addition to the deterministic start, from 0 to 100.
+                Each one is another optimizer run, lowering the risk of a poor local optimum.
+            initial_coefficients (ArrayLike | None): An additional starting point for the fit, in the
+                format of :attr:`~haiqu.sdk.schemas.FunctionTomographyResult.coefficients`: shape
+                ``(m_1, ..., m_dim)``, one entry per basis function on each axis. The coefficients of
+                an earlier result with the same ``m`` and ``basis_functions`` can be passed as they
+                are; their overall scale does not matter. The fit still runs its usual starts and
+                returns the best one, so this costs about as much as one more restart. Defaults to
+                ``None``, which adds no starting point.
+            name (str | None): Optional job name.
+            description (str | None): Optional job description.
+
+        Returns:
+            TomographyJobModel: Job handle. Call ``job.result()`` for a
+                :class:`~haiqu.sdk.schemas.FunctionTomographyResult`, whose ``coefficients`` are the
+                ``c_j`` with one array dimension per axis and whose
+                :meth:`~haiqu.sdk.schemas.FunctionTomographyResult.build_function` returns ``f`` as a
+                callable and :meth:`~haiqu.sdk.schemas.FunctionTomographyResult.build_expression` as a
+                SymPy expression, or ``job.progress()`` for live updates.
+
+        Examples:
+            Recover a distribution that :meth:`distribution_loading` encoded. A run without
+            ``readout_bases`` is read out in the computational basis, which is the unrotated basis
+            the fit needs; ``result_by_basis()[0]`` holds it for the run's one circuit. The fit
+            interval has to be the one the state was loaded on:
+
+            >>> from qiskit import QuantumCircuit
+            >>> dl_job = haiqu.distribution_loading(num_qubits=10, distribution_name="norm",
+            ...                                     interval_start=-1, interval_end=1, scale=0.25)
+            >>> qc = QuantumCircuit(10)
+            >>> qc.append(dl_job.result(), range(10))
+            >>> qc.measure_all()
+            >>> run_job = haiqu.run(qc, shots=1024, device_id="aer_simulator")
+            >>> result = haiqu.variational_function_tomography(run_job.result_by_basis()[0], m=5).result()
+
+            ``distribution_loading`` puts ``sqrt(pdf)`` in the amplitudes by default, so ``sqrt``
+            of the normal density is what comes back. Five Fourier terms recover it to a few
+            percent from those 1024 shots, thinly spread over a 1024-point grid; raising ``m``
+            past that starts fitting the shot noise rather than the distribution.
+
+            :meth:`~haiqu.sdk.schemas.FunctionTomographyResult.build_function` turns the coefficients
+            into a function that can be evaluated anywhere on the interval. The unrotated basis
+            determines only ``|f|``, so ask for that:
+
+            >>> import numpy as np
+            >>> x = np.linspace(-1, 1, 200)
+            >>> f_abs = result.build_function(absolute=True)
+            >>> f_abs(x)
+
+            With several axes the function takes one coordinate per axis, e.g. ``f(x, y)`` for a fit
+            with ``num_qubits=[5, 5]``.
+
+            Any other basis is evaluated the same way:
+
+            >>> job = haiqu.variational_function_tomography(run_job.result_by_basis()[0], m=5, basis_functions="legendre")
+            >>> f_abs = job.result().build_function(absolute=True)
+
+            A normal density is positive everywhere, so the unrotated basis above determines it.
+            A function that changes sign needs rotated bases as well, and many more shots:
+
+            >>> bases = ["Z" * 10, "X" + "Z" * 9, "Z" + "X" + "Z" * 8]
+            >>> run_job = haiqu.run(qc, shots=100_000, device_id="aer_simulator",
+            ...                     readout_bases=bases)
+            >>> job = haiqu.variational_function_tomography(run_job.result_by_basis()[0], m=8)
+            >>> f = job.result().build_function()  # signed, up to one overall sign
+            >>> f(x)
+
+            When the amplitudes were loaded on points other than the uniform bin midpoints, give
+            those points as ``grid``. Here the 10-qubit register is split into two axes, with
+            Chebyshev nodes along the first and evenly spaced points along the second:
+
+            >>> xs = -np.cos(np.pi * (np.arange(32) + 0.5) / 32)
+            >>> ys = np.linspace(-1, 1, 32)
+            >>> grid = np.stack(np.meshgrid(xs, ys, indexing="ij"), axis=-1)  # shape (32, 32, 2)
+            >>> job = haiqu.variational_function_tomography(run_job.result_by_basis()[0], num_qubits=[5, 5],
+            ...                                             m=[4, 4], basis_functions="legendre", grid=grid)
+            >>> f = job.result().build_function()
+            >>> amplitudes = f(grid[..., 0], grid[..., 1]).ravel()  # unit norm, in register order
+        """
+        self._check_experiment()
+        parameters, measurements = self._prepare_variational_function_tomography_params(
+            distributions, m, basis_functions, interval, grid, num_qubits, num_restarts, initial_coefficients
+        )
+        job = self._client.tomography(
+            data=TomographySubmitModel(
+                experiment_id=self._experiment.id,
+                tomography_type=TomographyType.VARIATIONAL_FUNCTION,
+                parameters=parameters,
+                data=measurements,
+                name=name or "Variational Function Tomography",
+                description=description or "",
+            )
+        )
+        self._display_dashboard_links(job)
+        return job
+
     def draw(
         self,
         circuit: Union[QuantumCircuit, CircuitModel],
@@ -5505,6 +6160,613 @@ class Haiqu:
         if return_artifact:
             return circuit.draw(output="mpl", fold=-1, style="bw")
         draw_neon_circuit(circuit=circuit, style=style)
+
+    @errors.graceful_api_errors_message
+    def list_qec_codes(
+        self,
+        family: list[str] | None = None,
+        code_type: list[str] | None = None,
+        completeness: list[str] | None = None,
+        n: list[int] | None = None,
+        d: list[int] | None = None,
+        q: str | None = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> QECCodeListResponseModel:
+        """List the codes of the Haiqu QEC code library, optionally filtered.
+
+        The results come in pages. Each filter keeps the codes that match any of its values, and
+        the filters given together keep only the codes that match all of them. The values of
+        ``family``, ``code_type`` and ``completeness`` are matched exactly, including case, so an
+        unknown value matches no codes rather than raising an error.
+
+        Args:
+            family (list[str] | None): Keep the codes of these code families, given by their slugs
+                (the ``family`` field of a code), e.g. ``["color"]``. Defaults to ``None``, no
+                family filter.
+            code_type (list[str] | None): Keep the codes of these code types: ``"css"``,
+                ``"stabilizer"``, ``"subsystem_css"``, ``"subsystem_stabilizer"``. Defaults to
+                ``None``, no code type filter.
+            completeness (list[str] | None): Keep the codes in these completeness tiers:
+                ``"full"``, ``"partial"``, ``"metadata_only"``, as explained in
+                `Completeness tiers <https://docs.haiqu.ai/reference/run/qec_codes#completeness-tiers>`__.
+                Defaults to ``None``, no completeness filter.
+            n (list[int] | None): Keep the codes with one of these numbers of physical qubits.
+                Defaults to ``None``, no filter on the number of physical qubits.
+            d (list[int] | None): Keep the codes with one of these code distances. A code whose X
+                and Z distances differ matches no value. Defaults to ``None``, no distance filter.
+            q (str | None): Keep the codes whose name or slug starts with this text, ignoring
+                case. Defaults to ``None``, no search.
+            page (int): Number of the page to return, starting at 1. A page past the last one has
+                no items. Defaults to 1.
+            page_size (int): Maximum number of codes per page. Defaults to 20.
+
+        Returns:
+            QECCodeListResponseModel: The requested page of matching codes, with the total number
+            of matching codes.
+
+        Raises:
+            requests.HTTPError: If the request fails, for example because a value of ``n`` or
+                ``d`` is not an integer. In a notebook, an error message is shown and ``None`` is
+                returned instead.
+
+        Examples:
+            >>> page = haiqu.list_qec_codes(family=["color"], completeness=["full"])
+            >>> slugs = [code.slug for code in page.items]
+        """
+        return self._client.list_qec_codes(
+            family=family,
+            code_type=code_type,
+            completeness=completeness,
+            n=n,
+            d=d,
+            q=q,
+            page=page,
+            page_size=page_size,
+        )
+
+    @errors.graceful_api_errors_message
+    def get_qec_code(self, slug: str) -> QECCodeModel:
+        """Get a code of the Haiqu QEC code library by its slug.
+
+        Args:
+            slug (str): Slug of the code, as listed by ``haiqu.list_qec_codes``, e.g.
+                ``"color_488_d3"``.
+
+        Returns:
+            QECCodeModel: The code.
+
+        Raises:
+            ValueError: If the library has no code with this slug.
+            requests.HTTPError: If the request fails for another reason. In a notebook, an error
+                message is shown and ``None`` is returned instead.
+
+        Examples:
+            >>> code = haiqu.get_qec_code("color_488_d3")
+            >>> code.name
+            'Distance-3 Triangular 4.8.8 Color Code'
+            >>> code.n, code.k, code.d
+            (7, 1, 3)
+        """
+        return self._fetch_qec_code(slug)
+
+    @errors.graceful_api_errors_message
+    def download_qec_code(self, slug: str) -> bytes:
+        """Download the ``.qecx`` file of a code of the Haiqu QEC code library.
+
+        A ``.qecx`` file holds the definition of a code together with the circuits that implement
+        its operations, as far as these are available. Codes in the ``"metadata_only"`` tier have
+        no file (see `Completeness tiers <https://docs.haiqu.ai/reference/run/qec_codes#completeness-tiers>`__).
+
+        Args:
+            slug (str): Slug of the code, as listed by ``haiqu.list_qec_codes``, e.g.
+                ``"color_488_d3"``.
+
+        Returns:
+            bytes: The content of the code's ``.qecx`` file. Currently, downloading is not
+            available, and the call raises ``requests.HTTPError`` for every code that has a
+            file (see `Current limitations <https://docs.haiqu.ai/reference/run/qec_codes#current-limitations>`__).
+
+        Raises:
+            ValueError: If the library has no code with this slug, or the code is in the
+                ``"metadata_only"`` tier and so has no file.
+            requests.HTTPError: If the request fails for another reason.
+        """
+        try:
+            return self._client.download_qec_code(code_slug=slug)
+        except HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                raise ValueError(
+                    f"QEC code '{slug}' not found. " "Use `haiqu.list_qec_codes()` to browse available codes."
+                ) from None
+            if e.response is not None and e.response.status_code == 409:
+                raise ValueError(f"QEC code '{slug}' has no QECX file (metadata_only completeness).") from None
+            raise e
+
+    def _fetch_qec_code(self, slug: str) -> QECCodeModel:
+        """Return the library code with `slug`, raising ValueError if the library has none."""
+        try:
+            return self._client.get_qec_code(code_slug=slug)
+        except HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                raise ValueError(
+                    f"QEC code '{slug}' not found. Use `haiqu.list_qec_codes()` to browse available codes."
+                ) from None
+            raise e
+
+    def _check_library_code_compilable(self, slug: str) -> None:
+        """Raise ValueError if `slug` names a library code that cannot be compiled to.
+
+        The code is always fetched, so a stale QECCodeModel given by the user doesn't skip the check. A slug the
+        library does not have is left to the server, since it can also name one of the user's custom codes; if it
+        names neither, the job fails.
+        """
+        try:
+            code_model = self._client.get_qec_code(code_slug=slug)
+        except HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                return
+            raise e
+        if code_model.completeness != "full":
+            raise ValueError(
+                f"QEC code '{slug}' has '{code_model.completeness}' completeness and cannot be compiled to. "
+                "Only codes with 'full' completeness provide the circuit implementations required for compilation. "
+                "Use `haiqu.list_qec_codes(completeness=['full'])` to browse compilable codes."
+            )
+
+    @errors.graceful_api_errors_message
+    def qec_compile(
+        self,
+        circuits: QuantumCircuit | list[QuantumCircuit] | CircuitModel | list[CircuitModel],
+        code: str | QECCodeModel | os.PathLike | BinaryIO,
+        job_name: str | None = None,
+        job_description: str | None = None,
+        **compilation_options: Any,
+    ) -> QECCompilationJobModel:
+        """Compile logical circuits to a code of the Haiqu QEC code library or to a custom code.
+
+        Each circuit is encoded into the chosen code, and error-correction cycles are inserted between
+        its logical gates, as explained in
+        `Error-correction cycles <https://docs.haiqu.ai/reference/run/qec_compile#error-correction-cycles>`__.
+        The operations a circuit can contain are listed in
+        `Supported logical operations <https://docs.haiqu.ai/reference/run/qec_compile#supported-logical-operations>`__.
+        The compilation runs asynchronously on the Haiqu cloud as a job, which produces one compiled
+        circuit for each given circuit, ready to be passed to ``haiqu.qec_run``.
+
+        Problems that are found during the compilation, such as a gate the code cannot implement or an
+        invalid compilation option, do not raise an error in this call. They make the job fail, and the
+        job's :meth:`~haiqu.sdk.schemas.QECCompilationJobModel.result` raises
+        :class:`~haiqu.sdk.exceptions.JobFailedError`, whose message describes the problem.
+
+        Args:
+            circuits (QuantumCircuit | list[QuantumCircuit] | CircuitModel | list[CircuitModel]): The
+                logical circuit to compile, or a list of them. Each qubit of a circuit is a logical qubit.
+                For a code with one logical qubit, each qubit of the circuit is encoded in its own code
+                block. For a code with several logical qubits, the size of each quantum register of the
+                circuit must be a positive multiple of that number, and other sizes make the job fail.
+            code (str | QECCodeModel | os.PathLike | BinaryIO): The code to compile to, in one of these
+                forms:
+
+                - A code of the Haiqu QEC code library, given by its slug, e.g. ``"color_488_d3"``, or as a
+                  code returned by ``haiqu.get_qec_code`` or ``haiqu.list_qec_codes``. Only codes in the
+                  ``"full"`` completeness tier can be compiled to (see
+                  `Completeness tiers <https://docs.haiqu.ai/reference/run/qec_codes#completeness-tiers>`__).
+                  The current data of the code is always fetched from the library, also when a code model
+                  is given.
+                - A custom code, given as the path to its QECX file, as a ``pathlib.Path`` or a string,
+                  e.g. ``"codes/my_code.qecx"``.
+                - A custom code, given as a file opened in binary mode, ``open(path, "rb")``, or as an
+                  ``io.BytesIO``. It is read from the current position of the file, which is left open. A
+                  file opened in text mode is refused, because reading a QECX file as text can corrupt it.
+
+                A string is read as a path when it names an existing file or contains ``/`` or ``\\``, and
+                as a slug otherwise. So a file in the working directory named exactly like the slug of a
+                library code is used instead of that code; pass the code model to select the library code
+                in that case.
+
+                A custom code belongs to the current experiment and is identified by its content: the same
+                content is stored once, however often and under whatever file name it is given, and an
+                edited file becomes a new custom code. A QECX file may be at most 5 MB. It is neither
+                checked against the code library nor validated in this call, so a file that is malformed or
+                cannot be compiled to makes the job fail. This includes well-formed files whose operations do
+                not match what the file declares about them, for example a measurement that is declared to
+                read out an operator but measures a different one.
+
+                The compiled circuits record their code, so ``haiqu.qec_run`` needs no ``code`` for them, and
+                it uses exactly the version of the file they were compiled with, also after the file is
+                edited.
+            job_name (str | None): Name of the compilation job. Defaults to ``None``, no name.
+            job_description (str | None): Description of the compilation job. Defaults to ``None``, no
+                description.
+            **compilation_options: Options of the compilation, given as keyword arguments:
+
+                - ``ec_cycle_frequency`` (int): A non-negative integer ``N``: an error-correction cycle
+                  is inserted after every ``N`` layers that contain a logical gate, and ``0`` inserts no
+                  cycles. Defaults to 1. See
+                  `Error-correction cycles <https://docs.haiqu.ai/reference/run/qec_compile#error-correction-cycles>`__.
+                - ``variant_selections`` (dict | None): The variants, alternative implementations declared
+                  by the code, to use for the code's operations, given by name, e.g.
+                  ``{"error_correction_cycle": "<name>"}``. Defaults to ``None``, the code's default
+                  variant for every operation. See
+                  `Variant selections <https://docs.haiqu.ai/reference/run/qec_compile#variant-selections>`__.
+                - ``add_layer_barriers`` (bool): Whether to place a barrier at every boundary between
+                  consecutive logical layers of the compiled circuit. Defaults to ``False``.
+
+                A value of the wrong type makes the job fail. Other keys are not supported.
+
+        Returns:
+            QECCompilationJobModel: The compilation job. Its
+            :meth:`~haiqu.sdk.schemas.QECCompilationJobModel.result` waits for the job to finish and
+            returns the compiled circuits.
+
+        Raises:
+            ValueError: If a library code is not in the ``"full"`` tier, or a custom code's file is empty. A
+                slug that names no code makes the job fail.
+            FileNotFoundError: If ``code`` is a path, or a string containing ``/`` or ``\\``, that does not
+                exist.
+            TypeError: If ``code`` is a file opened in text mode, or of a type not listed above.
+            requests.HTTPError: If a custom code's QECX file is larger than 5 MB (status 413), or a request
+                fails for another reason. In a notebook, an error message is shown and ``None`` is returned
+                instead.
+
+        Examples:
+            >>> from qiskit import QuantumCircuit
+            >>> circuit = QuantumCircuit(1, 1)
+            >>> circuit.h(0)
+            >>> circuit.h(0)
+            >>> circuit.measure(0, 0)
+            >>> job = haiqu.qec_compile(circuit, code="color_488_d3", ec_cycle_frequency=1)
+            >>> compiled = job.result()
+            >>> compiled.qec.code_slug
+            'color_488_d3'
+            >>> compiled.draw()
+
+            Compile a two-qubit circuit to a code with one logical qubit, which encodes each qubit in its own
+            code block:
+
+            >>> bell = QuantumCircuit(2, 2)
+            >>> bell.h(0)
+            >>> bell.cx(0, 1)
+            >>> bell.measure([0, 1], [0, 1])
+            >>> compiled_bell = haiqu.qec_compile(bell, code="color_488_d3").result()
+
+            Compile to a custom code from a QECX file, then run the compiled circuit without ``code``:
+
+            >>> compiled = haiqu.qec_compile(circuit, code="codes/my_code.qecx").result()
+            >>> job = haiqu.qec_run(compiled, noise={"p1q": 1e-3, "p2q": 1e-3, "p_meas": 1e-3})
+        """
+        self._check_experiment()
+        circuits = self._normalize_circuits(circuits)
+
+        is_custom_code = self._is_custom_qec_code(code)
+        # A custom code is stored here and has no library entry to check, so the library check below runs for
+        # library codes only. A library code is only looked up by name here, so a call that check rejects stores
+        # nothing.
+        code_slug = self._resolve_qec_code_slug(code)
+
+        if not is_custom_code:
+            self._check_library_code_compilable(code_slug)
+
+        logged_circuits = self._log_circuits(circuits)
+        return self._client.qec_compile(
+            data=QECCompileSubmitModel(
+                experiment_id=self._experiment.id,
+                circuit_ids=[c.id for c in logged_circuits],
+                code_slug=code_slug,
+                compilation_options=compilation_options,
+                name=job_name,
+                description=job_description,
+            )
+        )
+
+    @errors.graceful_api_errors_message
+    def qec_run(
+        self,
+        circuits: QuantumCircuit | CircuitModel | list[QuantumCircuit | CircuitModel],
+        shots: int = 1024,
+        *,
+        noise: QECNoiseModel | dict,
+        sampler: str = "stim",
+        decoder: str = "auto",
+        seed: int | None = None,
+        code: str | QECCodeModel | os.PathLike | BinaryIO | None = None,
+        job_name: str | None = None,
+        job_description: str | None = None,
+        toggles: dict | None = None,
+        **compilation_options: Any,
+    ) -> QECRunJobModel:
+        """Run QEC-compiled circuits under noise and decode the outcomes.
+
+        Each circuit is sampled under the noise model given in ``noise``, the syndrome measured in its
+        error-correction cycles is decoded, and the decoded outcomes are returned as counts together
+        with a logical error rate. A circuit that is not compiled yet is compiled to ``code`` during the
+        run. The run executes asynchronously on the Haiqu cloud as a job. The noise model, the decoders
+        and the results are explained in
+        `Noise model <https://docs.haiqu.ai/reference/run/qec_run#noise-model>`__,
+        `Decoders <https://docs.haiqu.ai/reference/run/qec_run#decoders>`__ and
+        `Reading results <https://docs.haiqu.ai/reference/run/qec_run#reading-results>`__.
+
+        By default, noise is applied everywhere in the compiled circuit. The ``toggles`` argument
+        restricts it to selected parts, as explained in
+        `Targeted noise in QEC runs <https://docs.haiqu.ai/reference/run/qec_noise>`__.
+
+        Problems that are found when the job runs, such as a decoder that cannot decode a circuit, do not
+        raise an error in this call. They make the job fail, and the job's
+        :meth:`~haiqu.sdk.schemas.QECRunJobModel.result` raises :class:`~haiqu.sdk.exceptions.JobFailedError`,
+        whose message describes the problem.
+
+        Args:
+            circuits (QuantumCircuit | CircuitModel | list[QuantumCircuit | CircuitModel]): The circuit to
+                run, or a list of them. Each circuit is either QEC-compiled, as returned by the result of a
+                ``haiqu.qec_compile`` job, or a logical circuit, which is compiled to ``code`` during the run.
+                A logical circuit can be given as a ``QuantumCircuit``, which is logged automatically, or as a
+                logged circuit, for example as returned by ``haiqu.log``.
+            shots (int): Number of shots for each circuit, at least 1. Defaults to 1024.
+            noise (QECNoiseModel | dict): Required. The noise model, as a
+                :class:`~haiqu.sdk.schemas.QECNoiseModel` or as a dict with the keys ``"p1q"``, ``"p2q"``
+                and ``"p_meas"``, each a probability in ``[0, 1]``. See
+                `Noise model <https://docs.haiqu.ai/reference/run/qec_run#noise-model>`__.
+            sampler (str): The sampler, ``"stim"``. Defaults to ``"stim"``.
+            decoder (str): The decoder, one of ``"auto"``, ``"pymatching"``, ``"chromobius"``, ``"bposd"``
+                and ``"tesseract"``. ``"auto"`` selects the first decoder the code's QECX file declares, in
+                the order ``"chromobius"``, ``"pymatching"``, ``"tesseract"``, ``"bposd"``, and
+                ``"pymatching"`` for a code whose file declares none, custom codes included; the library's
+                color codes get ``"chromobius"``. Each decoder has limits: ``"pymatching"`` does not reliably
+                correct color codes; ``"chromobius"`` needs color information in the code's file, decodes
+                less accurately across a logical S gate and fails on some circuits; ``"bposd"`` is slow and
+                can decode some single faults on small codes incorrectly; ``"tesseract"`` is the most
+                accurate but much slower, and its decoding can outlast the job's 30-minute limit. Defaults
+                to ``"auto"``. See `Decoders <https://docs.haiqu.ai/reference/run/qec_run#decoders>`__.
+            seed (int | None): Random seed of the sampling, a non-negative integer. With a seed, the
+                sampling is reproducible: the same circuits, arguments and seed give the same results.
+                Defaults to ``None``, no seed.
+            code (str | QECCodeModel | os.PathLike | BinaryIO | None): The code to compile logical circuits to
+                during the run, in one of the forms accepted by
+                `qec_compile <https://docs.haiqu.ai/reference/run/qec_compile>`__: a library code, given by
+                its slug, e.g. ``"color_488_d3"``, or as a code model, or a custom code, given as the path to
+                its QECX file or as a file opened in binary mode. Required when a circuit is not compiled yet.
+                Only library codes in the ``"full"`` completeness tier can be used (see
+                `Completeness tiers <https://docs.haiqu.ai/reference/run/qec_codes#completeness-tiers>`__),
+                and the current data of a library code is always fetched from the library, also when a code
+                model is given; a slug that names no code makes the job fail. Compiled circuits run with the
+                code they were compiled to, so ``code`` is not needed for them; when it is given, it must be
+                that code, or ``ValueError`` is raised. A library code matches by slug and a custom code by
+                content, so an edited file does not match, and neither does the same file in another
+                experiment, since a custom code belongs to its experiment. The results report a custom code
+                by a slug derived from its file name, or ``custom_code`` for a file object without a name,
+                which differs for each version of the file. Defaults to ``None``, no code.
+            job_name (str | None): Name of the run job. Defaults to ``None``, no name.
+            job_description (str | None): Description of the run job. Defaults to ``None``, no description.
+            toggles (dict | None): The parts of the compiled circuit that receive noise, as a dict with up
+                to three keys, explained in
+                `Targeted noise in QEC runs <https://docs.haiqu.ai/reference/run/qec_noise>`__. A malformed
+                dict makes the job fail. Defaults to ``None``, noise everywhere.
+            **compilation_options: Options for compiling logical circuits during the run, the same as those
+                of `qec_compile <https://docs.haiqu.ai/reference/run/qec_compile>`__, given as keyword
+                arguments:
+
+                - ``ec_cycle_frequency`` (int): Where error-correction cycles are inserted. Defaults to 1.
+                  See `Error-correction cycles <https://docs.haiqu.ai/reference/run/qec_compile#error-correction-cycles>`__.
+                - ``variant_selections`` (dict | None): The variants to use for the code's operations.
+                  Defaults to ``None``, the code's default variant for every operation. See
+                  `Variant selections <https://docs.haiqu.ai/reference/run/qec_compile#variant-selections>`__.
+                - ``add_layer_barriers`` (bool): Whether to place a barrier at every boundary between
+                  consecutive logical layers of the compiled circuit. Defaults to ``False``.
+
+                A value of the wrong type makes the job fail. Other keys are not supported. The options are
+                ignored for circuits that are already compiled, which keep the options they were compiled
+                with.
+
+        Returns:
+            QECRunJobModel: The run job. Its :meth:`~haiqu.sdk.schemas.QECRunJobModel.result` waits for
+            the job to finish and returns the decoded results.
+
+        Raises:
+            ValueError: If a circuit is not compiled and no ``code`` is given, if ``code`` is a library code
+                that is not in the ``"full"`` tier, if ``code`` is not the code a compiled circuit was compiled
+                to, if ``sampler`` or ``decoder`` is not one of the supported values, if ``noise``, ``shots`` or
+                ``seed`` has an invalid value, or if a custom code's file is empty. These checks are made before
+                any circuit is logged or any custom code is stored.
+            FileNotFoundError: If ``code`` is a path, or a string containing ``/`` or ``\\``, that does not
+                exist.
+            TypeError: If ``code`` is a file opened in text mode, or of a type not listed above.
+            requests.HTTPError: If a custom code's QECX file is larger than 5 MB (status 413), or a request
+                fails for another reason. In a notebook, an error message is shown and ``None`` is returned
+                instead.
+
+        Examples:
+            >>> from qiskit import QuantumCircuit
+            >>> circuit = QuantumCircuit(1, 1)
+            >>> circuit.h(0)
+            >>> circuit.h(0)
+            >>> circuit.measure(0, 0)
+            >>> compiled = haiqu.qec_compile(circuit, code="color_488_d3").result()
+
+            Run without noise, as a check that every shot gives the ideal outcome:
+
+            >>> job = haiqu.qec_run(compiled, shots=1000, noise={"p1q": 0, "p2q": 0, "p_meas": 0})
+            >>> result = job.result()
+            >>> result.counts
+            {'0': 1000}
+            >>> result.logical_error_rate
+            0.0
+
+            Sweep the noise strength, collecting the jobs and then reading their results:
+
+            >>> jobs = []
+            >>> for p in [1e-3, 2e-3, 5e-3]:
+            ...     noise = {"p1q": p, "p2q": p, "p_meas": p}
+            ...     jobs.append(haiqu.qec_run(compiled, shots=10_000, noise=noise, decoder="tesseract"))
+            >>> results = [job.result() for job in jobs]
+
+            Compile a logical circuit to a custom code from a QECX file during the run:
+
+            >>> job = haiqu.qec_run(circuit, noise={"p1q": 1e-3, "p2q": 1e-3, "p_meas": 1e-3}, code="codes/my_code.qecx")
+            >>> job.result().code_slug
+            'my_code-3f9a1c2e'
+
+            Apply noise only in the error-correction cycles:
+
+            >>> from haiqu.sdk.qec_labels import ec_cycle_box_label
+            >>> job = haiqu.qec_run(
+            ...     compiled,
+            ...     noise={"p1q": 1e-3, "p2q": 1e-3, "p_meas": 1e-3},
+            ...     decoder="tesseract",
+            ...     toggles={"noisy_box_labels": [ec_cycle_box_label()], "apply_noise_outside_boxes": False},
+            ... )
+        """
+        self._check_experiment()
+        circuits = self._normalize_circuits(circuits)
+
+        for circuit in circuits:
+            # Non-compiled circuits are compiled on the fly during the run, which requires a `code`. A
+            # QuantumCircuit is never compiled.
+            if code is None and (isinstance(circuit, QuantumCircuit) or circuit.qec is None):
+                circuit_name = circuit.name if isinstance(circuit, QuantumCircuit) else circuit.id
+                raise ValueError(
+                    f"Circuit '{circuit_name}' is not QEC-compiled; pass `code=...` to compile it during "
+                    "the run, or compile it first with `haiqu.qec_compile()`."
+                )
+
+        supported_samplers = ("stim",)
+        if sampler not in supported_samplers:
+            raise ValueError(f"Unsupported sampler {sampler!r}. Supported samplers: {', '.join(supported_samplers)}.")
+
+        supported_decoders = ("auto", "pymatching", "chromobius", "bposd", "tesseract")
+        if decoder not in supported_decoders:
+            raise ValueError(f"Unsupported decoder {decoder!r}. Supported decoders: {', '.join(supported_decoders)}.")
+
+        # Validates `noise`, `shots` and `seed`; the code and the circuits are added once the checks pass
+        data = QECRunSubmitModel(
+            experiment_id=self._experiment.id,
+            shots=shots,
+            noise=noise,
+            sampler=sampler,
+            decoder=decoder,
+            seed=seed,
+            toggles=toggles,
+            compilation_options=compilation_options,
+            name=job_name,
+            description=job_description,
+        )
+
+        if code is not None and not self._is_custom_qec_code(code):
+            self._check_library_code_compilable(code.slug if isinstance(code, QECCodeModel) else code)
+
+        # Resolved after the checks above, so that a rejected call never uploads a custom code, and before the
+        # circuits are logged, so that a code that doesn't match the compiled circuits logs nothing
+        compiled_circuits = [c for c in circuits if isinstance(c, CircuitModel)]
+        data.code_slug = None if code is None else self._resolve_qec_code_slug(code, compiled_circuits)
+        data.circuit_ids = [c.id for c in self._log_circuits(circuits)]
+
+        return self._client.qec_run(data=data)
+
+    def _resolve_qec_code_slug(
+        self,
+        code: str | QECCodeModel | os.PathLike | BinaryIO,
+        circuits: Sequence[CircuitModel] = (),
+    ) -> str:
+        """Return the slug that identifies `code` in a QEC request, storing a custom code first if needed.
+
+        Raises if any of `circuits` was already compiled with another code. A custom code is compared by
+        its content and stored only after that check, so a rejected call stores nothing: content the
+        experiment already holds is found by its hash and not uploaded again, while edited content is
+        stored as a new custom code with a new slug.
+        """
+        if not self._is_custom_qec_code(code):
+            code_slug = code.slug if isinstance(code, QECCodeModel) else cast(str, code)
+            self._check_qec_code_matches_compiled(circuits, code_slug, f"'{code_slug}'")
+            return code_slug
+
+        name, content = self._read_custom_qec_code(code)
+        # None while the experiment doesn't hold this content, which then matches no compiled circuit
+        stored_slug = self._find_custom_qec_code_slug(hashlib.sha256(content).hexdigest())
+        self._check_qec_code_matches_compiled(circuits, stored_slug, f"the custom code in '{name}'")
+        if stored_slug is not None:
+            return stored_slug
+        custom_code = self._client.create_qec_custom_code(
+            data=QECCustomCodeSubmitModel(
+                experiment_id=self._experiment.id,
+                name=name,
+                content=base64.b64encode(content).decode("ascii"),
+            )
+        )
+        return custom_code.slug
+
+    @staticmethod
+    def _is_custom_qec_code(
+        code: str | QECCodeModel | os.PathLike | BinaryIO | None,
+    ) -> TypeGuard[str | os.PathLike | BinaryIO]:
+        """Return whether `code` is a QECX file, which makes it a custom code, rather than a global code.
+
+        A path-like object or a file handle is a QECX file. A string is one when it names an existing
+        file or contains a path separator, which a global code's slug never does; any other string is
+        the slug of a global code.
+        """
+        if code is None or isinstance(code, QECCodeModel):
+            return False
+        if isinstance(code, str):
+            return os.path.isfile(code) or "/" in code or "\\" in code
+        return True
+
+    @staticmethod
+    def _read_custom_qec_code(code: str | os.PathLike | BinaryIO) -> tuple[str, bytes]:
+        """Return the name and content of a custom code given as a path or a binary file handle.
+
+        A handle is read from its current position and left open.
+        """
+        if isinstance(code, (str, os.PathLike)):
+            path = Path(code)
+            name, content = path.name, path.read_bytes()
+        else:
+            if not hasattr(code, "read"):
+                raise TypeError(
+                    f"`code` of type {type(code).__name__} is not supported. Pass a global code's slug or code "
+                    "object, a path to a QECX file, or a file opened in binary mode; wrap bytes held in memory "
+                    "in `io.BytesIO`."
+                )
+            # A file opened in text mode is refused before it is read, since reading a QECX file as text
+            # can fail or corrupt it. Any other handle must return bytes.
+            read = None if isinstance(code, io.TextIOBase) else code.read()
+            if not isinstance(read, bytes):
+                raise TypeError(
+                    'A custom code handle must be opened in binary mode: pass `open(path, "rb")` as `code`, '
+                    "or the path itself."
+                )
+            content = read
+            handle_name = getattr(code, "name", None)
+            name = os.path.basename(handle_name) if isinstance(handle_name, str) else ""
+
+        name = name or "custom_code"
+        if not content:
+            raise ValueError(
+                f"Custom code '{name}' is empty: the QECX file has no content, or its handle was already read "
+                "to the end (call `seek(0)` on it first)."
+            )
+        return name, content
+
+    @staticmethod
+    def _check_qec_code_matches_compiled(circuits: Sequence[CircuitModel], code_slug: str | None, code_description: str) -> None:
+        """Raise if any of `circuits` was compiled with a code other than the one `code_slug` identifies.
+
+        `code_slug` is None for a custom code the experiment does not hold yet, which matches no circuit.
+        `code_description` names the given code in the error.
+        """
+        for circuit in circuits:
+            if circuit.qec is not None and circuit.qec.code_slug != code_slug:
+                raise ValueError(
+                    f"Circuit '{circuit.id}' was compiled with QEC code '{circuit.qec.code_slug}', but `code` is "
+                    f"{code_description}. Drop `code=` to run compiled circuits with the code they were compiled with."
+                )
+
+    def _find_custom_qec_code_slug(self, code_hash: str) -> str | None:
+        """Return the slug of the experiment's custom code with `code_hash`, or None if it holds none."""
+        try:
+            return self._client.get_qec_custom_code(experiment_id=self._experiment.id, code_hash=code_hash).slug
+        except HTTPError as e:
+            if e.response is None or e.response.status_code != 404:
+                raise e
+            return None
 
     def _init(
         self,

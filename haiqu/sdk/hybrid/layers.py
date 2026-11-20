@@ -2,8 +2,9 @@
 
 A program is an ordered list of layers describing how your circuits are processed
 and run. It starts with an :class:`InputLayer` and ends with the layer that produces
-its results: a :class:`DeviceLayer` to run on a backend, or a
-:class:`StatevectorLayer` to simulate exactly instead.
+its results: a :class:`DeviceLayer` to run on a backend, a :class:`StatevectorLayer`
+to simulate exactly instead, or a :class:`CliffordTSynthesisLayer` to approximate the
+circuits with Clifford+T gates and return them without running them.
 
 Use :class:`EstimatorLayer` or :class:`DistributionMitigationLayer` for grouped
 error mitigation, or compose finer processing steps by hand. For advanced
@@ -59,6 +60,54 @@ class StatevectorLayer(BaseModel):
     """
 
     type: Literal["statevector"] = "statevector"
+
+
+class CliffordTSynthesisLayer(BaseModel):
+    """Approximate the circuits' non-Clifford rotations with Clifford+T gates, and return them.
+
+    An alternative ending to a program: use this instead of a :class:`DeviceLayer` when you
+    want the circuits approximated with Clifford+T gates rather than run. Nothing is executed,
+    so the job's ``shots`` is not used and no device time is spent. A program ending here has
+    no other layer after its :class:`InputLayer`.
+
+    Each rotation outside the Clifford group is replaced by a sequence of Clifford and T
+    gates that approximates it. How closely is set by one of four options; when several are
+    set, the first of them in this order is used and the rest are ignored:
+    ``total_t_gate_budget``, ``gate_t_gate_budget``, ``total_precision_tolerance``,
+    ``gate_precision_tolerance``. With none set, the whole circuit is kept within a precision
+    tolerance of ``1e-8``. The precision of one rotation is the spectral norm distance to its
+    approximation, minimized over global phase; that of the whole circuit is the sum of these
+    distances.
+
+    A precision tolerance is met with GridSynth, a T-gate budget with TRASYN, which tends to
+    use fewer T gates but takes longer the larger the budget. A per-gate budget above
+    ``max_trasyn_budget`` is met with GridSynth instead. With ``exact_spectral_norm`` set, the
+    synthesis also reports the exact spectral norm distance between each whole circuit and its
+    approximation; it is computed from their full unitaries, so it is only available for
+    circuits of up to 10 qubits. See :meth:`~haiqu.sdk.quantum_haiqu.Haiqu.clifford_t_synthesis`
+    for details.
+
+    The job returns one :class:`~haiqu.sdk.schemas.CircuitModel` per input circuit, in input
+    order, each logged to the job's experiment as a child of its input circuit. Final
+    measurements are kept. The job's ``info["clifford_t_synthesis"]`` holds what the synthesis
+    reports for each input circuit.
+    """
+
+    type: Literal["clifford_t_synthesis"] = "clifford_t_synthesis"
+
+    #: T-gate budget for the whole circuit.
+    total_t_gate_budget: Annotated[int, Field(ge=0)] | None = None
+    #: T-gate budget for each synthesized rotation.
+    gate_t_gate_budget: Annotated[int, Field(ge=0)] | None = None
+    #: Precision tolerance for the whole circuit; at least ``1e-13``.
+    total_precision_tolerance: Annotated[float, Field(ge=1e-13)] | None = None
+    #: Precision tolerance for each synthesized rotation; at least ``1e-13``.
+    gate_precision_tolerance: Annotated[float, Field(ge=1e-13)] | None = None
+    #: Largest per-gate T-gate budget met with TRASYN rather than GridSynth, from 0 to 65.
+    #: Unset means the synthesis default, 13.
+    max_trasyn_budget: Annotated[int, Field(ge=0, le=65)] | None = None
+    #: Report the exact spectral norm distance of each whole circuit (up to 10 qubits).
+    exact_spectral_norm: bool = False
 
 
 class PackingLayer(BaseModel):
@@ -197,23 +246,72 @@ class QWCComputeLayer(BaseModel):
     type: Literal["qwc_compute"] = "qwc_compute"
 
 
-class ReadoutBasisLayer(BaseModel):
-    """Read the circuits out in the per-qubit Pauli bases carried by the job submission.
+# --- Encoding ------------------------------------------------------------------
 
-    The bases are a job-level field (``readout_bases``), not a layer field. This layer marks where the rotation is applied during
-    execution of the hybrid program, and the result depends on the placement relative to the :class:`TranspilationLayer`:
 
-    - After the :class:`TranspilationLayer`: all bases of a circuit share one transpilation and one layout.
-    - Before the :class:`TranspilationLayer`: each basis is transpiled separately.
-    - No :class:`TranspilationLayer`: the rotation applies to the pre-transpiled circuit's active qubits.
+class DFSEncodingLayer(BaseModel):
+    """Encode every qubit into a three-qubit decoherence-free subsystem (DFS-3).
 
-    To ensure that each basis is twirled independently rather than sharing one sample, place the rotation prior to
-    :class:`NoiseTailoringLayer`.
+    Each qubit of the circuit is carried by three physical qubits arranged so that noise acting
+    identically on all three leaves the encoded information untouched. The encoded circuit is
+    considerably deeper than the original and needs three times as many qubits on the device;
+    results are reported over the original (logical) qubits.
 
-    Cannot be combined with an :class:`EstimatorLayer`.
+    ``postselect`` (default ``True``) discards shots in which an encoded qubit left its protected
+    state; the discarded fraction is reported in ``job.dfs_discard_fraction`` (distribution
+    jobs only).
+    ``synthesize_unknown`` lets gates without a built-in encoded version be synthesized
+    numerically, which is slow; by default such gates are rejected.
+
+    Place it before the :class:`TranspilationLayer`. To measure observables, put
+    :class:`ObservableSplitLayer` and :class:`QWCComputeLayer` before it (the grouped
+    :class:`EstimatorLayer` cannot be combined with it). Cannot be combined with :class:`PackingLayer`
+    or :class:`StatevectorLayer`.
+    These placement rules are checked when the program is compiled for execution.
+
+    Device connectivity matters: the three physical qubits of an encoded qubit should sit next
+    to each other on the device. On devices that are not all-to-all connected the transpiler may
+    spread them apart, which adds routing overhead to every gate and weakens the protection (and
+    disables :class:`SwapDDLayer` for that qubit). Check the transpiled circuit, or use a device
+    whose layout keeps each triple together.
     """
 
-    type: Literal["readout_basis"] = "readout_basis"
+    type: Literal["dfs_encoding"] = "dfs_encoding"
+
+    postselect: bool = True
+    synthesize_unknown: bool = False
+
+
+class SwapDDLayer(BaseModel):
+    """Swap dynamical decoupling for circuits encoded with :class:`DFSEncodingLayer`.
+
+    While an encoded qubit idles, its three physical qubits are cycled through all their role
+    permutations with physical SWAP gates, which averages out slowly varying noise. Requires a
+    :class:`DFSEncodingLayer` earlier in the program and must come after the
+    :class:`TranspilationLayer`; place it before :class:`DynamicalDecouplingLayer` or a grouped
+    mitigation layer. Swap sequences are only inserted on devices that expose gate durations.
+
+    ``fix_total=False`` (default) adds the swap durations on top of each idle period;
+    ``fix_total=True`` keeps each idle period's total duration fixed and skips periods too short
+    for the swaps. ``insert_barriers`` keeps the swap cycle from being reordered. ``max_dwell_dt``
+    caps how long (in device time steps) a block stays in one permutation, so longer idle periods
+    get more cycles; unset, one cycle spans the whole period. ``strict`` fails the job instead of
+    warning when an encoded qubit cannot be protected, or when no swap sequences can be inserted
+    at all (for example on a simulator without gate durations). How many encoded qubits were
+    protected is reported in ``job.swap_dd_coverage``.
+
+    Requires each encoded qubit's three physical qubits to be mutually connected on the device;
+    on devices that are not all-to-all connected, a qubit whose triple was spread apart by the
+    transpiler is left undecorated. The swaps must not be re-routed afterwards, since the scheme
+    relies on equal time spent in each permutation.
+    """
+
+    type: Literal["swap_dd"] = "swap_dd"
+
+    fix_total: bool = False
+    insert_barriers: bool = True
+    max_dwell_dt: Annotated[int, Field(ge=1)] | None = None
+    strict: bool = False
 
 
 Layer = Annotated[
@@ -221,6 +319,7 @@ Layer = Annotated[
         InputLayer,
         DeviceLayer,
         StatevectorLayer,
+        CliffordTSynthesisLayer,
         PackingLayer,
         TranspilationLayer,
         EstimatorLayer,
@@ -232,7 +331,8 @@ Layer = Annotated[
         AdvancedDistMitigationLayer,
         AdvancedReadoutMitigationLayer,
         QWCComputeLayer,
-        ReadoutBasisLayer,
+        DFSEncodingLayer,
+        SwapDDLayer,
     ],
     Field(discriminator="type"),
 ]

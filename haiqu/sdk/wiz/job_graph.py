@@ -13,6 +13,7 @@ NODE_DESCRIPTIONS: dict[str, str] = {
         "Maps logical qubits to physical qubits and decomposes gates to the"
         " device's native gate set via routing and optimization passes."
     ),
+    "Readout Basis": "Rotates the qubits into each requested Pauli basis just before measurement, one execution per basis.",
     "Observable Splitter": (
         "Splits a multi-observable task into one task per Pauli observable" " so downstream layers process each independently."
     ),
@@ -55,12 +56,13 @@ def build_run_job_graph(
     use_noise_tailoring: bool = False,
     use_dd: bool = True,
     use_readout: bool = True,
+    uses_readout_bases: bool = False,
 ):
     """Build the execution flow MultiDiGraph for a run job.
 
     Node names mirror the actual layer classes in run
     (some layer names are abstracted for confidentiality):
-      Packing, Transpile, Observable Splitter, Advanced Observable Mitigation,
+      Packing, Transpile, Readout Basis, Observable Splitter, Advanced Observable Mitigation,
       Advanced Distribution Mitigation, Noise Tailoring, Dynamical Decoupling,
       Observable Readout Correction, QWC Compute, Advanced Readout Mitigation,
       Readout Mitigation, Merge, <device_id>.
@@ -110,6 +112,8 @@ def build_run_job_graph(
         else:
             chain("QWC Compute")
     else:
+        if uses_readout_bases:
+            chain("Readout Basis")
         if uses_mitigation:
             if use_advanced:
                 chain("Advanced Distribution Mitigation")
@@ -343,6 +347,7 @@ def draw_run_job(
     use_noise_tailoring: bool = False,
     use_dd: bool = True,
     use_readout: bool = True,
+    uses_readout_bases: bool = False,
     help: bool = False,
 ) -> None:
     """Render the execution flow graph for the run job."""
@@ -356,5 +361,6 @@ def draw_run_job(
         use_noise_tailoring,
         use_dd,
         use_readout,
+        uses_readout_bases,
     )
     return plot_run_job_graph(G, help=help)

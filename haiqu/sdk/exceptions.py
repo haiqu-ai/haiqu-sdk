@@ -2,6 +2,8 @@
 Haiqu SDK. Exceptions and errors.
 """
 
+import functools
+
 from requests.exceptions import ConnectionError, RequestException
 from urllib3.exceptions import HTTPError
 from urllib.error import URLError
@@ -76,4 +78,37 @@ class JobNotRegisteredInExperimentError(Exception):
 class LogError(Exception):
     """
     Raised when logging to the Haiqu cloud environment fails.
+    """
+
+
+class _JobEndedError(Exception):
+    """A job that ended without a result: its ID and logs travel with the exception, through pickling and copying."""
+
+    def __init__(self, message: str, *, job_id: str, logs: str | None = None):
+        super().__init__(message)
+        self.job_id = job_id
+        self.logs = logs
+
+    def __reduce__(self):
+        # The default rebuilds the exception from its message alone, which the required job_id refuses.
+        return functools.partial(type(self), job_id=self.job_id, logs=self.logs), self.args
+
+
+class JobFailedError(_JobEndedError):
+    """
+    Raised by a job's ``result`` when the job failed.
+
+    Attributes:
+        job_id (str): ID of the job.
+        logs (str | None): All log messages of the job, of which the exception message shows the error.
+    """
+
+
+class JobCancelledError(_JobEndedError):
+    """
+    Raised by a job's ``result`` when the job was cancelled, by the user or because it exceeded its time limit.
+
+    Attributes:
+        job_id (str): ID of the job.
+        logs (str | None): All log messages of the job, of which the exception message shows the reason.
     """

@@ -28,6 +28,7 @@ API_ACTIONS = {
     "version": "/version",
     "health_auth": "/health/auth",
     "user": "/user",
+    "set_handle": "/user/handle",
     "benchmarks": "/help/benchmarks",
     "list_experiments": "/experiments",
     "init_experiment": "/experiments/init",
@@ -68,6 +69,14 @@ API_ACTIONS = {
     "postprocess_skqd": "/postprocess_skqd",
     "variational_optimization": "/variational",
     "pretraining": "/pretraining",
+    "tomography": "/tomography",
+    "list_qec_codes": "/codes",
+    "get_qec_code": "/codes/{code_slug}",
+    "download_qec_code": "/codes/{code_slug}/download",
+    "qec_compile": "/qec/compile",
+    "qec_run": "/qec/run",
+    "create_qec_custom_code": "/qec/custom_codes",
+    "get_qec_custom_code_by_hash": "/experiments/{experiment_id}/qec/custom_codes/{code_hash}",
 }
 
 
@@ -93,6 +102,35 @@ def auto_set_current_client(cls):
         setattr(cls, name, make_wrapper(attr))
 
     return cls
+
+
+def _response_error_detail(response: requests.Response) -> str | None:
+    """The API's description of a failed request, from the ``detail`` of its JSON body, or None.
+
+    A validation failure lists each problem with where in the request it is; an internal server error
+    carries an ID that support can look the error up by.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict) or payload.get("detail") in (None, "", []):
+        return None
+    detail = payload["detail"]
+    if isinstance(detail, list):
+        lines = []
+        for item in detail:
+            if isinstance(item, dict) and "msg" in item:
+                location = ".".join(str(part) for part in item.get("loc", []) if part != "body")
+                lines.append(f"{location}: {item['msg']}" if location else str(item["msg"]))
+            else:
+                lines.append(str(item))
+        detail = "\n".join(lines)
+    elif isinstance(detail, dict):
+        detail = detail.get("message", str(detail))
+    if payload.get("error_id"):
+        detail = f"{detail} (error ID: {payload['error_id']})"
+    return str(detail)
 
 
 @auto_set_current_client
@@ -166,6 +204,17 @@ class ApiClient:
             UserModel: User profile.
         """
         response = self._get(endpoint=API_ACTIONS["user"])
+        return schemas.UserModel.model_validate_json(response.text)
+
+    def set_handle(self, data: schemas.HandleSubmitModel) -> schemas.UserModel:
+        """Choose the handle that names the user in the Haiqu cloud.
+
+        Args:
+            data (HandleSubmitModel): The handle.
+        Returns:
+            UserModel: User profile, with the handle.
+        """
+        response = self._put(endpoint=API_ACTIONS["set_handle"], json=data.model_dump())
         return schemas.UserModel.model_validate_json(response.text)
 
     def init_experiment(self, data: schemas.ExperimentSubmitModel) -> schemas.ExperimentModel:
@@ -593,6 +642,11 @@ class ApiClient:
         job = schemas.VariationalJobModel.model_validate_json(response.text)
         return job
 
+    def tomography(self, data: schemas.TomographySubmitModel) -> schemas.TomographyJobModel:
+        """Post a tomography job request."""
+        response = self._post(endpoint=API_ACTIONS["tomography"], json=data.model_dump(mode="json"))
+        return schemas.TomographyJobModel.model_validate_json(response.text)
+
     def build_lr_qaoa_circuit(
         self,
         data: schemas.LRQAOACircuitSubmitModel,
@@ -685,6 +739,97 @@ class ApiClient:
         )
         job = schemas.SKQDJobModel.model_validate_json(response.text)
         return job
+
+    def list_qec_codes(
+        self,
+        family: list[str] | None = None,
+        code_type: list[str] | None = None,
+        completeness: list[str] | None = None,
+        n: list[int] | None = None,
+        d: list[int] | None = None,
+        q: str | None = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> schemas.QECCodeListResponseModel:
+        """List QEC codes with optional filtering and pagination."""
+        response = self._get(
+            endpoint=API_ACTIONS["list_qec_codes"],
+            query_params={
+                "family": family,
+                "code_type": code_type,
+                "completeness": completeness,
+                "n": n,
+                "d": d,
+                "q": q,
+                "page": page,
+                "page_size": page_size,
+            },
+        )
+        return schemas.QECCodeListResponseModel.model_validate_json(response.text)
+
+    def get_qec_code(self, code_slug: str) -> schemas.QECCodeModel:
+        """Get a QEC code by slug."""
+        endpoint = API_ACTIONS["get_qec_code"].format(code_slug=code_slug)
+        response = self._get(endpoint=endpoint)
+        return schemas.QECCodeModel.model_validate_json(response.text)
+
+    def download_qec_code(self, code_slug: str) -> bytes:
+        """Download the raw `.qecx` file bytes for a code."""
+        endpoint = API_ACTIONS["download_qec_code"].format(code_slug=code_slug)
+        response = self._get(endpoint=endpoint)
+        return response.content
+
+    def qec_compile(self, data: schemas.QECCompileSubmitModel) -> schemas.QECCompilationJobModel:
+        """Post QEC compilation request.
+
+        Args:
+            data (QECCompileSubmitModel): QEC compilation submit payload.
+
+        Returns:
+            QECCompilationJobModel: The submitted job (poll with .result() or .progress()).
+        """
+        response = self._post(endpoint=API_ACTIONS["qec_compile"], json=data.model_dump())
+        job = schemas.QECCompilationJobModel.model_validate_json(response.text)
+        return job
+
+    def qec_run(self, data: schemas.QECRunSubmitModel) -> schemas.QECRunJobModel:
+        """Post QEC noisy-sampler run request.
+
+        Args:
+            data (QECRunSubmitModel): QEC run submit payload.
+
+        Returns:
+            QECRunJobModel: The submitted job (poll with .result() or .progress()).
+        """
+        response = self._post(endpoint=API_ACTIONS["qec_run"], json=data.model_dump())
+        job = schemas.QECRunJobModel.model_validate_json(response.text)
+        return job
+
+    def get_qec_custom_code(self, experiment_id: str, code_hash: str) -> schemas.QECCustomCodeModel:
+        """Get the custom code with the given content hash in an experiment.
+
+        Args:
+            experiment_id (str): The experiment the custom code was stored in.
+            code_hash (str): SHA-256 hex digest of the QECX file content.
+
+        Returns:
+            QECCustomCodeModel: The stored custom code, without its content.
+        """
+        endpoint = API_ACTIONS["get_qec_custom_code_by_hash"].format(experiment_id=experiment_id, code_hash=code_hash)
+        response = self._get(endpoint=endpoint)
+        return schemas.QECCustomCodeModel.model_validate_json(response.text)
+
+    def create_qec_custom_code(self, data: schemas.QECCustomCodeSubmitModel) -> schemas.QECCustomCodeModel:
+        """Store a custom code, or return the one already stored with the same content.
+
+        Args:
+            data (QECCustomCodeSubmitModel): The experiment, file name and base64-encoded file content.
+
+        Returns:
+            QECCustomCodeModel: The stored custom code, without its content.
+        """
+        response = self._post(endpoint=API_ACTIONS["create_qec_custom_code"], json=data.model_dump())
+        return schemas.QECCustomCodeModel.model_validate_json(response.text)
 
     # ------------------------------------------------------------------------
     # Helper functions
@@ -787,7 +932,8 @@ class ApiClient:
             OutdatedSDKError: Raised for the API's ``outdated_sdk`` response.
             InvalidAPIKeyError: Raised for ``401`` responses.
             requests.HTTPError: Raised by ``response.raise_for_status()`` for
-                other non-OK responses.
+                other non-OK responses, with the API's description of the problem, if it gave one,
+                added to the message.
         """
         if response.status_code == codes.UPGRADE_REQUIRED:  # 426
             payload = response.json()
@@ -798,7 +944,13 @@ class ApiClient:
         if response.status_code == codes.UNAUTHORIZED:  # 401
             raise InvalidAPIKeyError()
         elif not response.ok:
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except exceptions.HTTPError as e:
+                detail = _response_error_detail(response)
+                if detail is None:
+                    raise
+                raise exceptions.HTTPError(f"{e}\n{detail}", response=response) from None
 
     @staticmethod
     def _match_job_type(job_type: schemas.JobType) -> type:
@@ -827,6 +979,12 @@ class ApiClient:
                 job_class = schemas.PretrainingJobModel
             case schemas.JobType.SKQD:
                 job_class = schemas.SKQDJobModel
+            case schemas.JobType.TOMOGRAPHY:
+                job_class = schemas.TomographyJobModel
+            case schemas.JobType.QEC_COMPILATION:
+                job_class = schemas.QECCompilationJobModel
+            case schemas.JobType.QEC_RUN:
+                job_class = schemas.QECRunJobModel
             case _:
                 job_class = schemas.BaseJobModel
         return job_class
