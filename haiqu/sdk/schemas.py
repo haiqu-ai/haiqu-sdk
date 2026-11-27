@@ -2401,6 +2401,11 @@ class HybridJobModel(ExecutionResultsMixin, BaseJobModel):
             circuit, in input order, holding the ``input_circuit_id``, the
             ``synthesized_circuit_id`` and the synthesis ``information`` described in
             :meth:`~haiqu.sdk.quantum_haiqu.Haiqu.clifford_t_synthesis`.
+
+            A program ending in a :class:`~haiqu.sdk.hybrid.layers.QECSamplerLayer` returns one
+            distribution per input circuit over the logical circuit's classical bits: the decoded
+            counts divided by the shots. See :attr:`qec_results` for the counts themselves and the
+            logical error rate.
         """
         super().result()
 
@@ -2528,6 +2533,24 @@ class HybridJobModel(ExecutionResultsMixin, BaseJobModel):
         if self.info is None:
             return None
         return self.info.get("swap_dd_coverage")
+
+    @property
+    def qec_results(self) -> Optional[list["QECRunResultModel"]]:
+        """
+        Decoded results of a program ending in a ``QECSamplerLayer``: one
+        :class:`QECRunResultModel` per input circuit, in input order, with the decoded counts, the
+        logical error rate and the decoder used, as ``haiqu.qec_run`` reports them. ``None`` for any
+        other program.
+
+        Warning:
+            This property blocks the current CPU thread until the job reaches a
+            terminal state (Done/Error), similarly to ``result()``.
+        """
+        self.result()
+
+        if self.info is None or self.info.get("qec_results") is None:
+            return None
+        return [QECRunResultModel.model_validate(result) for result in self.info["qec_results"]]
 
     @property
     def pre_device_pipeline_time(self) -> Optional[float]:

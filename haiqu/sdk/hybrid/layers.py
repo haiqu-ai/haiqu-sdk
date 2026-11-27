@@ -3,8 +3,10 @@
 A program is an ordered list of layers describing how your circuits are processed
 and run. It starts with an :class:`InputLayer` and ends with the layer that produces
 its results: a :class:`DeviceLayer` to run on a backend, a :class:`StatevectorLayer`
-to simulate exactly instead, or a :class:`CliffordTSynthesisLayer` to approximate the
-circuits with Clifford+T gates and return them without running them.
+to simulate exactly instead, a :class:`CliffordTSynthesisLayer` to approximate the
+circuits with Clifford+T gates and return them without running them, or a
+:class:`QECSamplerLayer` to sample circuits compiled by a :class:`QECCompilationLayer`
+to a quantum error-correcting code under noise.
 
 Use :class:`EstimatorLayer` or :class:`DistributionMitigationLayer` for grouped
 error mitigation, or compose finer processing steps by hand. For advanced
@@ -12,9 +14,10 @@ mitigation in manual pipelines, pick the layer for the mitigation path:
 :class:`AdvancedObsMitigationLayer` for observable-based mitigation and
 :class:`AdvancedDistMitigationLayer` for distribution-based mitigation.
 """
+import os
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class InputLayer(BaseModel):
@@ -314,6 +317,94 @@ class SwapDDLayer(BaseModel):
     strict: bool = False
 
 
+# --- Quantum error correction --------------------------------------------------
+# A program with these layers is exactly InputLayer -> QECCompilationLayer -> QECSamplerLayer.
+
+
+class QECCompilationLayer(BaseModel):
+    """Compile the circuits to a quantum error-correcting code, as
+    :meth:`~haiqu.sdk.quantum_haiqu.Haiqu.qec_compile` does.
+
+    Each circuit is a logical circuit: each of its qubits is encoded into the code, and
+    error-correction cycles are inserted between its logical gates. ``code`` is a code of the Haiqu
+    QEC code library, given by its slug (e.g. ``"steane_7_1_3"``) or as a code returned by
+    ``haiqu.get_qec_code``, or a custom code, given by the path to its QECX file or by the slug it was
+    stored under: :meth:`~haiqu.sdk.quantum_haiqu.Haiqu.flow` stores the file in the current experiment,
+    as ``qec_compile`` does, and submits the custom code's slug in its place. As in ``qec_compile``, a
+    string is read as a path when it names an existing file or contains ``/`` or ``\\``. A slug that names
+    no code makes the job fail. A file opened in binary mode is not accepted here; pass its path.
+
+    The options are those of ``qec_compile``; one left unset takes the default described there:
+    ``ec_cycle_frequency`` (an error-correction cycle after every ``N`` layers that contain a logical
+    gate, ``0`` for none), ``variant_selections`` (the code's variants to use for its operations, by
+    name) and ``add_layer_barriers`` (a barrier between consecutive logical layers).
+
+    The compiled circuits are sampled by a :class:`QECSamplerLayer`, which must follow directly: a
+    program with QEC layers is exactly ``InputLayer``, ``QECCompilationLayer``, ``QECSamplerLayer``.
+    This is checked when the program is created. To get the compiled circuits themselves, use
+    ``qec_compile``.
+    """
+
+    type: Literal["qec_compilation"] = "qec_compilation"
+
+    code: Annotated[str, Field(min_length=1, max_length=1024)]
+    ec_cycle_frequency: Annotated[int, Field(ge=0)] | None = None
+    variant_selections: dict | None = None
+    add_layer_barriers: bool | None = None
+
+    @field_validator("code", mode="before")
+    @classmethod
+    def _code_as_string(cls, code):
+        # The schemas module imports this one, so the code model of qec_compile is imported here.
+        from ..schemas import QECCodeModel
+
+        if isinstance(code, QECCodeModel):
+            return code.slug
+        if isinstance(code, os.PathLike):
+            # Its string form can read as a slug, so a missing file is refused here rather than at the server
+            if not os.path.isfile(code):
+                raise ValueError(f"QECX file '{os.fspath(code)}' does not exist")
+            return os.fspath(code)
+        return code
+
+
+class QECSamplerLayer(BaseModel):
+    """Sample the QEC-compiled circuits under noise and decode the outcomes, as
+    :meth:`~haiqu.sdk.quantum_haiqu.Haiqu.qec_run` does.
+
+    An alternative ending to a program, directly after a :class:`QECCompilationLayer`. Nothing runs
+    on a device: each compiled circuit is sampled ``shots`` times under the noise model ``noise``,
+    the syndrome measured in its error-correction cycles is decoded, and the outcomes are read in the
+    logical frame. The options are those of ``qec_run``, with the same defaults: ``noise`` (required,
+    a dict with the keys ``"p1q"``, ``"p2q"`` and ``"p_meas"``, or a
+    :class:`~haiqu.sdk.schemas.QECNoiseModel`), ``sampler``, ``decoder``, ``seed`` and ``toggles``.
+    With the same circuits, code, options, shots and seed, a program ending here gives the same counts
+    as ``qec_run``.
+
+    The job returns one measurement distribution per input circuit over the logical circuit's
+    classical bits, the decoded counts divided by ``shots``. ``job.qec_results`` holds the decoded
+    counts, the logical error rate and the decoder used for each circuit, as ``qec_run`` reports them.
+    Observables, readout bases, parameter sweeps, device credentials, dry runs and circuits that are
+    already QEC-compiled do not apply, and :meth:`~haiqu.sdk.quantum_haiqu.Haiqu.flow` refuses them.
+    """
+
+    type: Literal["qec_sampler"] = "qec_sampler"
+
+    noise: dict[str, float]
+    sampler: Literal["stim"] = "stim"
+    decoder: Literal["auto", "pymatching", "chromobius", "bposd", "tesseract"] = "auto"
+    seed: Annotated[int, Field(ge=0)] | None = None
+    toggles: dict | None = None
+
+    @field_validator("noise", mode="before")
+    @classmethod
+    def _check_noise(cls, noise):
+        # The schemas module imports this one, so the noise model of qec_run is imported here.
+        from ..schemas import QECNoiseModel
+
+        return QECNoiseModel.model_validate(noise).model_dump()
+
+
 Layer = Annotated[
     Union[
         InputLayer,
@@ -333,6 +424,8 @@ Layer = Annotated[
         QWCComputeLayer,
         DFSEncodingLayer,
         SwapDDLayer,
+        QECCompilationLayer,
+        QECSamplerLayer,
     ],
     Field(discriminator="type"),
 ]

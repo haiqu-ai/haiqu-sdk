@@ -4389,7 +4389,8 @@ class Haiqu:
             readout_bases: Per-qubit Pauli bases to read the circuits out in, e.g. ``["XXXX", "ZZZZ"]``, Qiskit
                            little-endian (the last character applies to qubit 0). Mutually exclusive with
                            ``observables``, and needs a ``program`` that returns measured distributions: one with
-                           no ``EstimatorLayer``, ``StatevectorLayer`` or ``CliffordTSynthesisLayer``. Each basis
+                           no ``EstimatorLayer``, ``StatevectorLayer``, ``CliffordTSynthesisLayer`` or
+                           ``QECSamplerLayer``. Each basis
                            is a separate execution, so the cost is ``len(readout_bases) * shots``. Defaults to
                            ``None``, which reads out in the computational basis.
 
@@ -4444,6 +4445,8 @@ class Haiqu:
                 ``dfs_discard_fraction`` for a distribution job whose program has a ``DFSEncodingLayer`` with
                 ``postselect=True``, and ``swap_dd_coverage`` for one whose program has a ``SwapDDLayer``;
                 distributions are then over the logical qubits).
+                A program ending in a ``QECSamplerLayer`` returns the decoded distributions, and
+                ``job.qec_results`` the decoded counts and logical error rate of each circuit.
                 Run ``help(job.result)`` for the full description of result and ``info`` contents.
 
                 In a notebook, a link to the job on the Dashboard is also displayed when
@@ -4649,6 +4652,24 @@ class Haiqu:
             [[[1.0, 1.0], [0.482, 0.8280000000000001]],
              [[-0.016000000000000014, 0.003999999999999963],
               [-0.02400000000000002, 0.008000000000000007]]]
+
+            A logical circuit compiled to a code of the QEC code library, sampled under noise and decoded:
+
+            >>> from qiskit import QuantumCircuit
+            >>> from haiqu.sdk.hybrid import HybridProgram, layers
+            >>> program = HybridProgram(layers=[
+            ...     layers.InputLayer(),
+            ...     layers.QECCompilationLayer(code="steane_7_1_3"),
+            ...     layers.QECSamplerLayer(noise={"p1q": 1e-3, "p2q": 1e-3, "p_meas": 1e-3}, seed=7),
+            ... ])
+            >>> qc = QuantumCircuit(1, 1)
+            >>> qc.x(0)
+            >>> qc.measure(0, 0)
+            >>> job = haiqu.flow(program, circuits=qc, shots=1000)
+            >>> job.result()  # Returns: [dist_c1] over the logical circuit's classical bits
+            [{'1': 1.0}]
+            >>> job.qec_results[0].counts
+            {'1': 1000}
         """
         self._check_experiment()
         circuits = self._normalize_circuits(circuits)
@@ -4658,13 +4679,27 @@ class Haiqu:
         if readout_bases is not None:
             # Layers whose program returns something other than measured distributions: expectation
             # values, statevectors or circuits.
-            unsupported = (layers.EstimatorLayer, layers.StatevectorLayer, layers.CliffordTSynthesisLayer)
+            unsupported = (
+                layers.EstimatorLayer,
+                layers.StatevectorLayer,
+                layers.CliffordTSynthesisLayer,
+                layers.QECSamplerLayer,
+            )
             rejected = sorted({type(layer).__name__ for layer in program.layers if isinstance(layer, unsupported)})
             if rejected:
                 raise ValueError(
                     f"`readout_bases` cannot be combined with {', '.join(rejected)}: readout bases need a program "
                     "that returns measured distributions, one per basis."
                 )
+
+        if isinstance(program.layers[-1], layers.QECSamplerLayer):
+            self._check_qec_program_settings(
+                circuits,
+                observables=observables,
+                parameters=parameters,
+                device_credentials=device_credentials,
+                dry_run=dry_run,
+            )
 
         device_id = None
         new_layers = []
@@ -4682,10 +4717,14 @@ class Haiqu:
 
                     new_layer = layers.DeviceLayer.model_validate(layer.model_copy(update={"options": options}))
                     new_layers.append(new_layer)
+                case layers.QECCompilationLayer():
+                    # As in qec_compile, a library code is checked to be compilable; a custom code's file is stored
+                    # once every other check has passed, below.
+                    if not self._is_custom_qec_code(layer.code):
+                        self._check_library_code_compilable(layer.code)
+                    new_layers.append(layer)
                 case _:
                     new_layers.append(layer)
-
-        program = HybridProgram.model_validate(program.model_copy(update={"layers": new_layers}))
 
         device_credentials = copy.deepcopy(device_credentials) if device_credentials is not None else {}
 
@@ -4700,6 +4739,17 @@ class Haiqu:
             len(circuits),
             num_parameters_per_circuit=get_num_parameters_per_circuit(circuits),
         )
+
+        # A custom code's file is stored, and submitted as its slug, only now that every check has passed.
+        new_layers = [
+            (
+                layer.model_copy(update={"code": self._resolve_qec_code_slug(layer.code)})
+                if isinstance(layer, layers.QECCompilationLayer)
+                else layer
+            )
+            for layer in new_layers
+        ]
+        program = HybridProgram.model_validate(program.model_copy(update={"layers": new_layers}))
 
         logged_circuits = self._log_circuits(circuits)
 
@@ -6660,6 +6710,37 @@ class Haiqu:
         data.circuit_ids = [c.id for c in self._log_circuits(circuits)]
 
         return self._client.qec_run(data=data)
+
+    @staticmethod
+    def _check_qec_program_settings(circuits, *, observables, parameters, device_credentials, dry_run) -> None:
+        """Raise ValueError for the settings and circuits a program ending in a QECSamplerLayer cannot use.
+
+        Such a program compiles logical circuits and samples their own measurements, with no device, as
+        ``qec_run`` does: it has nothing to measure otherwise, sweep, authenticate or estimate, and a circuit that
+        is already QEC-compiled is run with ``qec_run``.
+        """
+        unused = [
+            f"`{name}`"
+            for name, value in (
+                ("observables", observables),
+                ("parameters", parameters),
+                ("device_credentials", device_credentials),
+                ("dry_run", dry_run),
+            )
+            if value
+        ]
+        if unused:
+            raise ValueError(
+                f"{', '.join(unused)} cannot be used with a program ending in a QECSamplerLayer, which samples the "
+                "measurements of each circuit under a noise model, with no device."
+                + (" Assign parameter values to the circuits before submitting them." if parameters else "")
+            )
+        for circuit in circuits:
+            if isinstance(circuit, CircuitModel) and circuit.qec is not None:
+                raise ValueError(
+                    f"Circuit '{circuit.id}' is already QEC-compiled; pass the logical circuit to a program with QEC "
+                    "layers, or run the compiled circuit with `haiqu.qec_run()`."
+                )
 
     def _resolve_qec_code_slug(
         self,
